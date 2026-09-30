@@ -222,7 +222,7 @@ func (c *Client) EditMessageText(ctx context.Context, chatID, messageID int64, t
 	payload := map[string]any{
 		"chat_id":    chatID,
 		"message_id": messageID,
-		"text":       text,
+		"text":       truncateRunes(text, maxMessageRunes),
 	}
 	if kb != nil {
 		payload["reply_markup"] = kb
@@ -261,10 +261,16 @@ func (c *Client) AnswerCallbackAlert(ctx context.Context, id, text string) error
 	return c.call(ctx, "answerCallbackQuery", payload, nil)
 }
 
-// SetWebhook registers the webhook URL for the bot.
-func (c *Client) SetWebhook(ctx context.Context, webhookURL string) error {
-	return c.call(ctx, "setWebhook", map[string]any{
+// SetWebhook registers the webhook URL for the bot. When secretToken is not
+// empty Telegram sends it back in the X-Telegram-Bot-Api-Secret-Token
+// header of every update, so forged requests can be rejected.
+func (c *Client) SetWebhook(ctx context.Context, webhookURL, secretToken string) error {
+	payload := map[string]any{
 		"url":             webhookURL,
 		"allowed_updates": []string{"message", "callback_query"},
-	}, nil)
+	}
+	if secretToken != "" {
+		payload["secret_token"] = secretToken
+	}
+	return c.call(ctx, "setWebhook", payload, nil)
 }

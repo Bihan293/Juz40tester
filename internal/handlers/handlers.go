@@ -573,7 +573,9 @@ func (h *Handler) openTest(ctx context.Context, cb *bot.CallbackQuery, user *mod
 	// every further notice goes to the chat as a normal, readable message.
 	h.answerCallback(ctx, cb, "")
 	cbAnswered := true
-	if user.TestLang == models.TestLangKK {
+	// Language subjects (Русский/Английский/Казахский язык, литература) are
+	// never translated — TestNeedsTranslation is false for them.
+	if h.quiz.TestNeedsTranslation(ctx, user, testID) {
 		h.ensureTranslatedWithNote(ctx, cb.Message.Chat.ID, user, testID)
 	}
 
@@ -744,6 +746,11 @@ func (h *Handler) handleAnswer(ctx context.Context, cb *bot.CallbackQuery, user 
 		h.answerCallback(ctx, cb, "Ответ уже засчитан")
 		return
 	}
+	// BUG FIX: the happy path never acknowledged the callback, so the tapped
+	// A/B/C/D button kept spinning for ~15 s after every single answer.
+	// From here on the single allowed answer is spent — later errors go to
+	// the chat as plain messages.
+	h.answerCallback(ctx, cb, "")
 
 	// Finalize the answered message: verdict + option marks + question
 	// knowledge level, and REMOVE the A/B/C/D keyboard so the question
@@ -758,7 +765,7 @@ func (h *Handler) handleAnswer(ctx context.Context, cb *bot.CallbackQuery, user 
 		sum, err := h.quiz.BuildSummary(ctx, attemptID, user.ID)
 		if err != nil {
 			log.Printf("summary: %v", err)
-			h.answerCallback(ctx, cb, "Ошибка загрузки результата")
+			h.sendText(ctx, chatID, "Ошибка загрузки результата 😔")
 			return
 		}
 		h.quiz.OnTestCompleted(ctx, user.ID, sum.Test,
@@ -903,9 +910,12 @@ func (h *Handler) finishPersonalTest(ctx context.Context, cb *bot.CallbackQuery,
 }
 
 func (h *Handler) retryTest(ctx context.Context, cb *bot.CallbackQuery, user *models.User, attemptID int64) {
+	// NOTE: the router has already answered this callback (only ONE answer
+	// is allowed) — errors are reported as chat messages.
 	sum, err := h.quiz.BuildSummary(ctx, attemptID, user.ID)
 	if err != nil {
-		h.answerCallback(ctx, cb, "Ошибка")
+		log.Printf("retry summary %d: %v", attemptID, err)
+		h.sendText(ctx, cb.Message.Chat.ID, "Ошибка 😔 Попробуй ещё раз.")
 		return
 	}
 	// The user may have switched the test language to Kazakh since this test
@@ -913,7 +923,7 @@ func (h *Handler) retryTest(ctx context.Context, cb *bot.CallbackQuery, user *mo
 	// (the cached translation is reused when it already exists, zero API
 	// calls; otherwise the test is translated once, for everyone). A failure
 	// falls back to the Russian master version, never blocks the retry.
-	if user.TestLang == models.TestLangKK {
+	if h.quiz.TestNeedsTranslation(ctx, user, sum.Test.ID) {
 		h.ensureTranslatedWithNote(ctx, cb.Message.Chat.ID, user, sum.Test.ID)
 	}
 	// Every retry is a brand-new attempt with fresh shuffled question and
@@ -921,7 +931,7 @@ func (h *Handler) retryTest(ctx context.Context, cb *bot.CallbackQuery, user *mo
 	newAttempt, err := h.quiz.StartTest(ctx, user.ID, sum.Test.ID)
 	if err != nil {
 		log.Printf("retry test: %v", err)
-		h.answerCallback(ctx, cb, "Не удалось начать тест")
+		h.sendText(ctx, cb.Message.Chat.ID, "Не удалось начать тест 😔")
 		return
 	}
 	// The menu was restored with the result screen — hide it again for the
@@ -935,7 +945,7 @@ func (h *Handler) retryTest(ctx context.Context, cb *bot.CallbackQuery, user *mo
 func (h *Handler) confirmExit(ctx context.Context, cb *bot.CallbackQuery, user *models.User, attemptID int64) {
 	if err := h.quiz.Exit(ctx, attemptID, user.ID); err != nil {
 		log.Printf("exit confirm attempt %d: %v", attemptID, err)
-		h.answerCallback(ctx, cb, "Попытка не найдена")
+		h.sendText(ctx, cb.Message.Chat.ID, "Попытка не найдена")
 		return
 	}
 	idStr := strconv.FormatInt(attemptID, 10)
@@ -1075,7 +1085,7 @@ func settingsKeyboard(lang string) *bot.InlineKeyboardMarkup {
 	}}
 }
 
-const settingsText = "⚙️ Настройки\n\n🌐 Язык тестов\n\nВыберите язык, на котором показываются вопросы и варианты ответов. Интерфейс бота остаётся на русском.\n\nЕсли казахской версии теста ещё нет, я переведу его один раз и сохраню — дальше она откроется мгновенно."
+const settingsText = "⚙️ Настройки\n\n🌐 Язык тестов\n\nВыберите язык, на котором показываются вопросы и варианты ответов. Интерфейс бота остаётся на русском.\n\nЕсли казахской версии теста ещё нет, я переведу его один раз и сохраню — дальше она откроется мгновенно.\n\nℹ️ Языковые предметы (русский, английский, казахский язык, литература) не переводятся — их тесты всегда на языке самого предмета."
 
 // showSettings is used from the Reply Keyboard (new message).
 func (h *Handler) showSettings(ctx context.Context, chatID int64, user *models.User) {
@@ -1261,6 +1271,12 @@ func (h *Handler) handleCallback(ctx context.Context, cb *bot.CallbackQuery) {
 		return
 	}
 	data := cb.Data
+	// Very old / inaccessible messages arrive without cb.Message — every
+	// handler below dereferences cb.Message.Chat.ID, so bail out safely.
+	if cb.Message == nil {
+		h.answerCallback(ctx, cb, "Сообщение устарело — открой меню заново")
+		return
+	}
 
 	// IMPORTANT: a callback_query may be answered EXACTLY ONCE — a second
 	// answerCallbackQuery call is rejected by Telegram, which silently
@@ -1412,6 +1428,14 @@ func (h *Handler) editMessage(ctx context.Context, cb *bot.CallbackQuery, text s
 func (h *Handler) answerAlert(ctx context.Context, cb *bot.CallbackQuery, text string) {
 	if err := h.tg.AnswerCallbackAlert(ctx, cb.ID, text); err != nil {
 		log.Printf("answer callback alert: %v", err)
+	}
+}
+
+// sendText sends a plain chat message — used for errors after the callback
+// has already been answered (Telegram accepts exactly one answer).
+func (h *Handler) sendText(ctx context.Context, chatID int64, text string) {
+	if _, err := h.tg.SendMessage(ctx, chatID, text, nil); err != nil {
+		log.Printf("send text: %v", err)
 	}
 }
 

@@ -13,6 +13,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -148,7 +149,10 @@ func main() {
 
 	// Register webhook (WEBHOOK_URL is the public base URL of this service).
 	webhookEndpoint := cfg.WebhookURL + "/telegram/webhook"
-	if err := tg.SetWebhook(ctx, webhookEndpoint); err != nil {
+	if cfg.WebhookSecret == "" {
+		log.Println("webhook: WEBHOOK_SECRET not set — incoming updates are NOT authenticated (set it in production)")
+	}
+	if err := tg.SetWebhook(ctx, webhookEndpoint, cfg.WebhookSecret); err != nil {
 		log.Fatalf("set webhook: %v", err)
 	}
 	log.Printf("webhook set: %s", webhookEndpoint)
@@ -174,6 +178,11 @@ func main() {
 	// our own /ping endpoint to keep the instance awake. Silent on purpose.
 	go selfPing(context.Background(), cfg.WebhookURL+"/ping")
 	mux.HandleFunc("POST /telegram/webhook", func(w http.ResponseWriter, r *http.Request) {
+		if cfg.WebhookSecret != "" &&
+			subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Telegram-Bot-Api-Secret-Token")), []byte(cfg.WebhookSecret)) != 1 {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
 		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 		if err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
@@ -187,7 +196,14 @@ func main() {
 		// Respond to Telegram immediately, process asynchronously.
 		w.WriteHeader(http.StatusOK)
 		// Detach from the request context so processing survives the response.
-		go h.HandleUpdate(context.Background(), &upd)
+		// A timeout guards against a hung provider/DB call leaking the
+		// goroutine forever (translation of a test may legitimately take a
+		// minute or two, hence the generous bound).
+		go func() {
+			uctx, cancel := context.WithTimeout(context.Background(), updateTimeout)
+			defer cancel()
+			h.HandleUpdate(uctx, &upd)
+		}()
 	})
 
 	srv := &http.Server{
@@ -214,6 +230,9 @@ func main() {
 		log.Printf("shutdown: %v", err)
 	}
 }
+
+// updateTimeout bounds the processing of one Telegram update.
+const updateTimeout = 5 * time.Minute
 
 // selfPing hits the given URL every 5 minutes so the hosting platform keeps
 // the instance alive (Render free tier spins services down after ~15 minutes

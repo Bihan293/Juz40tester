@@ -3,6 +3,7 @@ package services
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/Bihan293/Juz40-test2/internal/models"
 )
@@ -186,5 +187,34 @@ func TestUnlockRuleConstants(t *testing.T) {
 	}
 	if models.MaxVisibleTests != 50 {
 		t.Fatalf("max visible tests = %d, want 50", models.MaxVisibleTests)
+	}
+}
+
+func TestLanguageSubjectRule(t *testing.T) {
+	if r := languageSubjectRule("Биология"); r != "" {
+		t.Fatalf("regular subject must have no language rule, got %q", r)
+	}
+	if r := languageSubjectRule("История Казахстана"); r != "" {
+		t.Fatalf("История Казахстана is not a language subject, got %q", r)
+	}
+	en := chainGenPrompt("Английский язык", 1, nil, nil)
+	if !strings.Contains(en, "английском") {
+		t.Fatal("English subject prompt must require English content")
+	}
+	kk := personalGenPrompt("Казахский язык", []string{"Етістік"})
+	if !strings.Contains(kk, "казахском") {
+		t.Fatal("Kazakh subject prompt must require Kazakh content")
+	}
+	ru := chainGenPrompt("Русский язык", 1, nil, nil)
+	if !strings.Contains(ru, "ТОЛЬКО на русском") {
+		t.Fatal("Russian subject prompt must pin the Russian language")
+	}
+}
+
+func TestChainPromptStemTruncationIsValidUTF8(t *testing.T) {
+	prev := []models.Question{{Text: strings.Repeat("щ", 200), Topic: "Тема"}}
+	p := chainGenPrompt("Биология", 2, prev, []int{0})
+	if !utf8.ValidString(p) {
+		t.Fatal("chain prompt must stay valid UTF-8 after truncating stems")
 	}
 }

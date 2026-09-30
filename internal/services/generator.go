@@ -161,7 +161,7 @@ type generatedTest struct {
 	Questions []generatedQuestion `json:"questions"`
 }
 
-const genSystemPrompt = `Ты — автор тестов ЕНТ/УБТ (Казахстан) для школьников 9–11 классов. Пишешь на русском, в официальном стиле ЕНТ: точные однозначные формулировки, без двойных отрицаний, строго по школьной программе.
+const genSystemPrompt = `Ты — автор тестов ЕНТ/УБТ (Казахстан) для школьников 9–11 классов. Пишешь на русском (если в задании не указан другой язык предмета), в официальном стиле ЕНТ: точные однозначные формулировки, без двойных отрицаний, строго по школьной программе.
 
 Требования к каждому вопросу:
 1. Ровно один правильный ответ; 4 варианта; дистракторы правдоподобные (типичные ошибки), не абсурдные.
@@ -180,15 +180,18 @@ const genSystemPrompt = `Ты — автор тестов ЕНТ/УБТ (Каз�
 func chainGenPrompt(subjectName string, testNumber int, prev []models.Question, marks []int) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Предмет: «%s». Составь Тест №%d из ровно %d вопросов.\n\n", subjectName, testNumber, GeneratedQuestionsPerTest)
+	b.WriteString(languageSubjectRule(subjectName))
 
 	if testNumber <= 1 || len(prev) == 0 {
 		b.WriteString("Это ПЕРВЫЙ тест цепочки: базовый уровень (difficulty 1–2), фундаментальные темы программы 9–11 классов — то, без чего нельзя начинать подготовку к ЕНТ/УБТ.\n")
 	} else {
 		fmt.Fprintf(&b, "Прошлый Тест №%d (тема — суть вопроса — уровень ученика: 0=не знает, 1=в процессе, 2=закреплено):\n", testNumber-1)
 		for i, q := range prev {
+			// Cut by RUNES, not bytes: a byte slice cut in the middle of a
+			// Cyrillic/Kazakh letter produced invalid UTF-8 in the prompt.
 			stem := q.Text
-			if len(stem) > 80 {
-				stem = stem[:80] + "…"
+			if r := []rune(stem); len(r) > 80 {
+				stem = string(r[:80]) + "…"
 			}
 			mark := 0
 			if i < len(marks) {
@@ -203,6 +206,27 @@ func chainGenPrompt(subjectName string, testNumber int, prev []models.Question, 
 	}
 	b.WriteString("\nВыдай строго JSON по схеме, ровно " + fmt.Sprint(GeneratedQuestionsPerTest) + " вопросов.")
 	return b.String()
+}
+
+// languageSubjectRule returns the extra instruction for LANGUAGE subjects:
+// their tests are written in the studied language itself (an English test
+// in English, a Kazakh-language test in Kazakh) — exactly like the real
+// ЕНТ/УБТ. Such tests are never machine-translated afterwards, so the
+// original language is the one the student sees. Empty for other subjects.
+func languageSubjectRule(subjectName string) string {
+	switch models.SubjectContentLang(subjectName) {
+	case models.ContentLangEN:
+		return "ЯЗЫК ТЕСТА: это предмет «Английский язык». Весь тест — вопросы, варианты ответов — пиши ТОЛЬКО на английском языке, в формате ЕНТ по английскому (grammar, vocabulary, reading). Поле topic — короткое название темы на английском (например «Present Perfect»).\n\n"
+	case models.ContentLangDE:
+		return "ЯЗЫК ТЕСТА: это предмет «Немецкий язык». Вопросы и варианты ответов пиши ТОЛЬКО на немецком языке. Поле topic — на немецком.\n\n"
+	case models.ContentLangFR:
+		return "ЯЗЫК ТЕСТА: это предмет «Французский язык». Вопросы и варианты ответов пиши ТОЛЬКО на французском языке. Поле topic — на французском.\n\n"
+	case models.ContentLangKK:
+		return "ЯЗЫК ТЕСТА: это предмет «Казахский язык/литература». Весь тест — вопросы, варианты ответов и поле topic — пиши ТОЛЬКО на казахском языке (қазақ тілінде), по программе казахского языка для ЕНТ/ҰБТ.\n\n"
+	case models.ContentLangRU:
+		return "ЯЗЫК ТЕСТА: это предмет «Русский язык/литература». Тест проверяет знание русского языка — пиши ТОЛЬКО на русском; варианты ответов — слова, формы, правила русского языка. Тест не переводится на другие языки.\n\n"
+	}
+	return ""
 }
 
 // difficultyBand maps the chain position to the target difficulty band.
@@ -230,6 +254,7 @@ func difficultyBand(testNumber int) string {
 // with one of THESE topics verbatim (validated server-side afterwards).
 func personalGenPrompt(subjectName string, topics []string) string {
 	var b strings.Builder
+	b.WriteString(languageSubjectRule(subjectName))
 	fmt.Fprintf(&b, "Предмет: «%s». Составь тренировочный тест из ровно %d вопросов ТОЛЬКО по этим слабым темам ученика:\n", subjectName, GeneratedQuestionsPerTest)
 	for i, t := range topics {
 		fmt.Fprintf(&b, "%d. %s\n", i+1, t)

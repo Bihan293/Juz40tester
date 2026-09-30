@@ -15,6 +15,10 @@ type Config struct {
 	DatabaseURL string
 	WebhookURL  string
 	Port        string
+	// WebhookSecret (optional, WEBHOOK_SECRET): Telegram echoes it in the
+	// X-Telegram-Bot-Api-Secret-Token header; requests without it are
+	// rejected. Without it anyone who knows the URL could forge updates.
+	WebhookSecret string
 
 	// DeepSeek API settings for AI test generation.
 	DeepSeekAPIKey        string
@@ -52,6 +56,7 @@ func Load() (*Config, error) {
 		DatabaseURL:           os.Getenv("DATABASE_URL"),
 		WebhookURL:            strings.TrimRight(os.Getenv("WEBHOOK_URL"), "/"),
 		Port:                  os.Getenv("PORT"),
+		WebhookSecret:         strings.TrimSpace(os.Getenv("WEBHOOK_SECRET")),
 		DeepSeekAPIKey:        os.Getenv("DEEPSEEK_API_KEY"),
 		DeepSeekModel:         os.Getenv("DEEPSEEK_MODEL"),
 		DeepSeekReasonerModel: os.Getenv("DEEPSEEK_REASONER_MODEL"),
