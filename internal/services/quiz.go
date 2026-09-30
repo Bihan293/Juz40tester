@@ -620,7 +620,8 @@ func (s *QuizService) buildView(ctx context.Context, user *models.User, attempt 
 	byLabel := map[string]string{
 		"A": q.OptionA, "B": q.OptionB, "C": q.OptionC, "D": q.OptionD,
 	}
-	if user != nil && user.TestLang == models.TestLangKK && s.translator != nil {
+	if user != nil && user.TestLang == models.TestLangKK && s.translator != nil &&
+		s.subjectTranslatable(ctx, q.SubjectID) {
 		if tr, terr := s.translator.TranslationFor(ctx, q.ID, models.TestLangKK); terr != nil {
 			log.Printf("translation lookup q%d: %v", q.ID, terr)
 		} else if tr != nil {
@@ -797,7 +798,7 @@ func (s *QuizService) ResolveTestForUser(ctx context.Context, user *models.User,
 		return nil, false, err
 	}
 	resolved := make([]ResolvedQuestion, 0, len(questions))
-	if user.TestLang != models.TestLangKK || s.translator == nil || !s.translator.Enabled() {
+	if !s.wantsTranslation(ctx, user, testID) {
 		for _, q := range questions {
 			resolved = append(resolved, russianQuestion(&q))
 		}
@@ -880,7 +881,7 @@ func (s *QuizService) TestFullyTranslated(ctx context.Context, testID int64) (bo
 // master is served (Russian users, translator disabled, or a translation
 // failure — a missing translation must never block a test from opening).
 func (s *QuizService) EnsureTestTranslated(ctx context.Context, user *models.User, testID int64) (ready bool, err error) {
-	if user.TestLang != models.TestLangKK || s.translator == nil || !s.translator.Enabled() {
+	if !s.wantsTranslation(ctx, user, testID) {
 		return false, nil
 	}
 	_, ok, err := s.ResolveTestForUser(ctx, user, testID)
@@ -889,4 +890,55 @@ func (s *QuizService) EnsureTestTranslated(ctx context.Context, user *models.Use
 		return false, err
 	}
 	return ok, nil
+}
+
+// ---------------------------------------------------------------------------
+// Language subjects are never translated
+// ---------------------------------------------------------------------------
+
+// subjectTranslatable reports whether the content of the subject may be
+// machine-translated into the user's test language. LANGUAGE subjects
+// («Русский язык», «Английский язык», «Казахский язык», литература …)
+// teach the language itself: their questions and answer options ARE words
+// and forms of that language, so a translation destroys the task (a Russian
+// spelling question translated into Kazakh has no correct answer anymore).
+// Such tests are always shown in their original language.
+//
+// On a lookup error the subject is treated as NOT translatable: showing the
+// original is always correct, a wrong translation never is.
+func (s *QuizService) subjectTranslatable(ctx context.Context, subjectID int64) bool {
+	subject, err := s.subjects.GetByID(ctx, subjectID)
+	if err != nil {
+		log.Printf("subject %d lookup for translation check: %v", subjectID, err)
+		return false
+	}
+	return !models.IsLanguageSubject(subject.Name)
+}
+
+// testTranslatable is subjectTranslatable for the subject of a test.
+func (s *QuizService) testTranslatable(ctx context.Context, testID int64) bool {
+	test, err := s.subjects.GetTest(ctx, testID)
+	if err != nil {
+		log.Printf("test %d lookup for translation check: %v", testID, err)
+		return false
+	}
+	return s.subjectTranslatable(ctx, test.SubjectID)
+}
+
+// wantsTranslation reports whether the test must be served in Kazakh to this
+// user: the user picked 🇰🇿, a translator is configured and the test does
+// NOT belong to a language subject.
+func (s *QuizService) wantsTranslation(ctx context.Context, user *models.User, testID int64) bool {
+	if user == nil || user.TestLang != models.TestLangKK || s.translator == nil || !s.translator.Enabled() {
+		return false
+	}
+	return s.testTranslatable(ctx, testID)
+}
+
+// TestNeedsTranslation is the handler-facing check: true only when opening
+// this test should make sure its Kazakh version exists. Language subjects
+// (Русский/Английский/Казахский язык, литература) always return false —
+// they are shown in the original language and never sent to the translator.
+func (s *QuizService) TestNeedsTranslation(ctx context.Context, user *models.User, testID int64) bool {
+	return s.wantsTranslation(ctx, user, testID)
 }
