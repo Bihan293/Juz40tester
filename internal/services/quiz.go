@@ -428,6 +428,56 @@ func (s *QuizService) ReviveChainTest(ctx context.Context, subjectID int64, test
 	s.genSvc.ReviveChainTest(ctx, subjectID, testNumber, userID)
 }
 
+// SubjectsWithWeakTopics returns only the subjects in which the user has at
+// least one weak (🔴/🟡) topic — the «🎯 Слабые темы» picker must not offer
+// subjects the user never practised (there is nothing to build a personal
+// test from, and tapping such a subject used to hang in «generating…»).
+func (s *QuizService) SubjectsWithWeakTopics(ctx context.Context, userID int64) ([]models.Subject, error) {
+	all, err := s.subjects.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	weak, err := s.gen.SubjectsWithWeakTopics(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]models.Subject, 0, len(weak))
+	for _, subj := range all {
+		if weak[subj.ID] {
+			out = append(out, subj)
+		}
+	}
+	return out, nil
+}
+
+// ChainTestStatus reports whether chain test #number of the subject already
+// exists (test != nil) or is still being generated (pending). Used by the
+// «wait for the test» notifier: when both are empty the generation failed.
+func (s *QuizService) ChainTestStatus(ctx context.Context, subjectID int64, number int) (test *models.Test, pending bool, err error) {
+	chain, err := s.subjects.ListChainTests(ctx, subjectID)
+	if err != nil {
+		return nil, false, err
+	}
+	for i := range chain {
+		if chain[i].TestNumber == number {
+			return &chain[i], false, nil
+		}
+	}
+	pending, err = s.gen.HasPendingOrRunningChainJob(ctx, subjectID, number)
+	return nil, pending, err
+}
+
+// PersonalTestStatus reports whether the user's personal weak-topics test of
+// the subject exists (test != nil) or is still being generated (pending).
+func (s *QuizService) PersonalTestStatus(ctx context.Context, userID, subjectID int64) (test *models.Test, pending bool, err error) {
+	test, err = s.gen.FindPersonalTest(ctx, subjectID, userID)
+	if err != nil || test != nil {
+		return test, false, err
+	}
+	pending, err = s.gen.HasPendingOrRunningPersonalJob(ctx, subjectID, userID)
+	return nil, pending, err
+}
+
 // EnsurePersonalTest exposes the per-user weak-topics test
 // lookup/generation to handlers ("🎯 Слабые темы" in the main menu).
 //

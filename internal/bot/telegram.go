@@ -249,6 +249,18 @@ func (c *Client) AnswerCallbackQuery(ctx context.Context, id, text string) error
 	return c.call(ctx, "answerCallbackQuery", payload, nil)
 }
 
+// AnswerCallbackAlert acknowledges a callback with a MODAL alert (a dialog
+// with an OK button) instead of the tiny toast that disappears after a few
+// seconds — used for important notices the user must actually read.
+func (c *Client) AnswerCallbackAlert(ctx context.Context, id, text string) error {
+	payload := map[string]any{
+		"callback_query_id": id,
+		"text":              truncateRunes(text, maxCallbackAnswerRunes),
+		"show_alert":        true,
+	}
+	return c.call(ctx, "answerCallbackQuery", payload, nil)
+}
+
 // SetWebhook registers the webhook URL for the bot.
 func (c *Client) SetWebhook(ctx context.Context, webhookURL string) error {
 	return c.call(ctx, "setWebhook", map[string]any{
