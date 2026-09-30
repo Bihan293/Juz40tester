@@ -1,6 +1,20 @@
 # JUZ40 Tester
 
-Telegram-бот для подготовки к ЕНТ/УБТ для школьников 9–11 классов (JUZ40). Стек: Go, Telegram Bot API (webhook), PostgreSQL (Neon) + pgx/v5, DeepSeek API (генерация тестов), Docker, Render.
+Telegram-бот для подготовки к ЕНТ/УБТ для школьников 9–11 классов (JUZ40). Стек: Go, Telegram Bot API (webhook), PostgreSQL (Neon) + pgx/v5, **Groq API (бесплатно: GPT-OSS 120B + Qwen 3.8 27B)** + DeepSeek API (платный резерв), Docker, Render.
+
+## 💸 Groq: бесплатные модели вместо DeepSeek
+
+С `GROQ_API_KEY` почти вся ИИ-работа уходит на бесплатный тариф Groq, DeepSeek вызывается только как резерв:
+
+| Задача | Модель | Резерв |
+|---|---|---|
+| Перевод теста на казахский | `qwen/qwen3.8-27b` (instruct, без рассуждений — быстро) | `openai/gpt-oss-120b` → DeepSeek |
+| Генерация chain-тестов | `openai/gpt-oss-120b` (reasoning medium → low) | Qwen → DeepSeek |
+| Тест по слабым темам | `openai/gpt-oss-120b` (reasoning low) | Qwen → DeepSeek |
+
+Лимиты Free-плана (на каждую модель): **30 RPM · 1 000 RPD · 8 000 TPM · 200 000 TPD**, причём 8 000 TPM — это ещё и максимальный размер одного запроса (prompt + max_tokens). Бот соблюдает их локально (скользящие окна + заголовки `x-ratelimit-*` + `retry-after`, запас 10%), режет перевод на куски, которые гарантированно влезают в один запрос, и при исчерпании квоты мгновенно переходит на следующую модель — ошибок 429/413 пользователь не увидит. Подробно: **[docs/GROQ_LIMITS.md](docs/GROQ_LIMITS.md)**.
+
+Без `GROQ_API_KEY` бот работает ровно как раньше (только DeepSeek). Описание ниже про DeepSeek относится к резервному пути.
 
 Тесты генерируются ИИ **одним дешёвым вызовом**: **deepseek-flash** (DeepSeek-V4.1-Flash) **в thinking-режиме** (`{"thinking":{"type":"enabled"}}` + официальный `reasoning_effort`) пишет весь тест из 20 вопросов, сам проверяя ключи ответов. Усилие адаптивное: chain-тесты (по одному на предмет, общие для всех учеников) — `reasoning_effort=high` («средний» уровень думания), персональные тесты по слабым темам и все ретраи — `low`. Итог ≈ **$0.002–0.006 за тест** (жёсткий потолок одного вызова ~$0.0096 по пиковому тарифу — `max_tokens=8000`, покрывает и скрытые thinking-токены). Старые имена моделей `deepseek-chat`/`deepseek-reasoner` **удалены из API 24.07.2026** и не используются; если thinking-параметры отвергаются (старый прокси) — клиент прозрачно откатывается на **deepseek-v4-pro** (non-thinking, дороже — только fallback). Каждый вызов логирует реальные токены и оценку стоимости (off-peak/peak + сумма за сессию) — чек всегда виден в логах сервера. При пустой цепочке предмета Тест 1 ставится в очередь немедленно при старте. Без `DEEPSEEK_API_KEY` генерация выключена — предмет останется без тестов.
 
@@ -53,7 +67,8 @@ internal/
   bot/            минимальный клиент Telegram Bot API (inline + reply клавиатуры)
   config/         загрузка конфигурации из env (модели, off-peak окно)
   database/       подключение pgxpool + миграции
-  deepseek/       клиент DeepSeek (chat + reasoner, JSON mode)
+  deepseek/       клиент DeepSeek (chat + reasoner, JSON mode) — платный резерв
+  groq/           клиент Groq + локальный rate limiter (RPM/RPD/TPM/TPD)
   handlers/       обработчики сообщений и callback-ов (сетка тестов, пагинация)
   models/         доменные модели и правила системы знаний
   repositories/   SQL-доступ к данным (включая очередь генерации и state)
@@ -83,7 +98,10 @@ Seed при старте создаёт стартовый предмет (ид�
 | `DATABASE_URL` | строка подключения PostgreSQL (Neon) |
 | `WEBHOOK_URL` | публичный URL сервиса (без пути) |
 | `PORT` | порт HTTP (по умолчанию 8080) |
-| `DEEPSEEK_API_KEY` | (опционально) ключ DeepSeek API — включает ИИ-генерацию тестов |
+| `GROQ_API_KEY` | (рекомендуется) ключ Groq — бесплатные перевод (Qwen 3.8 27B) и генерация (GPT-OSS 120B), см. [docs/GROQ_LIMITS.md](docs/GROQ_LIMITS.md) |
+| `GROQ_BASE_URL` | (опционально) по умолчанию `https://api.groq.com/openai/v1` |
+| `GROQ_RPM` / `GROQ_RPD` / `GROQ_TPM` / `GROQ_TPD` | (опционально) переопределить лимиты Groq — только после перехода на Developer-план |
+| `DEEPSEEK_API_KEY` | (опционально) ключ DeepSeek API — платный резерв для генерации и перевода (без Groq — основной провайдер) |
 | `DEEPSEEK_REASONER_MODEL` | (опционально) основная thinking-модель генерации, по умолчанию `deepseek-flash` (усилие: high для chain-тестов, low для weak-тестов и ретраев) |
 | `DEEPSEEK_MODEL` | (опционально) запасная non-thinking модель, по умолчанию `deepseek-v4-pro` |
 | `DEEPSEEK_BASE_URL` | (опционально) переопределение endpoint, по умолчанию `https://api.deepseek.com` |
@@ -103,5 +121,5 @@ go build ./...
 
 1. Создать Neon PostgreSQL и скопировать `DATABASE_URL`.
 2. Render → New → Web Service → Docker (репозиторий подключается как есть).
-3. Задать переменные окружения: `BOT_TOKEN`, `DATABASE_URL`, `WEBHOOK_URL` (URL, который выдаст Render, вида `https://<name>.onrender.com`), плюс `DEEPSEEK_API_KEY` для ИИ-генерации.
+3. Задать переменные окружения: `BOT_TOKEN`, `DATABASE_URL`, `WEBHOOK_URL` (URL, который выдаст Render, вида `https://<name>.onrender.com`), плюс `GROQ_API_KEY` (бесплатная ИИ-генерация и перевод) и `DEEPSEEK_API_KEY` (платный резерв).
 4. После деплоя бот сам применит миграции (включая удаление старых тестов-заглушек), создаст предмет, поставит Тест 1 в очередь генерации, выставит webhook и запустит фоновый воркер генерации.

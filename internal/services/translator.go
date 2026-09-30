@@ -3,22 +3,33 @@
 // Cost discipline (the whole point of this service): a question is
 // translated EXACTLY ONCE, cached in question_translations and reused by
 // every user forever — there is no per-user translation and no repeated
-// API call. The Russian question row always stays the master version: when
-// a Kazakh user opens a test whose questions have no cached translation
-// yet, the whole test is translated in ONE DeepSeek Flash call (low effort
-// — translation is mechanical) and stored. If the very same test is
-// already cached, zero API calls are made.
+// API call. The Russian question row always stays the master version.
+//
+// Provider route (translation is mechanical — no paid reasoning needed):
+//  1. Groq Qwen 3.8 27B, instruct mode (reasoning_effort=none) — free, fast
+//     (~450 tok/s), strong multilingual; the primary translator;
+//  2. Groq GPT-OSS 120B (reasoning low) — separate free quota bucket;
+//  3. DeepSeek flash — the paid last resort (the old behaviour).
+//
+// The Groq free tier caps ONE request at 8000 tokens (prompt + max output),
+// so the questions are packed into chunks that provably fit that ceiling;
+// each chunk is saved as soon as it is translated (partial progress is
+// never lost, the next open only translates what is missing). If the very
+// same test is already cached, zero API calls are made.
 package services
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Bihan293/Juz40-test2/internal/deepseek"
+	"github.com/Bihan293/Juz40-test2/internal/groq"
 	"github.com/Bihan293/Juz40-test2/internal/models"
 	"github.com/Bihan293/Juz40-test2/internal/repositories"
 )
@@ -28,6 +39,16 @@ const (
 	// question+4 options, plus the low-effort thinking tokens). Kazakh text
 	// is comparable in length to Russian, so 8000 tokens is generous.
 	translateMaxTokens = 8000
+
+	// Kazakh output is longer in tokens than the Russian input (agglutinative
+	// morphology, weaker tokenizer coverage): the reply of a chunk is
+	// budgeted at kkOutputFactor x the payload tokens + a fixed overhead.
+	kkOutputFactor   = 1.7
+	kkOutputOverhead = 150
+	// groqTranslateMaxWait: a user is waiting on the translation — never
+	// sit on the per-minute window for long; the next free bucket (or the
+	// paid fallback) is tried instead.
+	groqTranslateMaxWait = 8 * time.Second
 )
 
 // translationSystemPrompt keeps the model strictly in translator mode: the
@@ -63,6 +84,7 @@ type translationResponse struct {
 // translation.
 type TranslatorService struct {
 	ds   *deepseek.Client // nil when DEEPSEEK_API_KEY is not set
+	gq   *groq.Client     // nil when GROQ_API_KEY is not set
 	repo *repositories.TranslationRepository
 
 	// inFlight serialises translation of the same test so two concurrent
@@ -75,8 +97,18 @@ func NewTranslatorService(ds *deepseek.Client, repo *repositories.TranslationRep
 	return &TranslatorService{ds: ds, repo: repo, inFlight: map[int64]*sync.Mutex{}}
 }
 
-// Enabled reports whether translation is configured.
-func (t *TranslatorService) Enabled() bool { return t != nil && t.ds != nil && t.repo != nil }
+// WithGroq wires the free Groq provider (Qwen primary, GPT-OSS secondary).
+func (t *TranslatorService) WithGroq(gq *groq.Client) *TranslatorService {
+	if gq != nil && gq.Enabled() {
+		t.gq = gq
+	}
+	return t
+}
+
+// Enabled reports whether translation is configured (any provider).
+func (t *TranslatorService) Enabled() bool {
+	return t != nil && t.repo != nil && (t.ds != nil || t.gq != nil)
+}
 
 // testLock returns the per-test translation mutex.
 func (t *TranslatorService) testLock(testID int64) *sync.Mutex {
@@ -182,62 +214,217 @@ func (t *TranslatorService) CopyTranslationsToTest(ctx context.Context, srcTestI
 	return t.repo.CopyTranslationsToTest(ctx, srcTestID, dstQuestionIDs, models.TestLangKK)
 }
 
-// translateBatch translates one batch of questions with a single model call
-// and stores the result. The master correct_answer letters are preserved.
+// translateBatch translates the given questions (packed into chunks that
+// fit one Groq free-tier request) and stores every chunk right away. The
+// master correct_answer letters are preserved (never sent to the model).
 func (t *TranslatorService) translateBatch(ctx context.Context, questions []models.Question) error {
+	var errs []error
+	for _, ch := range chunkForTranslation(questions) {
+		if err := t.translateChunk(ctx, ch); err != nil {
+			// Keep going: the other chunks can still be cached; the missing
+			// questions fall back to Russian and are retried on next open.
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// translationPayload builds the compact model payload of a chunk (local ids
+// 1..n — shorter than DB ids — and no answer key).
+func translationPayload(questions []models.Question) []translationQuestion {
 	payload := make([]translationQuestion, 0, len(questions))
-	correctByID := make(map[int64]string, len(questions))
-	masterByIdx := make(map[int]*models.Question, len(questions))
 	for i, q := range questions {
 		payload = append(payload, translationQuestion{
-			ID:       i + 1, // a small local id, never the DB id (shorter prompt)
+			ID:       i + 1,
 			Question: q.Text,
 			Options:  []string{q.OptionA, q.OptionB, q.OptionC, q.OptionD},
 			Topic:    q.Topic,
 		})
-		correctByID[q.ID] = q.CorrectAnswer
-		qi := q
-		masterByIdx[i+1] = &qi
 	}
+	return payload
+}
+
+func translationMessages(payload []translationQuestion) ([]deepseek.Message, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	raw, err := t.ds.TranslateJSON(ctx, []deepseek.Message{
+	return []deepseek.Message{
 		{Role: "system", Content: translationSystemPrompt},
 		{Role: "user", Content: "Переведи на казахский язык этот JSON-массив вопросов и выдай строго JSON по схеме, ровно " + fmt.Sprint(len(payload)) + " переводов, в том же порядке:\n" + string(body)},
-	}, translateMaxTokens)
-	if err != nil {
-		return fmt.Errorf("translate: %w", err)
-	}
+	}, nil
+}
 
-	tr, err := parseTranslationJSON(raw)
+// translationOutputBudget estimates the reply size (tokens) of a chunk.
+func translationOutputBudget(payload []translationQuestion) int {
+	body, _ := json.Marshal(payload)
+	return int(float64(groq.EstimateTextTokens(string(body)))*kkOutputFactor) + kkOutputOverhead
+}
+
+// gptOSSTranslateHeadroom: GPT-OSS always spends some reasoning tokens even
+// at effort=low — extra output budget on top of the visible JSON.
+const (
+	gptOSSTranslateHeadroom    = 1200
+	gptOSSTranslateMinHeadroom = 300
+)
+
+// fitsOneGroqRequest reports whether a chunk (prompt + expected reply) fits
+// the per-request ceiling (free-tier TPM) of the primary Groq translator.
+func fitsOneGroqRequest(questions []models.Question) bool {
+	payload := translationPayload(questions)
+	msgs, err := translationMessages(payload)
+	if err != nil {
+		return false
+	}
+	return groq.Budget(groq.ModelQwen27B, toGroqMessages(msgs)) >= translationOutputBudget(payload)
+}
+
+// chunkForTranslation greedily packs questions into the fewest chunks that
+// each fit one Groq request (typically 2–3 chunks for a 20-question test).
+// A single oversized question still forms its own chunk — the Groq step
+// then reports ErrTooLarge locally (no HTTP call) and DeepSeek handles it.
+func chunkForTranslation(questions []models.Question) [][]models.Question {
+	var chunks [][]models.Question
+	var cur []models.Question
+	for _, q := range questions {
+		next := append(append([]models.Question(nil), cur...), q)
+		if len(cur) > 0 && !fitsOneGroqRequest(next) {
+			chunks = append(chunks, cur)
+			cur = []models.Question{q}
+			continue
+		}
+		cur = next
+	}
+	if len(cur) > 0 {
+		chunks = append(chunks, cur)
+	}
+	return chunks
+}
+
+// translationSteps returns the provider route of one chunk.
+func (t *TranslatorService) translationSteps(msgs []deepseek.Message, outBudget int) []aiStep {
+	var steps []aiStep
+	if t.gq != nil {
+		gm := toGroqMessages(msgs)
+		steps = append(steps,
+			groqStep(t.gq, groq.Request{
+				Model: groq.ModelQwen27B, Messages: gm,
+				// +33% headroom over the estimate (clamped to the per-request
+				// ceiling by the client); the limiter re-credits unused tokens.
+				MaxTokens: outBudget + outBudget/3, MinTokens: outBudget,
+				Effort:      groq.EffortNone, // instruct mode — translation needs no reasoning
+				Temperature: 0.3, TopP: 0.8,
+				Schema: translationJSONSchema, SchemaName: "kk_translation",
+				MaxWait: groqTranslateMaxWait,
+			}),
+			groqStep(t.gq, groq.Request{
+				Model: groq.ModelGPTOSS120B, Messages: gm,
+				MaxTokens: outBudget + gptOSSTranslateHeadroom,
+				MinTokens: outBudget + gptOSSTranslateMinHeadroom,
+				Effort:    groq.EffortLow,
+				Schema:    translationJSONSchema, SchemaName: "kk_translation",
+				MaxWait: groqTranslateMaxWait,
+			}),
+		)
+	}
+	if t.ds != nil {
+		ds := t.ds
+		steps = append(steps, aiStep{
+			name: "deepseek/" + ds.ReasonerModel() + "(translate)",
+			run: func(ctx context.Context) (string, error) {
+				return ds.TranslateJSON(ctx, msgs, translateMaxTokens)
+			},
+		})
+	}
+	return steps
+}
+
+// translationJSONSchema is the strict Structured Outputs schema of a reply.
+var translationJSONSchema = map[string]any{
+	"type": "object",
+	"properties": map[string]any{
+		"translations": map[string]any{
+			"type": "array",
+			"items": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"id":       map[string]any{"type": "integer"},
+					"question": map[string]any{"type": "string"},
+					"options":  map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+					"topic":    map[string]any{"type": "string"},
+				},
+				"required":             []string{"id", "question", "options", "topic"},
+				"additionalProperties": false,
+			},
+		},
+	},
+	"required":             []string{"translations"},
+	"additionalProperties": false,
+}
+
+// translateChunk translates one chunk through the provider route and saves
+// it. Every reply is validated locally before anything is written.
+func (t *TranslatorService) translateChunk(ctx context.Context, questions []models.Question) error {
+	payload := translationPayload(questions)
+	msgs, err := translationMessages(payload)
 	if err != nil {
 		return err
 	}
-	if len(tr.Translations) != len(payload) {
-		return fmt.Errorf("translator: need %d translations, got %d", len(payload), len(tr.Translations))
+	correctByID := make(map[int64]string, len(questions))
+	masterByIdx := make(map[int]*models.Question, len(questions))
+	for i := range questions {
+		correctByID[questions[i].ID] = questions[i].CorrectAnswer
+		masterByIdx[i+1] = &questions[i]
 	}
 
-	out := make([]models.QuestionTranslation, 0, len(tr.Translations))
+	var out []models.QuestionTranslation
+	validate := func(raw string) error {
+		rows, err := buildTranslations(raw, len(payload), masterByIdx)
+		if err != nil {
+			return err
+		}
+		out = rows
+		return nil
+	}
+	task := fmt.Sprintf("translate %d q", len(questions))
+	if _, _, err := runSteps(ctx, task, t.translationSteps(msgs, translationOutputBudget(payload)), validate); err != nil {
+		return fmt.Errorf("translate: %w", err)
+	}
+	return t.repo.SaveTranslations(ctx, out, correctByID)
+}
+
+// buildTranslations parses and validates a model reply against the chunk.
+func buildTranslations(raw string, want int, masterByIdx map[int]*models.Question) ([]models.QuestionTranslation, error) {
+	tr, err := parseTranslationJSON(raw)
+	if err != nil {
+		return nil, err
+	}
+	if len(tr.Translations) != want {
+		return nil, fmt.Errorf("translator: need %d translations, got %d", want, len(tr.Translations))
+	}
+	seen := make(map[int]bool, want)
+	out := make([]models.QuestionTranslation, 0, want)
 	for i := range tr.Translations {
 		q := &tr.Translations[i]
 		master := masterByIdx[q.ID]
 		if master == nil {
-			return fmt.Errorf("translator: unknown translation id %d", q.ID)
+			return nil, fmt.Errorf("translator: unknown translation id %d", q.ID)
 		}
+		if seen[q.ID] {
+			return nil, fmt.Errorf("translator: duplicate translation id %d", q.ID)
+		}
+		seen[q.ID] = true
 		q.Question = strings.TrimSpace(q.Question)
 		if len(q.Question) < 4 {
-			return fmt.Errorf("translator: question %d: text too short", q.ID)
+			return nil, fmt.Errorf("translator: question %d: text too short", q.ID)
 		}
 		if len(q.Options) != 4 {
-			return fmt.Errorf("translator: question %d: need 4 options, got %d", q.ID, len(q.Options))
+			return nil, fmt.Errorf("translator: question %d: need 4 options, got %d", q.ID, len(q.Options))
 		}
 		for j := range q.Options {
 			q.Options[j] = strings.TrimSpace(q.Options[j])
 			if q.Options[j] == "" {
-				return fmt.Errorf("translator: question %d: empty option %d", q.ID, j+1)
+				return nil, fmt.Errorf("translator: question %d: empty option %d", q.ID, j+1)
 			}
 		}
 		out = append(out, models.QuestionTranslation{
@@ -252,7 +439,7 @@ func (t *TranslatorService) translateBatch(ctx context.Context, questions []mode
 			CorrectAnswer: master.CorrectAnswer,
 		})
 	}
-	return t.repo.SaveTranslations(ctx, out, correctByID)
+	return out, nil
 }
 
 // parseTranslationJSON extracts the JSON object from a model reply
