@@ -119,6 +119,34 @@ func (r *GenerationRepository) WeakTopics(ctx context.Context, userID, subjectID
 	return out, rows.Err()
 }
 
+// SubjectsWithWeakTopics returns the ids of subjects in which the user has
+// at least one weak topic — using EXACTLY the same definition as WeakTopics
+// (an answered question with status < 2 and a non-empty topic). The
+// «🎯 Слабые темы» picker lists only these subjects: a subject the user has
+// never practised cannot have a weak topic, and offering it led to an
+// endless «generating…» state.
+func (r *GenerationRepository) SubjectsWithWeakTopics(ctx context.Context, userID int64) (map[int64]bool, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT DISTINCT q.subject_id
+		FROM questions q
+		JOIN user_question_progress p
+		     ON p.question_id = q.id AND p.user_id = $1
+		WHERE q.topic <> '' AND p.status < 2`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]bool{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
+}
+
 // scanTest scans a tests row (id, subject_id, test_number, title, is_active,
 // kind, topics, owner_user_id, topics_fingerprint) into a models.Test.
 // Returns (nil, nil) when the row does not exist.

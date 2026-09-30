@@ -8,6 +8,8 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/Bihan293/Juz40-test2/internal/bot"
 	"github.com/Bihan293/Juz40-test2/internal/models"
@@ -27,19 +29,19 @@ const (
 // Callback data prefixes (kept short — Telegram limit is 64 bytes).
 const (
 	cbSubjects    = "subj:list"
-	cbSubject     = "subj:open:"   // + subjectID
-	cbSubjectPage = "subj:page:"   // + subjectID:page
+	cbSubject     = "subj:open:"    // + subjectID
+	cbSubjectPage = "subj:page:"    // + subjectID:page
 	cbOpenTest    = "test:open:"    // + testID (opens the test straight away)
 	cbPending     = "test:pending"  // legacy: test is being generated (toast only)
 	cbPendingID   = "test:pending:" // + subjectID:testNumber — tap re-queues a stuck/failed generation
-	cbWeakMenu    = "weak:menu"    // weak-topics subject picker
-	cbWeakSubject = "weak:subj:"   // + subjectID (open/generate the personal weak test)
-	cbFinish      = "test:finish:" // + testID (finish & delete a mastered personal test)
-	cbAnswer      = "ans:"         // + attemptID:position:displayIndex
-	cbExit        = "test:exit:"   // + attemptID (asks for confirmation)
-	cbExitYes     = "test:exit:y:" // + attemptID (confirmed exit)
-	cbExitNo      = "test:exit:n:" // + attemptID (cancel — back to the question)
-	cbRetry       = "test:retry:"  // + attemptID (same test again)
+	cbWeakMenu    = "weak:menu"     // weak-topics subject picker
+	cbWeakSubject = "weak:subj:"    // + subjectID (open/generate the personal weak test)
+	cbFinish      = "test:finish:"  // + testID (finish & delete a mastered personal test)
+	cbAnswer      = "ans:"          // + attemptID:position:displayIndex
+	cbExit        = "test:exit:"    // + attemptID (asks for confirmation)
+	cbExitYes     = "test:exit:y:"  // + attemptID (confirmed exit)
+	cbExitNo      = "test:exit:n:"  // + attemptID (cancel — back to the question)
+	cbRetry       = "test:retry:"   // + attemptID (same test again)
 	cbProgress    = "nav:progress"
 	cbProgSubject = "prog:subj:" // + subjectID
 	cbSettings    = "nav:settings"
@@ -56,6 +58,10 @@ type Handler struct {
 	tg    *bot.Client
 	users *repositories.UserRepository
 	quiz  *services.QuizService
+	// watchers tracks the active «wait until the test is generated»
+	// goroutines (key -> struct{}), so repeated taps on the same ⏳ button
+	// never spawn duplicate watchers or flood the chat with notes.
+	watchers sync.Map
 }
 
 // New creates a Handler.
@@ -105,7 +111,7 @@ func (h *Handler) handleMessage(ctx context.Context, m *bot.Message) {
 	case kbSubjects, "/subjects":
 		h.showSubjects(ctx, m.Chat.ID)
 	case kbWeak, "/weak":
-		h.showWeakMenu(ctx, m.Chat.ID)
+		h.showWeakMenu(ctx, m.Chat.ID, user)
 	case kbProgress, "/progress":
 		h.showProgress(ctx, m.Chat.ID, user)
 	case kbTop, "/top":
@@ -149,20 +155,18 @@ func (h *Handler) hideReplyKeyboard(ctx context.Context, chatID int64) {
 	}
 }
 
-// restoreReplyKeyboard brings the bottom menu back once the test is over
-// (finished or exited) — it was hidden while the test ran. No chatter: the
-// user asked for NO extra message here, so the menu is restored silently
-// via a service message that is deleted right after (the keyboard stays).
+// restoreReplyKeyboard brings the bottom main menu back once the test is
+// over (finished or exited) — it was hidden while the test ran.
+//
+// BUG FIX: the menu used to be restored by a service message that was
+// deleted right away. Telegram clients drop a reply keyboard together with
+// the message that carried it, so after a test the main menu never came
+// back (only the inline «⬅️ Главное меню» button helped, «📚 К предметам»
+// left the user stuck without a menu). The note now STAYS in the chat, so
+// the keyboard reliably reappears.
 func (h *Handler) restoreReplyKeyboard(ctx context.Context, chatID int64) {
-	msgID, err := h.tg.SendMessage(ctx, chatID, "⬇️", mainMenuKeyboard())
-	if err != nil {
+	if _, err := h.tg.SendMessage(ctx, chatID, "🏠 Главное меню снова доступно — кнопки внизу 👇", mainMenuKeyboard()); err != nil {
 		log.Printf("restore reply keyboard: %v", err)
-		return
-	}
-	// The message is only the keyboard-restore vehicle — delete it so the
-	// chat stays clean. The keyboard stays visible after the deletion.
-	if err := h.tg.DeleteMessage(ctx, chatID, msgID); err != nil {
-		log.Printf("delete keyboard-restore note: %v", err)
 	}
 }
 
@@ -228,6 +232,9 @@ func (h *Handler) renderSubjects(ctx context.Context, chatID int64) (string, *bo
 		buttons = append(buttons, bot.Btn(subjectEmoji(s.Name)+" "+s.Name, cbSubject+strconv.FormatInt(s.ID, 10)))
 	}
 	rows := bot.ChunkButtons(buttons, 1)
+	// A way home from the subjects list: without it a user who left a test
+	// via «📚 К предметам» had no path back to the main menu.
+	rows = append(rows, bot.Row(bot.Btn("⬅️ Главное меню", cbMainMenu)))
 	return "📚 Выберите предмет:", &bot.InlineKeyboardMarkup{InlineKeyboard: rows}, nil
 }
 
@@ -346,7 +353,10 @@ func (h *Handler) renderSubject(ctx context.Context, user *models.User, subjectI
 		rows = append(rows, nav)
 	}
 
-	rows = append(rows, bot.Row(bot.Btn("⬅️ К предметам", cbSubjects)))
+	rows = append(rows, bot.Row(
+		bot.Btn("⬅️ К предметам", cbSubjects),
+		bot.Btn("🏠 Главное меню", cbMainMenu),
+	))
 	return b.String(), &bot.InlineKeyboardMarkup{InlineKeyboard: rows}, nil
 }
 
@@ -371,26 +381,38 @@ func (h *Handler) openSubject(ctx context.Context, cb *bot.CallbackQuery, user *
 }
 
 // handlePendingTest handles a tap on a ⏳ (still generating) test button.
-// Beyond the toast it REVIVES the generation: a test whose job failed (all
-// retries exhausted) or got stuck while the queue was broken used to hang in
-// «Минуточку...» forever — the tap only showed a toast and nothing was ever
-// re-queued. Now the tap puts the job back into the queue as URGENT (the
-// user is actively waiting), so the worker picks it up within ~20 seconds.
-// A healthy already-running job is unaffected (the revive is idempotent).
+// It REVIVES the generation (a failed/stuck job is re-queued as URGENT) and,
+// instead of a tiny toast that vanished after a few seconds, sends a clear
+// chat message «⏳ Тест генерируется… никуда не уходи». A background watcher
+// then edits that message into «✅ Тест готов» with a start button (or an
+// honest error with a retry button) — the user is never left guessing.
 func (h *Handler) handlePendingTest(ctx context.Context, cb *bot.CallbackQuery, user *models.User, data string) {
 	parts := strings.Split(strings.TrimPrefix(data, cbPendingID), ":")
 	if len(parts) != 2 {
-		h.answerCallback(ctx, cb, "Минуточку, тест генерируется ⏳ Загляни сюда через минуту-две")
+		h.answerAlert(ctx, cb, "⏳ Тест ещё генерируется. Подожди минуточку и открой предмет снова.")
 		return
 	}
 	subjectID, err1 := strconv.ParseInt(parts[0], 10, 64)
 	testNumber, err2 := strconv.Atoi(parts[1])
 	if err1 != nil || err2 != nil {
-		h.answerCallback(ctx, cb, "Минуточку, тест генерируется ⏳ Загляни сюда через минуту-две")
+		h.answerAlert(ctx, cb, "⏳ Тест ещё генерируется. Подожди минуточку и открой предмет снова.")
 		return
 	}
 	h.quiz.ReviveChainTest(ctx, subjectID, testNumber, user.ID)
-	h.answerCallback(ctx, cb, "Минуточку, тест генерируется ⏳ Если он застрял — я только что перезапустил сборку, загляни через минуту-две")
+
+	// The test may have been generated a moment ago — open it right away.
+	if test, _, err := h.quiz.ChainTestStatus(ctx, subjectID, testNumber); err == nil && test != nil {
+		h.openTest(ctx, cb, user, test.ID)
+		return
+	}
+
+	key := fmt.Sprintf("chain:%d:%d:%d", user.ID, subjectID, testNumber)
+	check := func(ctx context.Context) (*models.Test, bool, error) {
+		return h.quiz.ChainTestStatus(ctx, subjectID, testNumber)
+	}
+	retryData := cbPendingID + strconv.FormatInt(subjectID, 10) + ":" + strconv.Itoa(testNumber)
+	note := fmt.Sprintf("⏳ «Тест %d» сейчас генерируется…\n\nНикуда не уходи, подожди минуточку — как только тест будет готов, я сразу пришлю сюда кнопку, чтобы его начать 👇", testNumber)
+	h.startGenerationWatch(ctx, cb, key, note, check, retryData)
 }
 
 // flipSubjectPage switches the tests-grid page and remembers it.
@@ -416,12 +438,21 @@ func (h *Handler) flipSubjectPage(ctx context.Context, cb *bot.CallbackQuery, us
 // --- Weak-topics (personal tests) ------------------------------------------------
 
 // renderWeakMenu renders the weak-topics subject picker (main menu ->
-// "🎯 Слабые темы"). No generation is triggered here — a test is created
-// only when the user explicitly opens a subject.
-func (h *Handler) renderWeakMenu(ctx context.Context) (string, *bot.InlineKeyboardMarkup, error) {
-	subjects, err := h.quiz.ListSubjects(ctx)
+// "🎯 Слабые темы"). Only subjects in which the user ACTUALLY has weak
+// (🔴/🟡) topics are listed: a subject the user never practised cannot have
+// a weak topic, and offering it led to an endless «generating…» state. No
+// generation is triggered here — a test is created only on an explicit tap.
+func (h *Handler) renderWeakMenu(ctx context.Context, user *models.User) (string, *bot.InlineKeyboardMarkup, error) {
+	subjects, err := h.quiz.SubjectsWithWeakTopics(ctx, user.ID)
 	if err != nil {
 		return "", nil, err
+	}
+	if len(subjects) == 0 {
+		return "🎯 Слабые темы\n\nПока у тебя нет слабых тем 🙌\n\nОни появятся, когда ты пройдёшь хотя бы один обычный тест и ошибёшься в каких-то вопросах. Загляни в «📚 Предметы» — а потом возвращайся сюда за персональным тестом.",
+			&bot.InlineKeyboardMarkup{InlineKeyboard: [][]bot.InlineKeyboardButton{
+				bot.Row(bot.Btn("📚 К предметам", cbSubjects)),
+				bot.Row(bot.Btn("⬅️ Главное меню", cbMainMenu)),
+			}}, nil
 	}
 	buttons := make([]bot.InlineKeyboardButton, 0, len(subjects))
 	for _, s := range subjects {
@@ -429,12 +460,12 @@ func (h *Handler) renderWeakMenu(ctx context.Context) (string, *bot.InlineKeyboa
 	}
 	rows := bot.ChunkButtons(buttons, 1)
 	rows = append(rows, bot.Row(bot.Btn("⬅️ Главное меню", cbMainMenu)))
-	return "🎯 Слабые темы\n\nЯ соберу персональный тест из 20 вопросов по темам, которые у тебя пока 🔴 и 🟡. Выбери предмет:", &bot.InlineKeyboardMarkup{InlineKeyboard: rows}, nil
+	return "🎯 Слабые темы\n\nЯ соберу персональный тест из 20 вопросов по темам, которые у тебя пока 🔴 и 🟡. Здесь только предметы, в которых у тебя есть слабые темы. Выбери предмет:", &bot.InlineKeyboardMarkup{InlineKeyboard: rows}, nil
 }
 
 // showWeakMenu is used from the Reply Keyboard (new message).
-func (h *Handler) showWeakMenu(ctx context.Context, chatID int64) {
-	text, kb, err := h.renderWeakMenu(ctx)
+func (h *Handler) showWeakMenu(ctx context.Context, chatID int64, user *models.User) {
+	text, kb, err := h.renderWeakMenu(ctx, user)
 	if err != nil {
 		log.Printf("weak menu: %v", err)
 		if _, err := h.tg.SendMessage(ctx, chatID, "Ошибка загрузки 😔", nil); err != nil {
@@ -448,8 +479,8 @@ func (h *Handler) showWeakMenu(ctx context.Context, chatID int64) {
 }
 
 // editWeakMenu is used from an inline button (edits the current message).
-func (h *Handler) editWeakMenu(ctx context.Context, cb *bot.CallbackQuery) {
-	text, kb, err := h.renderWeakMenu(ctx)
+func (h *Handler) editWeakMenu(ctx context.Context, cb *bot.CallbackQuery, user *models.User) {
+	text, kb, err := h.renderWeakMenu(ctx, user)
 	if err != nil {
 		log.Printf("weak menu: %v", err)
 		h.answerCallback(ctx, cb, "Ошибка загрузки")
@@ -470,15 +501,23 @@ func (h *Handler) openWeakSubject(ctx context.Context, cb *bot.CallbackQuery, us
 		return
 	}
 	if len(topics) == 0 {
-		h.answerCallback(ctx, cb, "Пока нет слабых тем — пройди пару обычных тестов в разделе «📚 Предметы»")
+		// Stale button (the topics got mastered meanwhile) — refresh the
+		// picker so the subject disappears from the list.
+		h.answerAlert(ctx, cb, "В этом предмете у тебя больше нет слабых тем 🎉 Пройди обычные тесты в «📚 Предметы» — новые слабые темы появятся здесь.")
+		h.editWeakMenu(ctx, cb, user)
 		return
 	}
 	if test == nil {
-		if pending {
-			h.answerCallback(ctx, cb, "Минуточку, тест по твоим слабым темам генерируется ⏳ Загляни сюда через минуту-две")
-		} else {
-			h.answerCallback(ctx, cb, "Генерация сейчас недоступна")
+		if !pending {
+			h.answerAlert(ctx, cb, "Генерация тестов сейчас недоступна 😔 Попробуй чуть позже.")
+			return
 		}
+		key := fmt.Sprintf("weak:%d:%d", user.ID, subjectID)
+		check := func(ctx context.Context) (*models.Test, bool, error) {
+			return h.quiz.PersonalTestStatus(ctx, user.ID, subjectID)
+		}
+		note := "⏳ Генерирую персональный тест по твоим слабым темам…\n\nНикуда не уходи, подожди минуточку — как только тест будет готов, я сразу пришлю сюда кнопку, чтобы его начать 👇"
+		h.startGenerationWatch(ctx, cb, key, note, check, cbWeakSubject+strconv.FormatInt(subjectID, 10))
 		return
 	}
 	// openTest acknowledges the tap itself (a toast when the first-ever Kazakh
@@ -518,7 +557,9 @@ func (h *Handler) openTest(ctx context.Context, cb *bot.CallbackQuery, user *mod
 		return
 	}
 	if !allowed {
-		h.answerCallback(ctx, cb, reason)
+		// A modal alert (with OK) instead of a vanishing toast: the unlock
+		// requirement is long and must be readable.
+		h.answerAlert(ctx, cb, reason)
 		return
 	}
 
@@ -528,23 +569,12 @@ func (h *Handler) openTest(ctx context.Context, cb *bot.CallbackQuery, user *mod
 	// completely free); otherwise the Russian master test is translated once
 	// (one DeepSeek Flash call) and stored for everyone. A translation
 	// failure never blocks the test — it opens in the Russian master version.
-	cbAnswered := false
+	// The callback is acknowledged right away (a silent ack stops the spinner);
+	// every further notice goes to the chat as a normal, readable message.
+	h.answerCallback(ctx, cb, "")
+	cbAnswered := true
 	if user.TestLang == models.TestLangKK {
-		done, terr := h.quiz.TestFullyTranslated(ctx, testID)
-		if terr != nil {
-			log.Printf("translation status %d: %v", testID, terr)
-			done = true // unknown — do not promise a wait we cannot judge
-		}
-		if !done {
-			// The first-ever translation of a test takes up to a minute — say
-			// so instead of leaving a silently spinning button. Every later
-			// open (of any user) hits the cache and skips this entirely.
-			h.answerCallback(ctx, cb, "⏳ Перевожу тест на казахский — это делается один раз, дальше он будет открываться мгновенно")
-			cbAnswered = true
-		}
-		if _, terr := h.quiz.EnsureTestTranslated(ctx, user, testID); terr != nil {
-			log.Printf("translate test %d: %v", testID, terr)
-		}
+		h.ensureTranslatedWithNote(ctx, cb.Message.Chat.ID, user, testID)
 	}
 
 	resume, err := h.quiz.ResumeOrNil(ctx, user.ID, testID)
@@ -868,8 +898,8 @@ func (h *Handler) finishPersonalTest(ctx context.Context, cb *bot.CallbackQuery,
 			bot.Row(bot.Btn("🎯 Слабые темы", cbWeakMenu)),
 			bot.Row(bot.Btn("⬅️ Главное меню", cbMainMenu)),
 		}})
-	// The personal test is finished — the bottom menu comes back.
-	h.restoreReplyKeyboard(ctx, cb.Message.Chat.ID)
+	// The bottom menu was already restored together with the result screen
+	// — no extra note needed here.
 }
 
 func (h *Handler) retryTest(ctx context.Context, cb *bot.CallbackQuery, user *models.User, attemptID int64) {
@@ -884,9 +914,7 @@ func (h *Handler) retryTest(ctx context.Context, cb *bot.CallbackQuery, user *mo
 	// calls; otherwise the test is translated once, for everyone). A failure
 	// falls back to the Russian master version, never blocks the retry.
 	if user.TestLang == models.TestLangKK {
-		if _, terr := h.quiz.EnsureTestTranslated(ctx, user, sum.Test.ID); terr != nil {
-			log.Printf("retry: translate test %d: %v", sum.Test.ID, terr)
-		}
+		h.ensureTranslatedWithNote(ctx, cb.Message.Chat.ID, user, sum.Test.ID)
 	}
 	// Every retry is a brand-new attempt with fresh shuffled question and
 	// option orders.
@@ -1255,10 +1283,10 @@ func (h *Handler) handleCallback(ctx context.Context, cb *bot.CallbackQuery) {
 	case strings.HasPrefix(data, cbPendingID):
 		h.handlePendingTest(ctx, cb, user, data)
 	case data == cbPending:
-		h.answerCallback(ctx, cb, "Минуточку, тест генерируется ⏳ Загляни сюда через минуту-две")
+		h.answerAlert(ctx, cb, "⏳ Тест ещё генерируется. Подожди минуточку и открой предмет снова.")
 	case data == cbWeakMenu:
 		h.answerCallback(ctx, cb, "")
-		h.editWeakMenu(ctx, cb)
+		h.editWeakMenu(ctx, cb, user)
 	case strings.HasPrefix(data, cbWeakSubject):
 		// openWeakSubject answers the callback itself (the result decides the
 		// text: a toast, an error, or a silent transition into the test).
@@ -1379,8 +1407,161 @@ func (h *Handler) editMessage(ctx context.Context, cb *bot.CallbackQuery, text s
 	}
 }
 
+// answerAlert answers the callback with a modal alert (dialog with an OK
+// button) — for notices that must actually be read, unlike the tiny toast.
+func (h *Handler) answerAlert(ctx context.Context, cb *bot.CallbackQuery, text string) {
+	if err := h.tg.AnswerCallbackAlert(ctx, cb.ID, text); err != nil {
+		log.Printf("answer callback alert: %v", err)
+	}
+}
+
 func (h *Handler) answerCallback(ctx context.Context, cb *bot.CallbackQuery, text string) {
 	if err := h.tg.AnswerCallbackQuery(ctx, cb.ID, text); err != nil {
 		log.Printf("answer callback: %v", err)
+	}
+}
+
+// --- «Please wait» notices ---------------------------------------------------
+
+const (
+	// genWatchInterval is how often the watcher checks whether the awaited
+	// test has been generated.
+	genWatchInterval = 5 * time.Second
+	// genWatchTimeout caps the wait (a real generation takes ~1–3 minutes,
+	// the worker's per-job timeout is 8 minutes).
+	genWatchTimeout = 10 * time.Minute
+)
+
+// ensureTranslatedWithNote makes sure the Kazakh version of the test exists.
+// When the first-ever translation is about to run (it takes up to a
+// minute), the user gets a clear CHAT MESSAGE instead of an unreadable
+// 5-second toast; the note is removed as soon as the test is ready.
+func (h *Handler) ensureTranslatedWithNote(ctx context.Context, chatID int64, user *models.User, testID int64) {
+	done, err := h.quiz.TestFullyTranslated(ctx, testID)
+	if err != nil {
+		log.Printf("translation status %d: %v", testID, err)
+		done = true // unknown — do not promise a wait we cannot judge
+	}
+	var noteID int64
+	if !done {
+		id, serr := h.tg.SendMessage(ctx, chatID,
+			"⏳ Тест переводится на казахский язык 🇰🇿\n\nНикуда не уходи, подожди минуточку — перевод делается один раз, дальше этот тест будет открываться мгновенно. Первый вопрос появится сам 👆", nil)
+		if serr != nil {
+			log.Printf("send translation note: %v", serr)
+		} else {
+			noteID = id
+		}
+	}
+	if _, terr := h.quiz.EnsureTestTranslated(ctx, user, testID); terr != nil {
+		// A translation failure never blocks the test: the Russian master
+		// version is served instead.
+		log.Printf("translate test %d: %v", testID, terr)
+		if noteID != 0 {
+			if eerr := h.tg.EditMessageText(ctx, chatID, noteID,
+				"😔 Не получилось перевести тест на казахский — пока открываю его на русском. Попробуй позже ещё раз.", nil); eerr != nil {
+				log.Printf("edit translation note: %v", eerr)
+			}
+		}
+		return
+	}
+	if noteID != 0 {
+		if derr := h.tg.DeleteMessage(ctx, chatID, noteID); derr != nil {
+			log.Printf("delete translation note: %v", derr)
+		}
+	}
+}
+
+// startGenerationWatch acknowledges the tap, posts a clearly visible chat
+// message «⏳ тест генерируется, никуда не уходи…» and starts a background
+// watcher that edits that very message into «✅ Тест готов» with a start
+// button once the test exists — or into an honest error with a retry button
+// when the generation failed / takes too long. One watcher per key: repeated
+// taps never spam the chat.
+func (h *Handler) startGenerationWatch(ctx context.Context, cb *bot.CallbackQuery, key, note string,
+	check func(context.Context) (*models.Test, bool, error), retryData string) {
+	if _, busy := h.watchers.LoadOrStore(key, struct{}{}); busy {
+		h.answerAlert(ctx, cb, "⏳ Тест ещё генерируется. Никуда не уходи — как только он будет готов, я пришлю в чат кнопку, чтобы его начать.")
+		return
+	}
+	h.answerCallback(ctx, cb, "")
+	chatID := cb.Message.Chat.ID
+	msgID, err := h.tg.SendMessage(ctx, chatID, note, nil)
+	if err != nil {
+		log.Printf("send generation note: %v", err)
+		h.watchers.Delete(key)
+		return
+	}
+	go h.watchGeneration(key, chatID, msgID, check, retryData)
+}
+
+// watchGeneration polls until the awaited test appears, then edits the
+// «please wait» note into a ready/failed/timeout message.
+func (h *Handler) watchGeneration(key string, chatID, msgID int64,
+	check func(context.Context) (*models.Test, bool, error), retryData string) {
+	defer h.watchers.Delete(key)
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("generation watcher %s panicked: %v", key, r)
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), genWatchTimeout+30*time.Second)
+	defer cancel()
+
+	retryKb := &bot.InlineKeyboardMarkup{InlineKeyboard: [][]bot.InlineKeyboardButton{
+		bot.Row(bot.Btn("🔄 Попробовать ещё раз", retryData)),
+		bot.Row(bot.Btn("⬅️ Главное меню", cbMainMenu)),
+	}}
+	deadline := time.Now().Add(genWatchTimeout)
+	misses := 0 // consecutive checks with neither a test nor an active job
+	ticker := time.NewTicker(genWatchInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		test, pending, err := check(ctx)
+		if err != nil {
+			log.Printf("generation watcher %s: %v", key, err)
+		} else if test != nil {
+			ready := fmt.Sprintf("✅ Готово! «Тест %d» сгенерирован.", test.TestNumber)
+			if test.Kind == models.TestKindPersonal {
+				ready = "✅ Готово! Персональный тест по твоим слабым темам собран."
+			}
+			h.editNote(ctx, chatID, msgID, ready+"\n\nНажми кнопку ниже, чтобы начать 👇",
+				&bot.InlineKeyboardMarkup{InlineKeyboard: [][]bot.InlineKeyboardButton{
+					bot.Row(bot.Btn("▶️ Начать тест", cbOpenTest+strconv.FormatInt(test.ID, 10))),
+				}})
+			return
+		} else if !pending {
+			// No test and no active job: the generation failed for good. Two
+			// consecutive misses guard against the short window between the
+			// job being marked done and the test becoming visible.
+			misses++
+			if misses >= 2 {
+				h.editNote(ctx, chatID, msgID, "😔 Не получилось сгенерировать тест. Нажми «🔄 Попробовать ещё раз» — я перезапущу генерацию.", retryKb)
+				return
+			}
+		} else {
+			misses = 0
+		}
+		if time.Now().After(deadline) {
+			h.editNote(ctx, chatID, msgID, "⏳ Генерация идёт дольше обычного. Нажми «🔄 Попробовать ещё раз» чуть позже — если тест уже готов, он сразу откроется.", retryKb)
+			return
+		}
+	}
+}
+
+// editNote edits a bot-sent note; when editing fails (e.g. the user deleted
+// the message) the text is sent as a new message instead.
+func (h *Handler) editNote(ctx context.Context, chatID, msgID int64, text string, kb *bot.InlineKeyboardMarkup) {
+	if err := h.tg.EditMessageText(ctx, chatID, msgID, text, kb); err != nil {
+		if strings.Contains(err.Error(), "message is not modified") {
+			return
+		}
+		if _, err2 := h.tg.SendMessage(ctx, chatID, text, kb); err2 != nil {
+			log.Printf("edit/send note: %v / %v", err, err2)
+		}
 	}
 }
