@@ -1,0 +1,18 @@
+# Secrets
+.env
+*.env
+
+# Binaries
+/bot
+*.exe
+
+# Logs
+*.log
+
+# IDE
+.idea/
+.vscode/
+
+# Local Go build caches (sandbox)
+/.gocache/
+/.toolchain/
