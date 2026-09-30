@@ -28,6 +28,7 @@ import (
 	"github.com/Bihan293/Juz40-test2/internal/config"
 	"github.com/Bihan293/Juz40-test2/internal/database"
 	"github.com/Bihan293/Juz40-test2/internal/deepseek"
+	"github.com/Bihan293/Juz40-test2/internal/groq"
 	"github.com/Bihan293/Juz40-test2/internal/handlers"
 	"github.com/Bihan293/Juz40-test2/internal/repositories"
 	"github.com/Bihan293/Juz40-test2/internal/services"
@@ -74,9 +75,25 @@ func main() {
 		log.Printf("deepseek: configured (thinking=%s, fallback=%s, off-peak=%s)",
 			ds.ReasonerModel(), ds.Model(), offPeak)
 	} else {
-		log.Println("deepseek: DEEPSEEK_API_KEY not set — AI test generation disabled")
+		log.Println("deepseek: DEEPSEEK_API_KEY not set — no paid fallback (Groq only, if configured)")
 	}
-	genSvc := services.NewGeneratorService(ds, cfg, genRepo, subjectRepo, stateRepo)
+	// Groq free tier: primary provider for translation (Qwen 3.8 27B) and
+	// generation (GPT-OSS 120B). Every request is kept inside the published
+	// free-tier quota by the client's local limiter (RPM/RPD/TPM/TPD); when
+	// the quota runs out the work falls through to paid DeepSeek, so the bot
+	// never breaks. Optional: without GROQ_API_KEY nothing changes.
+	var gq *groq.Client
+	if cfg.GroqAPIKey != "" {
+		gq = groq.New(cfg.GroqAPIKey, cfg.GroqBaseURL)
+		for _, m := range []string{groq.ModelQwen27B, groq.ModelGPTOSS120B} {
+			l := groq.LimitsFor(m)
+			log.Printf("groq: %s enabled (limits: %d RPM, %d RPD, %d TPM, %d TPD, max request %d tok)",
+				m, l.RPM, l.RPD, l.TPM, l.TPD, l.MaxRequestTokens())
+		}
+	} else {
+		log.Println("groq: GROQ_API_KEY not set — all AI work goes to DeepSeek (paid)")
+	}
+	genSvc := services.NewGeneratorService(ds, cfg, genRepo, subjectRepo, stateRepo).WithGroq(gq)
 	// Kazakh test translations: reuse the same DeepSeek client (flash, low
 	// effort). A question is translated once, cached in the DB and shared by
 	// every user — no per-user API calls. The generator gets the translator
@@ -85,7 +102,7 @@ func main() {
 	// Kazakh translations are carried over to the clone — otherwise every
 	// Kazakh-speaking user of a clone would pay for translating the very
 	// same text again.
-	translatorSvc := services.NewTranslatorService(ds, translationRepo)
+	translatorSvc := services.NewTranslatorService(ds, translationRepo).WithGroq(gq)
 	genSvc.WithTranslator(translatorSvc)
 	quiz := services.NewQuizService(subjectRepo, attemptRepo, stateRepo, genRepo, genSvc, userRepo).
 		WithTranslator(translatorSvc)

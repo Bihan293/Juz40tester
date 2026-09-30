@@ -22,6 +22,13 @@ type Config struct {
 	DeepSeekReasonerModel string // primary thinking model (DEEPSEEK_REASONER_MODEL), default deepseek-flash
 	DeepSeekBaseURL       string // overridable via DEEPSEEK_BASE_URL
 
+	// Groq API (free tier) — primary provider for Kazakh translation
+	// (qwen/qwen3.8-27b) and test generation (openai/gpt-oss-120b).
+	// DeepSeek becomes the paid fallback. Optional: without GROQ_API_KEY the
+	// bot behaves exactly as before (DeepSeek only). Quota: docs/GROQ_LIMITS.md.
+	GroqAPIKey  string
+	GroqBaseURL string // overridable via GROQ_BASE_URL
+
 	// Generation scheduling: generation of LOCKED chain tests is deferred to
 	// off-peak hours (half price on DeepSeek). Tests the user can already
 	// open, and personal weak-topics tests, are URGENT and ignore this.
@@ -49,6 +56,8 @@ func Load() (*Config, error) {
 		DeepSeekModel:         os.Getenv("DEEPSEEK_MODEL"),
 		DeepSeekReasonerModel: os.Getenv("DEEPSEEK_REASONER_MODEL"),
 		DeepSeekBaseURL:       os.Getenv("DEEPSEEK_BASE_URL"),
+		GroqAPIKey:            strings.TrimSpace(os.Getenv("GROQ_API_KEY")),
+		GroqBaseURL:           strings.TrimSpace(os.Getenv("GROQ_BASE_URL")),
 		OffPeakStartHour:      -1,
 		OffPeakEndHour:        -1,
 	}
@@ -70,6 +79,9 @@ func Load() (*Config, error) {
 	}
 	if cfg.DeepSeekBaseURL == "" {
 		cfg.DeepSeekBaseURL = "https://api.deepseek.com"
+	}
+	if cfg.GroqBaseURL == "" {
+		cfg.GroqBaseURL = "https://api.groq.com/openai/v1"
 	}
 
 	var missing []string
