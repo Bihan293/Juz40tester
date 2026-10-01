@@ -76,13 +76,98 @@ func TestParseTestJSONToleratesFences(t *testing.T) {
 	}
 }
 
-func TestDifficultyBand(t *testing.T) {
-	// The ramp must stay gentle: school level for the first dozen tests.
-	cases := map[int]string{1: "1–2", 2: "1–2", 3: "2–3", 4: "2–3", 5: "3", 7: "3", 8: "3–4", 12: "3–4", 13: "4–5", 50: "4–5"}
-	for n, want := range cases {
-		if got := difficultyBand(n); got != want {
-			t.Fatalf("difficultyBand(%d) = %q, want %q", n, got, want)
+func TestChainDifficultyCurve(t *testing.T) {
+	// Product rule: test 1 is really easy, 10 noticeably harder, 30 is a
+	// solid ЕНТ level, 100+ are hard. The curve never goes down and every
+	// single step is tiny (no sudden walls between neighbouring tests).
+	checks := []struct {
+		n      int
+		lo, hi float64
+	}{
+		{1, 1.0, 1.5}, {10, 2.4, 2.8}, {30, 3.3, 3.7}, {100, 4.2, 4.6}, {150, 4.6, 5.0}, {200, 4.6, 5.0},
+	}
+	for _, c := range checks {
+		if got := chainDifficultyTarget(c.n); got < c.lo || got > c.hi {
+			t.Fatalf("target(%d) = %.1f, want %.1f..%.1f", c.n, got, c.lo, c.hi)
 		}
+	}
+	prev := chainDifficultyTarget(1)
+	for n := 2; n <= 250; n++ {
+		cur := chainDifficultyTarget(n)
+		if cur < prev {
+			t.Fatalf("difficulty went DOWN at test %d: %.1f -> %.1f", n, prev, cur)
+		}
+		if cur-prev > 0.25 {
+			t.Fatalf("difficulty jump at test %d: %.1f -> %.1f", n, prev, cur)
+		}
+		prev = cur
+	}
+	if chainDifficultyTarget(10) <= chainDifficultyTarget(1) ||
+		chainDifficultyTarget(30) <= chainDifficultyTarget(10) ||
+		chainDifficultyTarget(100) <= chainDifficultyTarget(30) {
+		t.Fatal("difficulty must strictly rise 1 < 10 < 30 < 100")
+	}
+}
+
+func TestDifficultyMixMatchesTarget(t *testing.T) {
+	for n := 1; n <= models.MaxVisibleTests; n++ {
+		target := chainDifficultyTarget(n)
+		mix := difficultyMix(target)
+		total, sum := 0, 0
+		for lvl, c := range mix {
+			if c < 0 {
+				t.Fatalf("test %d: negative count in mix %v", n, mix)
+			}
+			total += c
+			sum += c * (lvl + 1)
+		}
+		if total != GeneratedQuestionsPerTest {
+			t.Fatalf("test %d: mix %v has %d questions", n, mix, total)
+		}
+		if mean := float64(sum) / float64(total); mean < target-0.06 || mean > target+0.06 {
+			t.Fatalf("test %d: mix %v mean %.2f, target %.1f", n, mix, mean, target)
+		}
+	}
+}
+
+func TestValidateChainDifficulty(t *testing.T) {
+	mk := func(d int) *generatedTest {
+		gt := &generatedTest{Questions: validQuestions()}
+		for i := range gt.Questions {
+			gt.Questions[i].Difficulty = d
+		}
+		return gt
+	}
+	if err := validateChainDifficulty(mk(1), 1); err != nil {
+		t.Fatalf("easy test 1 must pass: %v", err)
+	}
+	if err := validateChainDifficulty(mk(1), 40); err == nil {
+		t.Fatal("a beginner-level Тест 40 must be rejected")
+	}
+	if err := validateChainDifficulty(mk(5), 2); err == nil {
+		t.Fatal("an olympiad-level Тест 2 must be rejected")
+	}
+	if err := validateChainDifficulty(mk(4), 100); err != nil {
+		t.Fatalf("level-4 Тест 100 must pass: %v", err)
+	}
+}
+
+func TestChainPromptDifficultyByPosition(t *testing.T) {
+	p1 := chainGenPrompt("Биология", 1, nil, nil)
+	p30 := chainGenPrompt("Биология", 30, nil, nil)
+	if !strings.Contains(p1, "ПЕРВЫЙ тест") {
+		t.Fatal("test 1 prompt must describe the easiest level")
+	}
+	// Previous test missing: the prompt must NOT pretend to be the first
+	// (beginner) test — that silently reset deep tests to level 1.
+	if strings.Contains(p30, "ПЕРВЫЙ тест") {
+		t.Fatal("test 30 without a previous test must not be generated as the first test")
+	}
+	if !strings.Contains(p30, "≈ 3.5") || !strings.Contains(p1, "≈ 1.3") {
+		t.Fatalf("prompts must carry the target mean difficulty:\n%s\n---\n%s", p1, p30)
+	}
+	if !strings.Contains(p1, "Шкала сложности") {
+		t.Fatal("prompt must define the difficulty scale")
 	}
 }
 
@@ -96,15 +181,16 @@ func TestChainGenPromptCompact(t *testing.T) {
 			Text: strings.Repeat("длинный текст вопроса ", 20), Topic: "Тема",
 		})
 	}
-	marks := make([]int, GeneratedQuestionsPerTest)
+	marks := make([]float64, GeneratedQuestionsPerTest)
 	for i := range marks {
-		marks[i] = i % 3 // 0,1,2 knowledge levels
+		marks[i] = float64(i%3) + 0.5*float64(i%2) // averaged levels 0..2.5
 	}
+	marks[0] = -1 // nobody answered
 	p := chainGenPrompt("Биология", 2, prev, marks)
 	if len(p) > 6000 {
 		t.Fatalf("chain prompt too large: %d bytes", len(p))
 	}
-	if !strings.Contains(p, "уровень ученика") {
+	if !strings.Contains(p, "уровень учеников") || !strings.Contains(p, "— ?") || !strings.Contains(p, "— 1.5") {
 		t.Fatal("chain prompt must include the knowledge marks legend")
 	}
 	first := chainGenPrompt("Биология", 1, nil, nil)
@@ -185,8 +271,8 @@ func TestUnlockRuleConstants(t *testing.T) {
 	if models.TestsPerPage%models.TestsGridColumns != 0 {
 		t.Fatal("tests per page must fill full grid rows")
 	}
-	if models.MaxVisibleTests != 50 {
-		t.Fatalf("max visible tests = %d, want 50", models.MaxVisibleTests)
+	if models.MaxVisibleTests < 100 {
+		t.Fatalf("max visible tests = %d, the chain must reach the hard 100+ tests", models.MaxVisibleTests)
 	}
 }
 
@@ -213,7 +299,7 @@ func TestLanguageSubjectRule(t *testing.T) {
 
 func TestChainPromptStemTruncationIsValidUTF8(t *testing.T) {
 	prev := []models.Question{{Text: strings.Repeat("щ", 200), Topic: "Тема"}}
-	p := chainGenPrompt("Биология", 2, prev, []int{0})
+	p := chainGenPrompt("Биология", 2, prev, []float64{0})
 	if !utf8.ValidString(p) {
 		t.Fatal("chain prompt must stay valid UTF-8 after truncating stems")
 	}

@@ -78,7 +78,7 @@ func TestGenerationPromptFitsGroq(t *testing.T) {
 	// A worst-case chain prompt (20 long previous stems) must leave enough
 	// output budget for a full 20-question test on the free tier.
 	prev := make([]models.Question, 20)
-	marks := make([]int, 20)
+	marks := make([]float64, 20)
 	for i := range prev {
 		prev[i] = models.Question{Topic: "Молекулярная генетика", Text: strings.Repeat("Какой процесс происходит ", 10)}
 	}

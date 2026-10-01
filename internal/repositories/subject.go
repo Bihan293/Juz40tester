@@ -199,6 +199,35 @@ func (r *SubjectRepository) QuestionStatuses(ctx context.Context, userID int64, 
 	return out, rows.Err()
 }
 
+// AverageQuestionStatuses returns, per question, the average knowledge
+// status (0..2) over ALL users who answered it. Questions nobody answered
+// are absent from the map. Used to show the generator how the whole
+// audience did on a SHARED chain test.
+func (r *SubjectRepository) AverageQuestionStatuses(ctx context.Context, questionIDs []int64) (map[int64]float64, error) {
+	out := make(map[int64]float64, len(questionIDs))
+	if len(questionIDs) == 0 {
+		return out, nil
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT question_id, AVG(status)::float8
+		FROM user_question_progress
+		WHERE question_id = ANY($1)
+		GROUP BY question_id`, questionIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var qid int64
+		var avg float64
+		if err := rows.Scan(&qid, &avg); err != nil {
+			return nil, err
+		}
+		out[qid] = avg
+	}
+	return out, rows.Err()
+}
+
 // SubjectProgress aggregates knowledge statistics of a single subject for a
 // user over an EXPLICIT list of tests (testIDs) — the tests the user can
 // actually open right now. Locked chain tests are decided by the caller (the
@@ -269,7 +298,7 @@ func (r *SubjectRepository) UnlockedTestsLeaderboard(ctx context.Context, subjec
 			           SELECT 1 FROM chain pc
 			           JOIN prog pp ON pp.test_id = pc.id AND pp.user_id = p.user_id
 			           WHERE pc.test_number = c.test_number - 1
-			             AND pp.green >= $3 AND pp.yellow >= $4
+			             AND pp.green >= $3 AND pp.green + pp.yellow >= $3 + $4
 			       ) AS is_unlocked
 			FROM prog p
 			JOIN chain c ON c.id = p.test_id

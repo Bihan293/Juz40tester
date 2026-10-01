@@ -154,8 +154,21 @@ const (
 	// user can look.
 	TestsPerPage     = 12 // 3 x 4 grid
 	TestsGridColumns = 3
-	MaxVisibleTests  = 50
+	// MaxVisibleTests is the length of a subject's chain. The difficulty
+	// curve (see services.chainDifficultyTarget) keeps rising up to ~150, so
+	// the chain is long enough for "100+ — серьёзно сложные тесты".
+	MaxVisibleTests = 200
 )
+
+// MeetsUnlockBar reports whether a test with the given 🟢/🟡 counts reached
+// the unlock bar «15🟢 + 5🟡». The bar means "at least 15 mastered AND the
+// remaining questions at least in progress": 16🟢+4🟡 or 20🟢 are BETTER
+// than 15🟢+5🟡 and must pass too. (The old check `yellow >= 5` locked out
+// exactly the students who knew the test best: with 20 questions, 16🟢
+// leaves at most 4🟡, 20🟢 leaves 0🟡.)
+func MeetsUnlockBar(green, yellow int) bool {
+	return green >= UnlockGreen && green+yellow >= UnlockGreen+UnlockYellow
+}
 
 // Attempt statuses.
 const (
