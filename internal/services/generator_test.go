@@ -5,7 +5,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	"github.com/Bihan293/Juz40-test2/internal/models"
+	"github.com/Bihan293/Juz40tester/internal/models"
 )
 
 func validQuestions() []generatedQuestion {

@@ -11,7 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/Bihan293/Juz40-test2/migrations"
+	"github.com/Bihan293/Juz40tester/migrations"
 )
 
 // Connect creates a pgx connection pool and verifies connectivity.

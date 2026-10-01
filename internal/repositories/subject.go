@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/Bihan293/Juz40-test2/internal/models"
+	"github.com/Bihan293/Juz40tester/internal/models"
 )
 
 // ErrNotFound is returned when a requested row does not exist.

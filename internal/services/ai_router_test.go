@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Bihan293/Juz40-test2/internal/deepseek"
-	"github.com/Bihan293/Juz40-test2/internal/groq"
-	"github.com/Bihan293/Juz40-test2/internal/models"
+	"github.com/Bihan293/Juz40tester/internal/deepseek"
+	"github.com/Bihan293/Juz40tester/internal/groq"
+	"github.com/Bihan293/Juz40tester/internal/models"
 )
 
 func TestRunStepsFallsThrough(t *testing.T) {
