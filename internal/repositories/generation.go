@@ -72,79 +72,53 @@ func (r *GenerationRepository) TestProgressForUser(ctx context.Context, userID i
 	return out, rows.Err()
 }
 
-// WeakTopics returns the topics the user struggles with in a subject: topics
-// of ANSWERED questions whose knowledge status is 🔴/🟡 (not mastered),
-// weighted by how badly they perform. The list is sorted by weakness (worst
-// first) and capped at limit.
-//
-// Only questions the user has actually answered are considered (a progress
-// row exists only after an answer). Never-answered questions must NOT count
-// as weak — otherwise every untouched topic of every freshly generated test
-// would look "weak", and the weak-topics set would be huge and identical
-// for everyone.
-//
-// Mastered topics disappear from the result automatically the moment all of
-// their questions reach 🟢 — that is the "слабая тема удаляется" behaviour:
-// the weak-topics list is always derived from the CURRENT statuses, never
-// stored as a static snapshot.
+// WeakTopics returns the user's weak (🔴/🟡) topics of the subject, worst
+// first, capped at limit. They are derived from the ACCUMULATED per-topic
+// statistics (user_topic_stats: every answer of every test of this subject,
+// across attempts and restarts), classified by models.TopicStat.Level — NOT
+// from the status of individual questions. A topic becomes weak only after
+// systematic mistakes (≥ 2 wrong and < 80% correct among the last 10
+// answers), and leaves the list again once the user answers it reliably.
 func (r *GenerationRepository) WeakTopics(ctx context.Context, userID, subjectID int64, limit int) ([]string, error) {
 	if limit <= 0 {
 		limit = 5
 	}
-	rows, err := r.pool.Query(ctx, `
-		SELECT q.topic,
-		       COUNT(*) FILTER (WHERE p.status < 2)                           AS weak_count,
-		       COALESCE(SUM(p.wrong_count), 0)                                AS wrongs
-		FROM questions q
-		JOIN user_question_progress p
-		     ON p.question_id = q.id AND p.user_id = $1
-		WHERE q.subject_id = $2 AND q.topic <> ''
-		GROUP BY q.topic
-		HAVING COUNT(*) FILTER (WHERE p.status < 2) > 0
-		ORDER BY weak_count DESC, wrongs DESC, q.topic
-		LIMIT $3`, userID, subjectID, limit)
+	stats, err := r.WeakTopicStats(ctx, userID, subjectID, limit)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []string
-	for rows.Next() {
-		var topic string
-		var weakCount, wrongs int
-		if err := rows.Scan(&topic, &weakCount, &wrongs); err != nil {
-			return nil, err
-		}
-		out = append(out, topic)
+	out := make([]string, 0, len(stats))
+	for _, s := range stats {
+		out = append(out, s.Topic)
 	}
-	return out, rows.Err()
+	return out, nil
+}
+
+// WeakTopicStats is WeakTopics with the statistics of each topic (for the
+// «🎯 Слабые темы» screen). limit <= 0 returns every weak topic.
+func (r *GenerationRepository) WeakTopicStats(ctx context.Context, userID, subjectID int64, limit int) ([]models.TopicStat, error) {
+	stats, err := r.TopicStats(ctx, userID, subjectID)
+	if err != nil {
+		return nil, err
+	}
+	return models.WeakTopicStats(stats, limit), nil
 }
 
 // SubjectsWithWeakTopics returns the ids of subjects in which the user has
-// at least one weak topic — using EXACTLY the same definition as WeakTopics
-// (an answered question with status < 2 and a non-empty topic). The
-// «🎯 Слабые темы» picker lists only these subjects: a subject the user has
-// never practised cannot have a weak topic, and offering it led to an
-// endless «generating…» state.
+// at least one weak topic — EXACTLY the same definition as WeakTopics. The
+// «🎯 Слабые темы» picker lists only these subjects.
 func (r *GenerationRepository) SubjectsWithWeakTopics(ctx context.Context, userID int64) (map[int64]bool, error) {
-	rows, err := r.pool.Query(ctx, `
-		SELECT DISTINCT q.subject_id
-		FROM questions q
-		JOIN user_question_progress p
-		     ON p.question_id = q.id AND p.user_id = $1
-		WHERE q.topic <> '' AND p.status < 2`, userID)
+	stats, err := r.AllTopicStats(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	out := map[int64]bool{}
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
+	for _, s := range stats {
+		if s.IsWeak() {
+			out[s.SubjectID] = true
 		}
-		out[id] = true
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // scanTest scans a tests row (id, subject_id, test_number, title, is_active,
@@ -190,17 +164,25 @@ func (r *GenerationRepository) FindPersonalTest(ctx context.Context, subjectID, 
 // (see DeletePersonalTest), so the cache survives the original owner.
 // Users with identical weakness profiles share the same questions: the new
 // user gets a fresh CLONE of that test (zero AI cost, zero shared progress).
-func (r *GenerationRepository) FindPersonalTestByFingerprint(ctx context.Context, subjectID int64, fingerprint string) (*models.Test, error) {
+//
+// forUserID: tests of a lineage (the root test and all its clones) that this
+// user has ALREADY finished are skipped — the same weak topics must be
+// trained with NEW questions, not by repeating the questions the user has
+// already seen. Other users still get the free clone.
+func (r *GenerationRepository) FindPersonalTestByFingerprint(ctx context.Context, subjectID int64, fingerprint string, forUserID int64) (*models.Test, error) {
 	if fingerprint == "" {
 		return nil, nil
 	}
 	return scanTest(r.pool.QueryRow(ctx, `
 		SELECT `+testColumns+`
-		FROM tests
+		FROM tests t
 		WHERE subject_id = $1 AND kind = 'personal' AND topics_fingerprint = $2
+		  AND NOT EXISTS (
+		      SELECT 1 FROM user_personal_done d
+		      WHERE d.user_id = $3 AND d.root_test_id = COALESCE(t.origin_test_id, t.id))
 		ORDER BY id
 		LIMIT 1`,
-		subjectID, fingerprint))
+		subjectID, fingerprint, forUserID))
 }
 
 // PersonalTestQuestions returns the seed-question payload of a personal test
@@ -264,14 +246,24 @@ func (r *GenerationRepository) DeletePersonalTest(ctx context.Context, userID, t
 	// Ownership + kind + subject guard: only the owner can finish their own
 	// personal test of THIS subject.
 	var fingerprint sql.NullString
+	var rootID int64
 	err = tx.QueryRow(ctx, `
-		SELECT topics_fingerprint FROM tests
+		SELECT topics_fingerprint, COALESCE(origin_test_id, id) FROM tests
 		WHERE id = $1 AND owner_user_id = $2 AND kind = 'personal' AND subject_id = $3
-		FOR UPDATE`, testID, userID, subjectID).Scan(&fingerprint)
+		FOR UPDATE`, testID, userID, subjectID).Scan(&fingerprint, &rootID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
 	if err != nil {
+		return err
+	}
+	// The user has seen this content: their next weak-topics test must get
+	// NEW questions even when the weak-topics set is the same (see
+	// FindPersonalTestByFingerprint). The per-topic statistics of the
+	// practice stay in user_topic_stats — they are never deleted here.
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO user_personal_done (user_id, root_test_id, subject_id)
+		VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, userID, rootID, subjectID); err != nil {
 		return err
 	}
 
@@ -291,8 +283,8 @@ func (r *GenerationRepository) DeletePersonalTest(ctx context.Context, userID, t
 
 	if keepTemplate {
 		// The user's own trace of the test goes away (attempts cascade to
-		// attempt_questions; progress rows of its questions are dropped, so
-		// they never count as the user's weak topics again) ...
+		// attempt_questions; per-question progress rows are dropped). The
+		// per-TOPIC statistics are kept in user_topic_stats ...
 		if _, err := tx.Exec(ctx, `
 			DELETE FROM test_attempts WHERE test_id = $1 AND user_id = $2`, testID, userID); err != nil {
 			return err
@@ -614,13 +606,17 @@ func (r *GenerationRepository) CreateGeneratedTest(ctx context.Context, test *mo
 	if test.TopicsFingerprint != "" {
 		fingerprint = test.TopicsFingerprint
 	}
+	var origin any
+	if test.OriginTestID > 0 {
+		origin = test.OriginTestID
+	}
 	var testID int64
 	err = tx.QueryRow(ctx, `
-		INSERT INTO tests (subject_id, test_number, title, is_active, kind, topics, owner_user_id, topics_fingerprint)
-		VALUES ($1, $2, $3, TRUE, $4, $5, $6, $7)
+		INSERT INTO tests (subject_id, test_number, title, is_active, kind, topics, owner_user_id, topics_fingerprint, origin_test_id)
+		VALUES ($1, $2, $3, TRUE, $4, $5, $6, $7, $8)
 		ON CONFLICT (subject_id, test_number) DO NOTHING
 		RETURNING id`,
-		test.SubjectID, test.TestNumber, test.Title, test.Kind, topicsJSON, owner, fingerprint).
+		test.SubjectID, test.TestNumber, test.Title, test.Kind, topicsJSON, owner, fingerprint, origin).
 		Scan(&testID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// Conflict — the test already exists (concurrent generation). Re-read
@@ -691,6 +687,11 @@ func (r *GenerationRepository) ClonePersonalTest(ctx context.Context, src *model
 		Topics:            src.Topics,
 		OwnerUserID:       ownerUserID,
 		TopicsFingerprint: src.TopicsFingerprint,
+	}
+	// Lineage: every clone points at the ROOT (originally generated) test.
+	if err := r.pool.QueryRow(ctx, `
+		SELECT COALESCE(origin_test_id, id) FROM tests WHERE id = $1`, src.ID).Scan(&clone.OriginTestID); err != nil {
+		return nil, err
 	}
 	return r.CreateGeneratedTest(ctx, clone, questions)
 }

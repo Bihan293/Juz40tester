@@ -450,6 +450,12 @@ func (s *QuizService) SubjectsWithWeakTopics(ctx context.Context, userID int64) 
 	return out, nil
 }
 
+// WeakTopicStats returns the user's weak topics of the subject with their
+// statistics (worst first) for the «🎯 Слабые темы» screen.
+func (s *QuizService) WeakTopicStats(ctx context.Context, userID, subjectID int64, limit int) ([]models.TopicStat, error) {
+	return s.gen.WeakTopicStats(ctx, userID, subjectID, limit)
+}
+
 // ChainTestStatus reports whether chain test #number of the subject already
 // exists (test != nil) or is still being generated (pending). Used by the
 // «wait for the test» notifier: when both are empty the generation failed.
