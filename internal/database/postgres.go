@@ -29,9 +29,31 @@ func Connect(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
+// migrationLockKey is the pg_advisory_lock key that serializes migrations
+// ("juz40mig" as an int64-ish constant — any fixed value works).
+const migrationLockKey int64 = 0x6a757a34306d6967
+
 // Migrate applies all pending SQL migrations embedded in the binary.
 // Migrations run inside transactions and are recorded in schema_migrations.
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
+	// Serialize migrations across instances: during a zero-downtime deploy
+	// (Render) the old and the new instance may start at the same moment,
+	// and two concurrent runs of the same migration would crash one of them
+	// on the schema_migrations primary key. A session-level advisory lock on
+	// a dedicated connection makes the second instance wait and then see
+	// every migration as already applied.
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire migration connection: %w", err)
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrationLockKey); err != nil {
+		return fmt.Errorf("migration lock: %w", err)
+	}
+	defer func() {
+		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, migrationLockKey)
+	}()
+
 	// Create migration tracking table.
 	if _, err := pool.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
