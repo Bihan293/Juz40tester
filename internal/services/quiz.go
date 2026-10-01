@@ -192,7 +192,7 @@ func (s *QuizService) unlockedMax(ctx context.Context, userID int64, chain []mod
 			break // следующий тест ещё не сгенерирован — цепочка упирается сюда
 		}
 		p := progress[t.ID]
-		if p == nil || p.Green < models.UnlockGreen || p.Yellow < models.UnlockYellow {
+		if p == nil || !models.MeetsUnlockBar(p.Green, p.Yellow) {
 			break // следующий тест закрыт
 		}
 		unlocked++
@@ -294,7 +294,7 @@ func (s *QuizService) GetSubjectScreen(ctx context.Context, userID, subjectID in
 		slot.Unlocked = n <= unlockedMax
 		if t != nil {
 			p := progress[t.ID]
-			slot.Completed = p != nil && p.Green >= models.UnlockGreen && p.Yellow >= models.UnlockYellow
+			slot.Completed = p != nil && models.MeetsUnlockBar(p.Green, p.Yellow)
 			resume, err := s.attempts.GetActiveAttempt(ctx, userID, t.ID)
 			if err != nil {
 				return nil, err
@@ -399,7 +399,7 @@ func (s *QuizService) OnTestCompleted(ctx context.Context, userID int64, test *m
 	}
 	// Not at the bar yet — nothing to generate. The user keeps training
 	// this same test; generation starts exactly when the bar is crossed.
-	if green < models.UnlockGreen || yellow < models.UnlockYellow {
+	if !models.MeetsUnlockBar(green, yellow) {
 		return
 	}
 	chain, err := s.subjects.ListChainTests(ctx, test.SubjectID)

@@ -34,7 +34,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -179,17 +181,33 @@ const genSystemPrompt = `Ты — автор тестов ЕНТ/УБТ (Каз�
 
 // chainGenPrompt builds the user prompt for the next chain test. The model
 // sees the PREVIOUS test as compact lines "тема — короткая суть вопроса —
-// уровни ученика" (0=не знает, 1=в процессе, 2=закреплено) and must raise
-// the difficulty gently, target the weak topics and never repeat questions.
-func chainGenPrompt(subjectName string, testNumber int, prev []models.Question, marks []int) string {
+// уровень учеников" (0=не знают, 1=в процессе, 2=закреплено; for a shared
+// chain test this is the AVERAGE over every student who answered the
+// question, see GeneratorService.questionMarks) and must hit the target
+// difficulty of THIS chain position, target the weak topics and never repeat
+// questions.
+func chainGenPrompt(subjectName string, testNumber int, prev []models.Question, marks []float64) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Предмет: «%s». Составь Тест №%d из ровно %d вопросов.\n\n", subjectName, testNumber, GeneratedQuestionsPerTest)
 	b.WriteString(languageSubjectRule(subjectName))
+	b.WriteString(difficultyScale)
+	target := chainDifficultyTarget(testNumber)
+	mix := difficultyMix(target)
 
-	if testNumber <= 1 || len(prev) == 0 {
-		b.WriteString("Это ПЕРВЫЙ тест цепочки: базовый уровень (difficulty 1–2), фундаментальные темы программы 9–11 классов — то, без чего нельзя начинать подготовку к ЕНТ/УБТ.\n")
-	} else {
-		fmt.Fprintf(&b, "Прошлый Тест №%d (тема — суть вопроса — уровень ученика: 0=не знает, 1=в процессе, 2=закреплено):\n", testNumber-1)
+	switch {
+	case testNumber <= 1:
+		b.WriteString("Это ПЕРВЫЙ тест цепочки — самый лёгкий: базовые определения и факты, фундаментальные темы программы 9–11 классов — то, без чего нельзя начинать подготовку к ЕНТ/УБТ. Ученик должен почувствовать, что у него получается.\n")
+	case len(prev) == 0:
+		// The previous test is not available (removed / not generated). This
+		// is NOT the first test: the difficulty still follows the chain
+		// position — test 30 must never fall back to the beginner level.
+		fmt.Fprintf(&b, "Это Тест №%d длинной цепочки (прошлый тест недоступен): уровень соответствует позиции в цепочке, а не началу подготовки. Охвати разные разделы программы.\n", testNumber)
+	default:
+		fmt.Fprintf(&b, "Прошлый Тест №%d", testNumber-1)
+		if avg := meanDifficulty(prev); avg > 0 {
+			fmt.Fprintf(&b, " (средняя сложность %.1f)", avg)
+		}
+		b.WriteString(" — тема — суть вопроса — уровень учеников (0=не знают, 1=в процессе, 2=закреплено):\n")
 		for i, q := range prev {
 			// Cut by RUNES, not bytes: a byte slice cut in the middle of a
 			// Cyrillic/Kazakh letter produced invalid UTF-8 in the prompt.
@@ -197,19 +215,142 @@ func chainGenPrompt(subjectName string, testNumber int, prev []models.Question, 
 			if r := []rune(stem); len(r) > 80 {
 				stem = string(r[:80]) + "…"
 			}
-			mark := 0
-			if i < len(marks) {
-				mark = marks[i]
+			mark := "?"
+			if i < len(marks) && marks[i] >= 0 {
+				mark = strconv.FormatFloat(marks[i], 'f', -1, 64)
 			}
-			fmt.Fprintf(&b, "%d. [%s] %s — %d\n", i+1, q.Topic, stem, mark)
+			fmt.Fprintf(&b, "%d. [%s] %s — %s\n", i+1, q.Topic, stem, mark)
 		}
 		fmt.Fprintf(&b, "\nТвой Тест №%d ОБЯЗАН:\n", testNumber)
-		b.WriteString("— быть лишь НЕМНОГО сложнее прошлого (difficulty " + difficultyBand(testNumber) + "): сложность растёт очень плавно от теста к тесту, без скачков до олимпиадного уровня;\n")
-		b.WriteString("— подтягивать слабые места: темы с отметками 0–1 повтори через НОВЫЕ формулировки и другие аспекты, темы с 2 почти не трогай;\n")
+		b.WriteString("— быть немного сложнее прошлого: сложность растёт плавно от теста к тесту, без резких скачков;\n")
+		b.WriteString("— подтягивать слабые места: темы с уровнем ниже 1.5 повтори через НОВЫЕ формулировки и другие аспекты, хорошо усвоенные темы почти не трогай — вместо них бери новые разделы программы;\n")
 		b.WriteString("— НЕ ПОВТОРЯТЬ ни одного вопроса прошлого теста: другие формулировки, подтемы, числа и примеры.\n")
 	}
+	fmt.Fprintf(&b, "\nСЛОЖНОСТЬ Теста №%d: средняя difficulty ≈ %.1f. Распределение 20 вопросов по уровням: %s. Поле difficulty каждого вопроса ставь честно по шкале выше.\n",
+		testNumber, target, mixString(mix))
 	b.WriteString("\nВыдай строго JSON по схеме, ровно " + fmt.Sprint(GeneratedQuestionsPerTest) + " вопросов.")
 	return b.String()
+}
+
+// difficultyScale defines what each difficulty level MEANS, so the model's
+// "difficulty" tags (and the target mix) are comparable from test to test.
+const difficultyScale = `Шкала сложности (difficulty):
+1 — узнавание: прямое определение, термин или факт из учебника;
+2 — понимание: простое применение одного правила/формулы в один шаг;
+3 — стандартное задание ЕНТ: применение в 2 шага, сравнение, типичная ловушка;
+4 — трудное задание ЕНТ: многошаговое рассуждение, сочетание двух тем, нестандартная формулировка;
+5 — самые трудные задания ЕНТ: длинная цепочка рассуждений, тонкие исключения, анализ данных.
+
+`
+
+// difficultyCurve: anchor points (chain position -> target MEAN difficulty
+// of the test). Between anchors the target is linearly interpolated, beyond
+// the last anchor it stays flat. The curve is long on purpose: test 1 is
+// really easy, test 10 noticeably harder, test 30 is a solid ЕНТ level,
+// tests 100+ are hard. Every step between neighbours is tiny (≤ 0.18), so a
+// student never meets a sudden wall.
+var difficultyCurve = []struct {
+	n      int
+	target float64
+}{
+	{1, 1.3}, {5, 2.0}, {10, 2.6}, {20, 3.1}, {30, 3.5},
+	{50, 3.9}, {100, 4.4}, {150, 4.7}, {200, 4.8},
+}
+
+// chainDifficultyTarget returns the target mean difficulty (1..5) of chain
+// test number n.
+func chainDifficultyTarget(n int) float64 {
+	if n <= difficultyCurve[0].n {
+		return difficultyCurve[0].target
+	}
+	for i := 1; i < len(difficultyCurve); i++ {
+		a, b := difficultyCurve[i-1], difficultyCurve[i]
+		if n <= b.n {
+			t := a.target + (b.target-a.target)*float64(n-a.n)/float64(b.n-a.n)
+			return math.Round(t*10) / 10
+		}
+	}
+	return difficultyCurve[len(difficultyCurve)-1].target
+}
+
+// difficultyMix splits the 20 questions of a test over the levels 1..5 so
+// that the mean is (close to) target. Mostly the two neighbouring levels;
+// where possible a couple of warm-up questions one level lower and a couple
+// of stretch questions one level higher (the mean is preserved).
+func difficultyMix(target float64) [5]int {
+	var mix [5]int
+	total := GeneratedQuestionsPerTest
+	if target <= 1 {
+		mix[0] = total
+		return mix
+	}
+	if target >= 5 {
+		mix[4] = total
+		return mix
+	}
+	lo := int(math.Floor(target)) // 1..4
+	hi := lo + 1
+	nHi := int(math.Round(float64(total) * (target - float64(lo))))
+	nLo := total - nHi
+	mix[lo-1], mix[hi-1] = nLo, nHi
+	// Spread: 2 warm-up questions one level below lo and 2 stretch questions
+	// one level above hi — only when both sides exist (keeps the mean).
+	if lo > 1 && hi < 5 && nLo >= 4 && nHi >= 4 {
+		mix[lo-1] -= 2
+		mix[lo-2] += 2
+		mix[hi-1] -= 2
+		mix[hi] += 2
+	}
+	return mix
+}
+
+// mixString renders a difficulty mix for the prompt: "5 вопросов уровня 1, …".
+func mixString(mix [5]int) string {
+	parts := make([]string, 0, 5)
+	for lvl, n := range mix {
+		if n > 0 {
+			parts = append(parts, fmt.Sprintf("%d — уровня %d", n, lvl+1))
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+// meanDifficulty is the average difficulty tag of the questions (0 if none).
+func meanDifficulty(qs []models.Question) float64 {
+	sum, n := 0, 0
+	for _, q := range qs {
+		if q.Difficulty >= 1 && q.Difficulty <= 5 {
+			sum += q.Difficulty
+			n++
+		}
+	}
+	if n == 0 {
+		return 0
+	}
+	return math.Round(float64(sum)/float64(n)*10) / 10
+}
+
+// chainDifficultyTolerance: how far the mean difficulty of a generated chain
+// test may drift from the target before the reply is rejected (the model
+// ignored the level instruction — e.g. wrote a beginner test for Тест 40).
+const chainDifficultyTolerance = 1.0
+
+// validateChainDifficulty checks that the mean difficulty of a generated
+// chain test is close to the target of its chain position.
+func validateChainDifficulty(gt *generatedTest, testNumber int) error {
+	if len(gt.Questions) == 0 {
+		return nil
+	}
+	sum := 0
+	for _, q := range gt.Questions {
+		sum += q.Difficulty
+	}
+	mean := float64(sum) / float64(len(gt.Questions))
+	target := chainDifficultyTarget(testNumber)
+	if math.Abs(mean-target) > chainDifficultyTolerance {
+		return fmt.Errorf("difficulty: mean %.2f is too far from the target %.1f of test %d", mean, target, testNumber)
+	}
+	return nil
 }
 
 // languageSubjectRule returns the extra instruction for LANGUAGE subjects:
@@ -231,24 +372,6 @@ func languageSubjectRule(subjectName string) string {
 		return "ЯЗЫК ТЕСТА: это предмет «Русский язык/литература». Тест проверяет знание русского языка — пиши ТОЛЬКО на русском; варианты ответов — слова, формы, правила русского языка. Тест не переводится на другие языки.\n\n"
 	}
 	return ""
-}
-
-// difficultyBand maps the chain position to the target difficulty band.
-// The ramp is deliberately slow: even the 10th test stays at school level,
-// the top band is reached only deep into the chain.
-func difficultyBand(testNumber int) string {
-	switch {
-	case testNumber <= 2:
-		return "1–2"
-	case testNumber <= 4:
-		return "2–3"
-	case testNumber <= 7:
-		return "3"
-	case testNumber <= 12:
-		return "3–4"
-	default:
-		return "4–5"
-	}
 }
 
 // personalGenPrompt builds the user prompt for a weak-topics test. ONLY the
@@ -744,7 +867,7 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 		}
 		title = fmt.Sprintf("Тест %d", testNumber)
 		var prev []models.Question
-		var marks []int
+		var marks []float64
 		if testNumber > 1 {
 			prevTest, err := g.findChainTest(ctx, job.SubjectID, testNumber-1)
 			if err != nil {
@@ -755,11 +878,13 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 				if err != nil {
 					return 0, err
 				}
-				if job.OwnerUserID > 0 {
-					marks, err = g.questionMarks(ctx, job.OwnerUserID, prev)
-					if err != nil {
-						return 0, err
-					}
+				// Chain tests are SHARED by every student of the subject, so
+				// the marks are the average level of ALL students who answered
+				// each question — not of the one student who happened to
+				// trigger the generation first.
+				marks, err = g.questionMarks(ctx, prev)
+				if err != nil {
+					return 0, err
 				}
 			}
 		}
@@ -837,6 +962,14 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 		if kind == models.TestKindPersonal {
 			if err := validatePersonalCoverage(gt, promptTopics); err != nil {
 				return fmt.Errorf("personal test: %w", err)
+			}
+		}
+		// Chain tests must match the difficulty of their chain position:
+		// a model that writes a beginner test for Тест 40 (or an olympiad
+		// for Тест 2) is rejected and the next provider writes it.
+		if kind == models.TestKindChain {
+			if err := validateChainDifficulty(gt, testNumber); err != nil {
+				return err
 			}
 		}
 		// Quality gate: a reply where many questions give the answer away
@@ -977,10 +1110,11 @@ var testJSONSchema = map[string]any{
 	"additionalProperties": false,
 }
 
-// questionMarks maps each question to the user's knowledge level
-// (0=🔴 не знает, 1=🟡 в процессе, 2=🟢 закреплено).
-func (g *GeneratorService) questionMarks(ctx context.Context, userID int64, questions []models.Question) ([]int, error) {
-	marks := make([]int, len(questions))
+// questionMarks maps each question of the previous chain test to the
+// AVERAGE knowledge level of every student who answered it (0=🔴 не знают,
+// 1=🟡 в процессе, 2=🟢 закреплено), rounded to 0.1; -1 = nobody answered.
+func (g *GeneratorService) questionMarks(ctx context.Context, questions []models.Question) ([]float64, error) {
+	marks := make([]float64, len(questions))
 	if len(questions) == 0 {
 		return marks, nil
 	}
@@ -988,12 +1122,16 @@ func (g *GeneratorService) questionMarks(ctx context.Context, userID int64, ques
 	for i, q := range questions {
 		ids[i] = q.ID
 	}
-	statuses, err := g.subjects.QuestionStatuses(ctx, userID, ids)
+	avg, err := g.subjects.AverageQuestionStatuses(ctx, ids)
 	if err != nil {
 		return nil, err
 	}
 	for i, q := range questions {
-		marks[i] = statuses[q.ID]
+		if v, ok := avg[q.ID]; ok {
+			marks[i] = math.Round(v*10) / 10
+		} else {
+			marks[i] = -1
+		}
 	}
 	return marks, nil
 }

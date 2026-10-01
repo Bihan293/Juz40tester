@@ -37,3 +37,24 @@ func TestSubjectContentLang(t *testing.T) {
 		}
 	}
 }
+
+func TestMeetsUnlockBar(t *testing.T) {
+	cases := []struct {
+		green, yellow int
+		want          bool
+	}{
+		{15, 5, true},
+		{16, 4, true}, // better than the bar — used to stay LOCKED
+		{18, 2, true},
+		{20, 0, true}, // everything mastered — used to stay LOCKED
+		{15, 4, false},
+		{14, 6, false},
+		{10, 10, false},
+		{0, 0, false},
+	}
+	for _, c := range cases {
+		if got := MeetsUnlockBar(c.green, c.yellow); got != c.want {
+			t.Fatalf("MeetsUnlockBar(%d, %d) = %v, want %v", c.green, c.yellow, got, c.want)
+		}
+	}
+}

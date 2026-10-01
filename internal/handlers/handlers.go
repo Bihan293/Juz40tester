@@ -866,7 +866,7 @@ func (h *Handler) renderSummary(ctx context.Context, sum *services.AttemptSummar
 	// finished — the test is deleted and the next weak-topics run generates
 	// a fresh one.
 	if sum.Test.Kind == models.TestKindPersonal {
-		if green >= models.UnlockGreen && yellow >= models.UnlockYellow {
+		if models.MeetsUnlockBar(green, yellow) {
 			b.WriteString("\n\n🏁 Ты закрыл эти слабые темы! Можешь закончить тест — в следующий раз соберу новый.")
 			rows = append(rows, bot.Row(bot.Btn("🏁 Закончить тест", cbFinish+strconv.FormatInt(sum.Test.ID, 10))))
 		} else {
@@ -878,7 +878,7 @@ func (h *Handler) renderSummary(ctx context.Context, sum *services.AttemptSummar
 		// generation right away (that is the only trigger the user wants).
 		// Say it here so the user knows the next test is on its way — but
 		// only when a next test actually exists (the chain is capped).
-		if green >= models.UnlockGreen && yellow >= models.UnlockYellow {
+		if models.MeetsUnlockBar(green, yellow) {
 			if sum.Test.TestNumber+1 <= models.MaxVisibleTests {
 				fmt.Fprintf(&b, "\n\n🔓 Ты открыл «Тест %d»! Я уже начал его собирать по твоим результатам — обычно это занимает пару минут ⏳", sum.Test.TestNumber+1)
 			} else {

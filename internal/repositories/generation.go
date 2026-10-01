@@ -185,7 +185,9 @@ func (r *GenerationRepository) FindPersonalTest(ctx context.Context, subjectID, 
 }
 
 // FindPersonalTestByFingerprint returns any personal test generated for the
-// exact same weak-topics set (sha256 fingerprint), regardless of the owner.
+// exact same weak-topics set (sha256 fingerprint), regardless of the owner —
+// including ownerless archived TEMPLATES left behind by «🏁 Закончить тест»
+// (see DeletePersonalTest), so the cache survives the original owner.
 // Users with identical weakness profiles share the same questions: the new
 // user gets a fresh CLONE of that test (zero AI cost, zero shared progress).
 func (r *GenerationRepository) FindPersonalTestByFingerprint(ctx context.Context, subjectID int64, fingerprint string) (*models.Test, error) {
@@ -235,13 +237,23 @@ func (r *GenerationRepository) PersonalTestQuestions(ctx context.Context, testID
 	return out, rows.Err()
 }
 
-// DeletePersonalTest removes the user's personal weak-topics test together
-// with its questions and the user's progress on them (attempts cascade).
-// The questions are deleted only when no other test still references them.
-// Used by "Закончить тест": the next weak-topics run then generates a fresh
-// test from scratch. subjectID pins the deletion to the subject the caller
-// resolved the test in, so a stale callback can never delete a test of
-// another subject that reused the id.
+// DeletePersonalTest removes the user's personal weak-topics test ("🏁
+// Закончить тест", or a stale test whose topics are all mastered). The next
+// weak-topics run then builds a fresh test from the CURRENT weak topics.
+//
+// Sharing guarantee: the test content is the cache that lets the next
+// student with the SAME weak-topics fingerprint get the same test for free
+// (a clone, no AI call). Deleting the last copy used to throw that cache
+// away — after the first student finished, the next one with identical weak
+// topics paid for a brand-new generation. So when no other test of the
+// subject carries the same fingerprint, the test is ARCHIVED as an ownerless,
+// inactive TEMPLATE instead: the user's attempts and progress on it are
+// removed (their weak topics no longer count those questions), the
+// questions and their cached Kazakh translations stay for future clones.
+// Otherwise (another copy still exists) the test is deleted outright.
+//
+// subjectID pins the operation to the subject the caller resolved the test
+// in, so a stale callback can never touch a test of another subject.
 func (r *GenerationRepository) DeletePersonalTest(ctx context.Context, userID, testID, subjectID int64) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -249,18 +261,60 @@ func (r *GenerationRepository) DeletePersonalTest(ctx context.Context, userID, t
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Ownership + kind + subject guard: only the owner can delete their own
+	// Ownership + kind + subject guard: only the owner can finish their own
 	// personal test of THIS subject.
-	tag, err := tx.Exec(ctx, `
-		DELETE FROM tests
-		WHERE id = $1 AND owner_user_id = $2 AND kind = 'personal' AND subject_id = $3`, testID, userID, subjectID)
+	var fingerprint sql.NullString
+	err = tx.QueryRow(ctx, `
+		SELECT topics_fingerprint FROM tests
+		WHERE id = $1 AND owner_user_id = $2 AND kind = 'personal' AND subject_id = $3
+		FOR UPDATE`, testID, userID, subjectID).Scan(&fingerprint)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
+
+	keepTemplate := false
+	if fingerprint.Valid && fingerprint.String != "" {
+		var others bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM tests
+				WHERE subject_id = $1 AND kind = 'personal'
+				  AND topics_fingerprint = $2 AND id <> $3
+			)`, subjectID, fingerprint.String, testID).Scan(&others); err != nil {
+			return err
+		}
+		keepTemplate = !others
 	}
 
+	if keepTemplate {
+		// The user's own trace of the test goes away (attempts cascade to
+		// attempt_questions; progress rows of its questions are dropped, so
+		// they never count as the user's weak topics again) ...
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM test_attempts WHERE test_id = $1 AND user_id = $2`, testID, userID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM user_question_progress
+			WHERE user_id = $2
+			  AND question_id IN (SELECT question_id FROM test_questions WHERE test_id = $1)`,
+			testID, userID); err != nil {
+			return err
+		}
+		// ... while the content stays as an ownerless, hidden template.
+		if _, err := tx.Exec(ctx, `
+			UPDATE tests SET owner_user_id = NULL, is_active = FALSE WHERE id = $1`, testID); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
+	}
+
+	if _, err := tx.Exec(ctx, `DELETE FROM tests WHERE id = $1`, testID); err != nil {
+		return err
+	}
 	// Orphaned questions of the deleted test (not referenced by any other
 	// test) go away together with their progress rows.
 	if _, err := tx.Exec(ctx, `
@@ -499,6 +553,9 @@ func (r *GenerationRepository) FailJob(ctx context.Context, jobID int64, jobErr 
 // gets the next free personal number (9000+), keeping it far above the
 // chain. The UNIQUE (subject_id, test_number) constraint also guards chain
 // tests against concurrent generation of the same number.
+// personalLockNS is the advisory-lock namespace of personal-test creation.
+const personalLockNS int32 = 40_001
+
 func (r *GenerationRepository) CreateGeneratedTest(ctx context.Context, test *models.Test, questions []models.SeedQuestion) (*models.Test, error) {
 	if len(questions) == 0 {
 		return nil, errors.New("generated test has no questions")
@@ -514,6 +571,32 @@ func (r *GenerationRepository) CreateGeneratedTest(ctx context.Context, test *mo
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	if test.Kind == models.TestKindPersonal {
+		// Serialise personal-test creation per subject. Without the lock two
+		// concurrent creations (two users at once, or a double tap) read the
+		// same MAX(test_number)+1; the loser hit ON CONFLICT (subject_id,
+		// test_number) below and was handed the WINNER's test — another
+		// user's personal test. The lock is released on commit/rollback.
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, $2)`, personalLockNS, int32(test.SubjectID)); err != nil {
+			return nil, err
+		}
+		// One personal test per (subject, owner): a concurrent creation for
+		// the same owner already won — return that test instead of failing
+		// on the idx_tests_personal_owner unique index.
+		if test.OwnerUserID > 0 {
+			existing, err := scanTest(tx.QueryRow(ctx, `
+				SELECT `+testColumns+`
+				FROM tests
+				WHERE subject_id = $1 AND kind = 'personal' AND owner_user_id = $2`,
+				test.SubjectID, test.OwnerUserID))
+			if err != nil {
+				return nil, err
+			}
+			if existing != nil {
+				return existing, nil
+			}
+		}
+	}
 	if test.Kind == models.TestKindPersonal && test.TestNumber == 0 {
 		if err := tx.QueryRow(ctx, `
 			SELECT COALESCE(MAX(test_number), 8999) + 1
