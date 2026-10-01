@@ -1,4 +1,4 @@
-module github.com/Bihan293/Juz40-test2
+module github.com/Bihan293/Juz40tester
 
 go 1.23
 

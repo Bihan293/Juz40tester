@@ -11,8 +11,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/Bihan293/Juz40-test2/internal/models"
-	"github.com/Bihan293/Juz40-test2/internal/repositories"
+	"github.com/Bihan293/Juz40tester/internal/models"
+	"github.com/Bihan293/Juz40tester/internal/repositories"
 )
 
 // OptionLabels are the displayed answer labels.

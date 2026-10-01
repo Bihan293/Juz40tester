@@ -18,12 +18,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Bihan293/Juz40-test2/internal/bot"
-	"github.com/Bihan293/Juz40-test2/internal/config"
-	"github.com/Bihan293/Juz40-test2/internal/database"
-	"github.com/Bihan293/Juz40-test2/internal/models"
-	"github.com/Bihan293/Juz40-test2/internal/repositories"
-	"github.com/Bihan293/Juz40-test2/internal/services"
+	"github.com/Bihan293/Juz40tester/internal/bot"
+	"github.com/Bihan293/Juz40tester/internal/config"
+	"github.com/Bihan293/Juz40tester/internal/database"
+	"github.com/Bihan293/Juz40tester/internal/models"
+	"github.com/Bihan293/Juz40tester/internal/repositories"
+	"github.com/Bihan293/Juz40tester/internal/services"
 )
 
 type fakeTG struct {

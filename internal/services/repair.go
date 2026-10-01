@@ -18,10 +18,10 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/Bihan293/Juz40-test2/internal/deepseek"
-	"github.com/Bihan293/Juz40-test2/internal/groq"
-	"github.com/Bihan293/Juz40-test2/internal/models"
-	"github.com/Bihan293/Juz40-test2/internal/repositories"
+	"github.com/Bihan293/Juz40tester/internal/deepseek"
+	"github.com/Bihan293/Juz40tester/internal/groq"
+	"github.com/Bihan293/Juz40tester/internal/models"
+	"github.com/Bihan293/Juz40tester/internal/repositories"
 )
 
 const (
