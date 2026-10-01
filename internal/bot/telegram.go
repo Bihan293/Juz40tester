@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 	"unicode/utf8"
 )
@@ -26,6 +27,13 @@ func NewClient(token string) *Client {
 		httpClient: &http.Client{Timeout: 15 * time.Second},
 		baseURL:    "https://api.telegram.org",
 	}
+}
+
+// WithBaseURL points the client at another Bot API server (a local Bot API
+// server, or a fake one in tests).
+func (c *Client) WithBaseURL(u string) *Client {
+	c.baseURL = strings.TrimRight(u, "/")
+	return c
 }
 
 // --- Incoming update types -------------------------------------------------

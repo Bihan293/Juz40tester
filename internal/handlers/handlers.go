@@ -983,22 +983,61 @@ func (h *Handler) cancelExit(ctx context.Context, cb *bot.CallbackQuery, user *m
 
 // --- Progress & settings ---------------------------------------------------------
 
-// renderProgress renders the first progress screen: a subject picker with
-// inline buttons one per row (full width — long names stay readable). The
-// per-subject statistics are shown only after the user picks a subject.
+// renderProgress renders the first statistics screen: the 🔥 streak line,
+// a short per-subject summary and a subject picker (inline buttons one per
+// row — long names stay readable). Detailed statistics of a subject are
+// shown after the user picks it.
 func (h *Handler) renderProgress(ctx context.Context, user *models.User) (string, *bot.InlineKeyboardMarkup, error) {
 	subjects, err := h.quiz.ListSubjects(ctx)
 	if err != nil {
 		return "", nil, err
 	}
 
+	var b strings.Builder
+	b.WriteString(streakLine(user))
+	b.WriteString("\n\n📊 Ваша статистика по предметам:\n")
+	shown := 0
 	buttons := make([]bot.InlineKeyboardButton, 0, len(subjects))
 	for _, s := range subjects {
 		buttons = append(buttons, bot.Btn(subjectEmoji(s.Name)+" "+s.Name, cbProgSubject+strconv.FormatInt(s.ID, 10)))
+		sp, err := h.quiz.SubjectProgress(ctx, user.ID, s.ID)
+		if err != nil {
+			log.Printf("progress summary subject %d: %v", s.ID, err)
+			continue
+		}
+		if sp.Green+sp.Yellow == 0 && sp.CorrectCount+sp.WrongCount == 0 {
+			continue // not started yet — keep the summary short
+		}
+		fmt.Fprintf(&b, "%s %s: 🟢 %d · 🟡 %d · 🔴 %d\n", subjectEmoji(s.Name), s.Name, sp.Green, sp.Yellow, sp.Red)
+		shown++
 	}
+	if shown == 0 {
+		b.WriteString("Пока пусто — пройди первый тест в «📚 Предметы».\n")
+	}
+	b.WriteString("\nВыберите предмет для подробной статистики:")
+
 	rows := bot.ChunkButtons(buttons, 1)
 	rows = append(rows, bot.Row(bot.Btn("⬅️ Главное меню", cbMainMenu)))
-	return "📊 Мой прогресс\n\nВыберите предмет:", &bot.InlineKeyboardMarkup{InlineKeyboard: rows}, nil
+	return b.String(), &bot.InlineKeyboardMarkup{InlineKeyboard: rows}, nil
+}
+
+// streakLine renders the 🔥 «огонёк» line of the statistics screens from the
+// existing daily-streak counter (users.streak_days, maintained by
+// UserRepository.Upsert on every message/tap — the user row passed here was
+// refreshed by ensureUser for THIS update, so the number is current).
+func streakLine(user *models.User) string {
+	days := 0
+	if user != nil {
+		days = models.EffectiveStreak(user.StreakDays, user.LastActiveDate, models.StreakToday(time.Now()))
+	}
+	switch {
+	case days <= 0:
+		return "🔥 Огонёк пока не горит — занимайся каждый день, чтобы его зажечь!"
+	case days == 1:
+		return "🔥 У вас 1-й день огонька! Зайди завтра — и он разгорится."
+	default:
+		return fmt.Sprintf("🔥 У вас %d-й день огонька! (%d %s подряд)", days, days, dayWord(days))
+	}
 }
 
 // renderSubjectProgress renders the knowledge statistics of a single subject.
@@ -1009,7 +1048,8 @@ func (h *Handler) renderSubjectProgress(ctx context.Context, user *models.User, 
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "📊 Мой прогресс — %s\n\n", sp.SubjectName)
+	b.WriteString(streakLine(user))
+	fmt.Fprintf(&b, "\n\n📊 Ваша статистика — %s\n\n", sp.SubjectName)
 	fmt.Fprintf(&b, "🟢 Закреплено: %d\n", sp.Green)
 	fmt.Fprintf(&b, "🟡 В процессе: %d\n", sp.Yellow)
 	fmt.Fprintf(&b, "🔴 Требует повторения: %d\n", sp.Red)

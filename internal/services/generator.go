@@ -164,11 +164,15 @@ type generatedTest struct {
 const genSystemPrompt = `Ты — автор тестов ЕНТ/УБТ (Казахстан) для школьников 9–11 классов. Пишешь на русском (если в задании не указан другой язык предмета), в официальном стиле ЕНТ: точные однозначные формулировки, без двойных отрицаний, строго по школьной программе.
 
 Требования к каждому вопросу:
-1. Ровно один правильный ответ; 4 варианта; дистракторы правдоподобные (типичные ошибки), не абсурдные.
-2. Варианты однородны по длине и форме; правильный не выделяется.
-3. Позиции правильных ответов равномерно по 0–3 в рамках теста.
-4. topic — короткая тема (1–4 слова), difficulty — 1–5.
-5. Перед ответом мысленно проверь каждый correct_index: он обязан указывать на действительно правильный вариант.
+1. Ровно один правильный ответ; 4 варианта; дистракторы правдоподобные (типичные ошибки учеников), не абсурдные.
+2. Правильный ответ выбирается ТОЛЬКО знанием правила/факта, никогда — по внешнему виду. Все 4 варианта одной структуры, близкой длины, в одном формате записи (все предложения, все числа с одинаковыми единицами, все слова одной части речи и т.п.).
+3. Пунктуация и орфография: если спрашиваешь, ГДЕ нужен знак (тире, запятая, двоеточие, дефис, кавычки) или буква — НИ В ОДНОМ варианте он не проставлен (во всех вариантах одинаково оставь пропуск «_» или вообще не ставь знак). Если спрашиваешь, где знак поставлен ВЕРНО/НЕВЕРНО — знак есть во ВСЕХ вариантах. Недопустимо, чтобы нужный знак/буква/пропуск был только в одном варианте.
+   Плохо: «В каком предложении нужно тире? A) Наступила зима. B) Книга лежит на столе. C) Я люблю русский язык. D) Москва — столица России.» (тире есть только в D).
+   Хорошо: «В каком предложении на месте пропуска нужно тире? A) Москва _ столица России. B) Зимой _ здесь очень холодно. C) Книга _ лежит на столе. D) Он _ мой старый друг.»
+4. Никаких подсказок: без пометок «(верно)»/«✓», без вариантов «все ответы верны»/«нет правильного ответа», без дословного повтора ответа из текста вопроса, без совпадающих вариантов, без грамматического согласования вопроса только с одним вариантом.
+5. Позиции правильных ответов равномерно по 0–3 в рамках теста.
+6. topic — короткая тема (1–4 слова), difficulty — 1–5.
+7. Перед ответом мысленно проверь каждый вопрос: correct_index указывает на действительно правильный вариант, и угадать его, не зная темы, нельзя.
 
 Формат — строго JSON, без пояснений и markdown:
 {"questions":[{"question":"...","options":["...","...","...","..."],"correct_index":0,"topic":"...","difficulty":2}]}`
@@ -345,6 +349,7 @@ func validateTest(gt *generatedTest) error {
 		if q.Correct < 0 || q.Correct > 3 {
 			return fmt.Errorf("question %d: correct_index %d out of range", i+1, q.Correct)
 		}
+		normalizeOptionFormat(q.Text, q.Options)
 		if q.Difficulty < 1 || q.Difficulty > 5 {
 			q.Difficulty = 3 // sane fallback instead of rejecting the whole test
 		}
@@ -587,6 +592,8 @@ func (g *GeneratorService) runWorkerLoop(ctx context.Context) (panicked bool) {
 	}()
 	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
+	sweep := time.NewTicker(qualitySweepEvery)
+	defer sweep.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -594,7 +601,27 @@ func (g *GeneratorService) runWorkerLoop(ctx context.Context) (panicked bool) {
 			return false
 		case <-ticker.C:
 			g.processOne(ctx)
+		case <-sweep.C:
+			g.qualitySweepTick(ctx)
 		}
+	}
+}
+
+// qualitySweepEvery: how often stored questions are audited (local, free)
+// and the flagged ones rewritten. Runs in the same goroutine as the queue,
+// so a sweep never competes with a generation for the Groq quota.
+const qualitySweepEvery = 5 * time.Minute
+
+// qualitySweepTick runs one bounded sweep over not-yet-audited questions.
+func (g *GeneratorService) qualitySweepTick(ctx context.Context) {
+	sctx, cancel := context.WithTimeout(ctx, jobTimeout)
+	defer cancel()
+	n, err := g.RunQualitySweep(sctx)
+	if err != nil {
+		log.Printf("quality sweep: %v", err)
+	}
+	if n > 0 {
+		log.Printf("quality sweep: %d stored question(s) rewritten", n)
 	}
 }
 
@@ -812,12 +839,36 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 				return fmt.Errorf("personal test: %w", err)
 			}
 		}
+		// Quality gate: a reply where many questions give the answer away
+		// by the options' format (only the key has the dash, the key is the
+		// only filled-in gap, duplicate options, «все ответы верны»…) is
+		// sloppy as a whole — let the next provider write it from scratch.
+		// A few flagged questions are rewritten below (targeted repair).
+		if n := countHard(auditGenerated(gt)); n > maxHardFlaggedPerReply {
+			return fmt.Errorf("quality audit: %d of %d questions reveal the answer or have broken options", n, len(gt.Questions))
+		}
 		final = gt
 		return nil
 	}
 	task := fmt.Sprintf("gen %s job %d", kind, job.ID)
 	if _, _, err := runSteps(ctx, task, g.generationSteps(messages, kind, job.Attempts), validate); err != nil {
 		return 0, fmt.Errorf("generate: %w", err)
+	}
+	// Post-validation: every flagged question is rewritten by the model and
+	// re-audited before the test is stored; a test that still contains a
+	// giveaway question is NEVER shown to a student (the job is retried).
+	if err := g.repairFlagged(ctx, task, subject.Name, final); err != nil {
+		return 0, fmt.Errorf("quality: %w", err)
+	}
+	// The rewrites keep topics, but re-check the whole contract anyway
+	// (duplicates across questions, key balance, weak-topic coverage).
+	if err := validateTest(final); err != nil {
+		return 0, fmt.Errorf("after repair: %w", err)
+	}
+	if kind == models.TestKindPersonal {
+		if err := validatePersonalCoverage(final, promptTopics); err != nil {
+			return 0, fmt.Errorf("after repair: personal test: %w", err)
+		}
 	}
 
 	// Collect the topic list of the final test for weak-topic analysis.

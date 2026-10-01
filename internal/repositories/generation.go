@@ -611,3 +611,100 @@ func (r *GenerationRepository) ClonePersonalTest(ctx context.Context, src *model
 	}
 	return r.CreateGeneratedTest(ctx, clone, questions)
 }
+
+// UncheckedQuestions returns questions that have not passed the quality
+// audit yet (oldest first). Questions whose repair failed too many times
+// are skipped (quality_attempts cap is applied by NoteQualityAttempt).
+func (r *GenerationRepository) UncheckedQuestions(ctx context.Context, limit int) ([]models.Question, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, subject_id, question_text, option_a, option_b, option_c,
+		       option_d, correct_answer, topic, difficulty
+		FROM questions
+		WHERE quality_checked_at IS NULL
+		ORDER BY id
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []models.Question
+	for rows.Next() {
+		var q models.Question
+		if err := rows.Scan(&q.ID, &q.SubjectID, &q.Text, &q.OptionA, &q.OptionB, &q.OptionC,
+			&q.OptionD, &q.CorrectAnswer, &q.Topic, &q.Difficulty); err != nil {
+			return nil, err
+		}
+		out = append(out, q)
+	}
+	return out, rows.Err()
+}
+
+// MarkQuestionsChecked stamps questions as audited and clean.
+func (r *GenerationRepository) MarkQuestionsChecked(ctx context.Context, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	_, err := r.pool.Exec(ctx, `
+		UPDATE questions SET quality_checked_at = now() WHERE id = ANY($1)`, ids)
+	return err
+}
+
+// NoteQualityAttempt records a failed repair of a flagged question. After
+// maxAttempts failures the question is stamped as checked (left as is) so
+// the sweep stops paying for it.
+func (r *GenerationRepository) NoteQualityAttempt(ctx context.Context, id int64, maxAttempts int) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE questions
+		SET quality_attempts = quality_attempts + 1,
+		    quality_checked_at = CASE WHEN quality_attempts + 1 >= $2 THEN now() ELSE NULL END
+		WHERE id = $1`, id, maxAttempts)
+	return err
+}
+
+// ErrQuestionBusy: the question is shown in an unanswered position of an
+// in-progress attempt — rewriting it now would change the text/key under a
+// student who is looking at it. The sweep retries later.
+var ErrQuestionBusy = errors.New("question is in an active attempt")
+
+// ReplaceQuestionContent rewrites a flagged question in place (same id, so
+// tests, attempts history and the user's 🔴🟡🟢 progress stay intact) and
+// drops its cached translations (they described the old text and are
+// produced again on the next Kazakh open). Refuses with ErrQuestionBusy
+// while the question is on screen in an unfinished attempt.
+func (r *GenerationRepository) ReplaceQuestionContent(ctx context.Context, id int64, sq models.SeedQuestion) error {
+	if sq.Correct < 0 || sq.Correct > 3 {
+		return fmt.Errorf("question %d: invalid correct index %d", id, sq.Correct)
+	}
+	labels := []string{"A", "B", "C", "D"}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var busy bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM attempt_questions aq
+			JOIN test_attempts a ON a.id = aq.attempt_id
+			WHERE aq.question_id = $1 AND NOT aq.answered AND a.status = 'in_progress'
+		)`, id).Scan(&busy); err != nil {
+		return err
+	}
+	if busy {
+		return ErrQuestionBusy
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE questions
+		SET question_text = $2, option_a = $3, option_b = $4, option_c = $5, option_d = $6,
+		    correct_answer = $7, difficulty = $8, quality_checked_at = now()
+		WHERE id = $1`,
+		id, sq.Text, sq.Options[0], sq.Options[1], sq.Options[2], sq.Options[3],
+		labels[sq.Correct], sq.Difficulty); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM question_translations WHERE question_id = $1`, id); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
