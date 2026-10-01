@@ -173,7 +173,7 @@ const genSystemPrompt = `Ты — автор тестов ЕНТ/УБТ (Каз�
    Хорошо: «В каком предложении на месте пропуска нужно тире? A) Москва _ столица России. B) Зимой _ здесь очень холодно. C) Книга _ лежит на столе. D) Он _ мой старый друг.»
 4. Никаких подсказок: без пометок «(верно)»/«✓», без вариантов «все ответы верны»/«нет правильного ответа», без дословного повтора ответа из текста вопроса, без совпадающих вариантов, без грамматического согласования вопроса только с одним вариантом.
 5. Позиции правильных ответов равномерно по 0–3 в рамках теста.
-6. topic — короткая тема (1–4 слова), difficulty — 1–5.
+6. topic — короткая тема (1–4 слова), difficulty — 1–5. Называй темы стандартно, как разделы школьной программы (например «Фотосинтез», «Квадратные уравнения»), одну и ту же тему — всегда одинаково: по темам считается статистика ученика.
 7. Перед ответом мысленно проверь каждый вопрос: correct_index указывает на действительно правильный вариант, и угадать его, не зная темы, нельзя.
 
 Формат — строго JSON, без пояснений и markdown:
@@ -397,9 +397,7 @@ func personalGenPrompt(subjectName string, topics []string) string {
 
 // normalizeTopic canonicalises a topic string for comparison (the model may
 // differ in case or surrounding whitespace even when told to copy verbatim).
-func normalizeTopic(t string) string {
-	return strings.ToLower(strings.Join(strings.Fields(t), " "))
-}
+func normalizeTopic(t string) string { return models.NormalizeTopic(t) }
 
 // topicsFingerprint is the stable sha256 of the sorted weak-topic set. Two
 // users with the SAME weak topics get the SAME fingerprint — and therefore
@@ -633,7 +631,7 @@ func (g *GeneratorService) EnsurePersonalTest(ctx context.Context, userID, subje
 	fp := topicsFingerprint(topics)
 	// Reuse path: someone else (or a previous run) already generated a test
 	// for exactly this weak-topics set — clone it instead of calling the AI.
-	shared, err := g.gen.FindPersonalTestByFingerprint(ctx, subjectID, fp)
+	shared, err := g.gen.FindPersonalTestByFingerprint(ctx, subjectID, fp, userID)
 	if err != nil {
 		return nil, false, nil, err
 	}
@@ -915,7 +913,7 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 		// Before paying for a model call, check the fingerprint cache once
 		// more — the same weak-topics set may have been generated for another
 		// user (or by a concurrent job) while this job waited in the queue.
-		if shared, err := g.gen.FindPersonalTestByFingerprint(ctx, job.SubjectID, topicsFingerprint(topics)); err != nil {
+		if shared, err := g.gen.FindPersonalTestByFingerprint(ctx, job.SubjectID, topicsFingerprint(topics), ownerUserID); err != nil {
 			return 0, err
 		} else if shared != nil {
 			qs, err := g.gen.PersonalTestQuestions(ctx, shared.ID)

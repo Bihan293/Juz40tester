@@ -305,6 +305,14 @@ func (r *AttemptRepository) SubmitAnswer(ctx context.Context, userID, attemptID 
 		return nil, err
 	}
 
+	// 6b. Per-TOPIC statistics (the source of weak topics) — in the same
+	// transaction, so the answer and the topic statistics never diverge.
+	if countsForTopic(prevStatus, correct) {
+		if err := recordTopicAnswer(ctx, tx, userID, q.SubjectID, q.Topic, correct); err != nil {
+			return nil, err
+		}
+	}
+
 	// 7. Advance the attempt counters and position.
 	var total int
 	if err := tx.QueryRow(ctx,

@@ -231,6 +231,61 @@ func (e *flowEnv) setStatuses(t *testing.T, userID, testID int64, green, yellow 
 	}
 }
 
+// play runs one FULL attempt of the test through the real answer path
+// (StartTest + SubmitAnswer): a question is answered correctly when
+// right(topic) is true. Returns the number of correct answers.
+func (e *flowEnv) play(t *testing.T, userID, testID int64, right func(topic string) bool) int {
+	t.Helper()
+	ctx := context.Background()
+	a, err := e.quiz.StartTest(ctx, userID, testID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := e.quiz.TestQuestionCount(ctx, testID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	correct := 0
+	for pos := 1; pos <= n; pos++ {
+		_, q, err := e.attempts.QuestionAtPosition(ctx, a.ID, pos)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ans := q.CorrectAnswer
+		if right(q.Topic) {
+			correct++
+		} else if ans == "A" {
+			ans = "B"
+		} else {
+			ans = "A"
+		}
+		if _, err := e.quiz.SubmitAnswer(ctx, userID, a.ID, pos, ans); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return correct
+}
+
+func (e *flowEnv) weak(t *testing.T, userID, subjectID int64) []string {
+	t.Helper()
+	w, err := e.gen.WeakTopics(context.Background(), userID, subjectID, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w
+}
+
+func notIn(topics ...string) func(string) bool {
+	return func(topic string) bool {
+		for _, t := range topics {
+			if t == topic {
+				return false
+			}
+		}
+		return true
+	}
+}
+
 func (e *flowEnv) chain(t *testing.T) []models.Test {
 	t.Helper()
 	c, err := e.subjects.ListChainTests(context.Background(), e.sid)
@@ -337,13 +392,13 @@ func TestFlowWeakTopicsSharedClone(t *testing.T) {
 	e.drain(t)
 	t1 := e.chain(t)[0].ID
 
-	// Alice and Bob have IDENTICAL statuses → identical weak topics.
-	e.setStatuses(t, alice, t1, 10, 5)
-	e.setStatuses(t, bob, t1, 10, 5)
-	wa, _ := e.gen.WeakTopics(ctx, alice, e.sid, 5)
-	wb, _ := e.gen.WeakTopics(ctx, bob, e.sid, 5)
-	if len(wa) == 0 || strings.Join(wa, "|") != strings.Join(wb, "|") {
-		t.Fatalf("weak topics must be derived from statuses: %v vs %v", wa, wb)
+	// Alice and Bob fail the SAME topics (all 4 questions of «Тема 0» and
+	// «Тема 1» wrong) → identical weak topics from their topic statistics.
+	e.play(t, alice, t1, notIn("Тема 0", "Тема 1"))
+	e.play(t, bob, t1, notIn("Тема 0", "Тема 1"))
+	wa, wb := e.weak(t, alice, e.sid), e.weak(t, bob, e.sid)
+	if len(wa) != 2 || strings.Join(wa, "|") != strings.Join(wb, "|") {
+		t.Fatalf("weak topics must be derived from topic statistics: %v vs %v", wa, wb)
 	}
 
 	// Alice: first request generates (one AI call).
@@ -390,7 +445,7 @@ func TestFlowWeakTopicsSharedClone(t *testing.T) {
 	// Dan comes later with the SAME weak topics: before the fix the cache
 	// was deleted together with the last copy and Dan paid for a new
 	// generation. Now he gets a clone of the archived template.
-	e.setStatuses(t, dan, t1, 10, 5)
+	e.play(t, dan, t1, notIn("Тема 0", "Тема 1"))
 	before = atomic.LoadInt32(&e.ai.calls)
 	td, pending, _, err := e.quiz.EnsurePersonalTest(ctx, dan, e.sid)
 	if err != nil || td == nil || pending {

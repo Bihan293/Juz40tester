@@ -64,6 +64,12 @@ func main() {
 	genRepo := repositories.NewGenerationRepository(pool)
 	translationRepo := repositories.NewTranslationRepository(pool)
 
+	// One-off: build the per-topic statistics (source of weak topics) from
+	// the answer history stored before they existed. No-op once done.
+	if err := genRepo.BackfillTopicStats(ctx); err != nil {
+		log.Printf("topic stats backfill: %v", err)
+	}
+
 	// DeepSeek AI test generation. Optional: without DEEPSEEK_API_KEY the bot
 	// still works with the seeded tests, AI generation is simply disabled.
 	var ds *deepseek.Client

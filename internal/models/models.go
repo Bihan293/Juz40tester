@@ -118,6 +118,9 @@ type Test struct {
 	// test was generated for. Users with IDENTICAL weak topics share the same
 	// questions (a clone of the same test, zero AI cost).
 	TopicsFingerprint string
+	// OriginTestID is the root personal test a clone was copied from (0 for
+	// generated tests). Used to never hand a user content they finished.
+	OriginTestID int64
 }
 
 // UserSubjectState is per-user UI/progress state that survives restarts.

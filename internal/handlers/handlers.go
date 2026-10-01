@@ -454,20 +454,40 @@ func (h *Handler) renderWeakMenu(ctx context.Context, user *models.User) (string
 		return "", nil, err
 	}
 	if len(subjects) == 0 {
-		return "🎯 Слабые темы\n\nПока у тебя нет слабых тем 🙌\n\nОни появятся, когда ты пройдёшь хотя бы один обычный тест и ошибёшься в каких-то вопросах. Загляни в «📚 Предметы» — а потом возвращайся сюда за персональным тестом.",
+		return "🎯 Слабые темы\n\nПока у тебя нет слабых тем 🙌\n\nТема становится слабой, когда ты несколько раз ошибаешься в ней (по всем пройденным тестам), и уходит отсюда, когда начинаешь отвечать уверенно. Загляни в «📚 Предметы» — а потом возвращайся сюда за персональным тестом.",
 			&bot.InlineKeyboardMarkup{InlineKeyboard: [][]bot.InlineKeyboardButton{
 				bot.Row(bot.Btn("📚 К предметам", cbSubjects)),
 				bot.Row(bot.Btn("⬅️ Главное меню", cbMainMenu)),
 			}}, nil
 	}
+	var b strings.Builder
+	b.WriteString("🎯 Слабые темы\n\nТемы, в которых ты систематически ошибаешься (по всем твоим ответам, последние 10 по каждой теме):\n🔴 — верно меньше половины, 🟡 — верно меньше 80%.\n")
 	buttons := make([]bot.InlineKeyboardButton, 0, len(subjects))
 	for _, s := range subjects {
 		buttons = append(buttons, bot.Btn(subjectEmoji(s.Name)+" "+s.Name, cbWeakSubject+strconv.FormatInt(s.ID, 10)))
+		stats, err := h.quiz.WeakTopicStats(ctx, user.ID, s.ID, weakMenuTopics)
+		if err != nil {
+			return "", nil, err
+		}
+		fmt.Fprintf(&b, "\n%s %s\n", subjectEmoji(s.Name), s.Name)
+		for _, st := range stats {
+			n, c := st.WindowCounts()
+			fmt.Fprintf(&b, "%s %s — верно %d из %d\n", models.TopicLevelEmoji(st.Level()), st.Topic, c, n)
+		}
 	}
+	b.WriteString("\nВыбери предмет — я соберу персональный тест из 20 НОВЫХ вопросов по самым слабым темам:")
 	rows := bot.ChunkButtons(buttons, 1)
 	rows = append(rows, bot.Row(bot.Btn("⬅️ Главное меню", cbMainMenu)))
-	return "🎯 Слабые темы\n\nЯ соберу персональный тест из 20 вопросов по темам, которые у тебя пока 🔴 и 🟡. Здесь только предметы, в которых у тебя есть слабые темы. Выбери предмет:", &bot.InlineKeyboardMarkup{InlineKeyboard: rows}, nil
+	text := b.String()
+	if r := []rune(text); len(r) > 3900 { // Telegram message limit is 4096
+		text = string(r[:3900]) + "…"
+	}
+	return text, &bot.InlineKeyboardMarkup{InlineKeyboard: rows}, nil
 }
+
+// weakMenuTopics is how many weak topics per subject the picker lists (the
+// personal test itself trains the 5 worst ones).
+const weakMenuTopics = 5
 
 // showWeakMenu is used from the Reply Keyboard (new message).
 func (h *Handler) showWeakMenu(ctx context.Context, chatID int64, user *models.User) {
