@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -273,13 +274,13 @@ func (r *SubjectRepository) UnlockedTestsLeaderboard(ctx context.Context, subjec
 			FROM prog p
 			JOIN chain c ON c.id = p.test_id
 		)
-		SELECT u.id, u.first_name, u.username, u.streak_days,
+		SELECT u.id, u.first_name, u.username, `+liveStreakSQL("$5")+`,
 		       COUNT(*) FILTER (WHERE un.is_unlocked) AS unlocked_tests
 		FROM unlocked un
 		JOIN users u ON u.id = un.user_id
-		GROUP BY u.id, u.first_name, u.username, u.streak_days
+		GROUP BY u.id, u.first_name, u.username, u.streak_days, u.last_active_date
 		ORDER BY unlocked_tests DESC, u.id
-		LIMIT $2`, subjectID, limit, models.UnlockGreen, models.UnlockYellow)
+		LIMIT $2`, subjectID, limit, models.UnlockGreen, models.UnlockYellow, models.StreakToday(time.Now()).Format("2006-01-02"))
 	if err != nil {
 		return nil, err
 	}
@@ -301,7 +302,7 @@ func (r *SubjectRepository) UnlockedTestsLeaderboard(ctx context.Context, subjec
 // (COUNT DISTINCT), so generated duplicates cannot inflate the score.
 func (r *SubjectRepository) GreenLeaderboard(ctx context.Context, subjectID int64, limit int) ([]models.LeaderboardEntry, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT u.id, u.first_name, u.username, u.streak_days,
+		SELECT u.id, u.first_name, u.username, `+liveStreakSQL("$3")+`,
 		       COUNT(DISTINCT tq.question_id) AS green
 		FROM user_question_progress p
 		JOIN questions q ON q.id = p.question_id AND q.subject_id = $1
@@ -309,9 +310,9 @@ func (r *SubjectRepository) GreenLeaderboard(ctx context.Context, subjectID int6
 		JOIN tests t ON t.id = tq.test_id AND t.is_active
 		JOIN users u ON u.id = p.user_id
 		WHERE p.status = 2
-		GROUP BY u.id, u.first_name, u.username, u.streak_days
+		GROUP BY u.id, u.first_name, u.username, u.streak_days, u.last_active_date
 		ORDER BY green DESC, u.id
-		LIMIT $2`, subjectID, limit)
+		LIMIT $2`, subjectID, limit, models.StreakToday(time.Now()).Format("2006-01-02"))
 	if err != nil {
 		return nil, err
 	}

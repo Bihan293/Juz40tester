@@ -53,8 +53,10 @@ type User struct {
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 	// StreakDays is the daily-activity streak (the 🔥 "огонёк"): consecutive
-	// UTC calendar days with any bot activity. Day 1 -> 1; a missed day
-	// resets it to 1. LastActiveDate is the UTC date of the last activity.
+	// calendar days (StreakLocation, Kazakhstan UTC+5) with any bot activity.
+	// Day 1 -> 1; a missed day resets it to 1 (see NextStreak). The stored
+	// value only changes on activity — display it via EffectiveStreak.
+	// LastActiveDate is the calendar date of the last activity.
 	StreakDays     int
 	LastActiveDate time.Time
 	// TestLang is the language of the TEST CONTENT only ("ru" or "kk") — the
