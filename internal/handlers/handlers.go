@@ -98,6 +98,12 @@ func (h *Handler) ensureUser(ctx context.Context, from *bot.TgUser) (*models.Use
 // --- Messages ---------------------------------------------------------------
 
 func (h *Handler) handleMessage(ctx context.Context, m *bot.Message) {
+	// The bot is a personal tutor: it only talks in private chats. If it is
+	// ever added to a group, it must not answer every group message with the
+	// main menu (and must not register every group member as a user).
+	if m.Chat.Type != "" && m.Chat.Type != "private" {
+		return
+	}
 	user, err := h.ensureUser(ctx, m.From)
 	if err != nil {
 		log.Printf("upsert user %d: %v", m.From.ID, err)
