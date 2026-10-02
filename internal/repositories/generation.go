@@ -401,15 +401,50 @@ func (r *GenerationRepository) ReviveChainJob(ctx context.Context, subjectID int
 	if ownerUserID > 0 {
 		owner = ownerUserID
 	}
-	tag, err := r.pool.Exec(ctx, `
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// A 'done' row whose test no longer exists (deleted manually / by a
+	// cleanup, or deactivated) still occupies the unique slot
+	// idx_genjobs_chain_unique — no new job could ever be inserted and the
+	// slot would hang in ⏳ forever (a missing Тест 1 blocked the whole
+	// subject). Such orphaned rows are released by parking them as 'failed'.
+	if _, err := tx.Exec(ctx, `
+		UPDATE generation_jobs j
+		SET status = 'failed', last_error = 'test missing: released', updated_at = now()
+		WHERE j.kind = 'chain' AND j.subject_id = $1 AND j.test_number = $2
+		  AND j.status = 'done'
+		  AND (j.test_id IS NULL OR NOT EXISTS (
+		        SELECT 1 FROM tests t WHERE t.id = j.test_id AND t.is_active))`,
+		subjectID, testNumber); err != nil {
+		return false, err
+	}
+
+	// Revive exactly ONE failed row (the newest), and only when no active
+	// or done job holds the unique slot — reviving several rows (or one
+	// next to an active job) violated idx_genjobs_chain_unique.
+	tag, err := tx.Exec(ctx, `
 		UPDATE generation_jobs
 		SET status = 'pending', urgent = TRUE, not_before = now(),
 		    attempts = 0, last_error = '', owner_user_id = COALESCE($3, owner_user_id),
 		    updated_at = now()
-		WHERE kind = 'chain' AND subject_id = $1 AND test_number = $2
-		  AND status = 'failed'`,
+		WHERE id = (
+			SELECT id FROM generation_jobs
+			WHERE kind = 'chain' AND subject_id = $1 AND test_number = $2
+			  AND status = 'failed'
+			ORDER BY id DESC LIMIT 1)
+		  AND NOT EXISTS (
+			SELECT 1 FROM generation_jobs
+			WHERE kind = 'chain' AND subject_id = $1 AND test_number = $2
+			  AND status IN ('pending','running','done'))`,
 		subjectID, testNumber, owner)
 	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return false, err
 	}
 	return tag.RowsAffected() > 0, nil
@@ -814,6 +849,13 @@ func (r *GenerationRepository) ReplaceQuestionContent(ctx context.Context, id in
 		return err
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM question_translations WHERE question_id = $1`, id); err != nil {
+		return err
+	}
+	// The question now has a different text and correct answer — the old
+	// 🟢/🟡 marks describe a question that no longer exists and must not
+	// count towards the unlock bar. Chain unlocks already earned stay safe
+	// thanks to the permanent user_subject_state watermark.
+	if _, err := tx.Exec(ctx, `DELETE FROM user_question_progress WHERE question_id = $1`, id); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

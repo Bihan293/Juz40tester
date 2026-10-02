@@ -40,12 +40,15 @@ func recordTopicAnswer(ctx context.Context, tx pgx.Tx, userID, subjectID int64, 
 }
 
 // countsForTopic reports whether an answer is evidence about the TOPIC.
-// Every wrong answer is. A correct answer is, unless the question was
-// already 🟢 before it: re-answering a memorised question (retaking a test
-// to reach the unlock bar) proves memory of that question, not knowledge of
-// the topic — counting it would wash real weaknesses out of the statistics.
-func countsForTopic(prevStatus int, correct bool) bool {
-	return !correct || prevStatus < models.StatusMastered
+// Answers to a question that was already 🟢 before it are NOT counted at
+// all — neither correct nor wrong. Re-answering a memorised question
+// (retaking a test to reach the unlock bar) proves memory of that question,
+// not knowledge of the topic; and counting only its occasional misses (while
+// ignoring its correct answers) skewed the statistics: a well-learnt topic
+// slowly accumulated random slips and drifted into 🔴/🟡. Answers to
+// not-yet-mastered questions always count, both ways.
+func countsForTopic(prevStatus int, _ bool) bool {
+	return prevStatus < models.StatusMastered
 }
 
 // TopicStats returns the user's statistics of every topic of the subject.

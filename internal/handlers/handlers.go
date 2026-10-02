@@ -62,6 +62,11 @@ type Handler struct {
 	// goroutines (key -> struct{}), so repeated taps on the same ⏳ button
 	// never spawn duplicate watchers or flood the chat with notes.
 	watchers sync.Map
+	// answered tracks callback_query IDs that have already been answered
+	// during the current update. Telegram accepts exactly ONE answer per
+	// callback; any later answer with a text is delivered as a chat message
+	// instead, so error texts are never silently lost.
+	answered sync.Map
 }
 
 // New creates a Handler.
@@ -1342,6 +1347,7 @@ func (h *Handler) handleCallback(ctx context.Context, cb *bot.CallbackQuery) {
 		return
 	}
 	data := cb.Data
+	defer h.answered.Delete(cb.ID)
 	// Very old / inaccessible messages arrive without cb.Message — every
 	// handler below dereferences cb.Message.Chat.ID, so bail out safely.
 	if cb.Message == nil {
@@ -1497,6 +1503,10 @@ func (h *Handler) editMessage(ctx context.Context, cb *bot.CallbackQuery, text s
 // answerAlert answers the callback with a modal alert (dialog with an OK
 // button) — for notices that must actually be read, unlike the tiny toast.
 func (h *Handler) answerAlert(ctx context.Context, cb *bot.CallbackQuery, text string) {
+	if _, dup := h.answered.LoadOrStore(cb.ID, struct{}{}); dup {
+		h.fallbackText(ctx, cb, text)
+		return
+	}
 	if err := h.tg.AnswerCallbackAlert(ctx, cb.ID, text); err != nil {
 		log.Printf("answer callback alert: %v", err)
 	}
@@ -1511,9 +1521,25 @@ func (h *Handler) sendText(ctx context.Context, chatID int64, text string) {
 }
 
 func (h *Handler) answerCallback(ctx context.Context, cb *bot.CallbackQuery, text string) {
+	if _, dup := h.answered.LoadOrStore(cb.ID, struct{}{}); dup {
+		// The router (or an earlier step) already consumed the single
+		// allowed answer — a second answerCallbackQuery would be rejected
+		// and the user would never see the text. Deliver it to the chat.
+		h.fallbackText(ctx, cb, text)
+		return
+	}
 	if err := h.tg.AnswerCallbackQuery(ctx, cb.ID, text); err != nil {
 		log.Printf("answer callback: %v", err)
 	}
+}
+
+// fallbackText delivers a callback notice as a chat message once the
+// callback has already been answered. Empty texts are dropped.
+func (h *Handler) fallbackText(ctx context.Context, cb *bot.CallbackQuery, text string) {
+	if text == "" || cb.Message == nil {
+		return
+	}
+	h.sendText(ctx, cb.Message.Chat.ID, text)
 }
 
 // --- «Please wait» notices ---------------------------------------------------
@@ -1547,11 +1573,16 @@ func (h *Handler) ensureTranslatedWithNote(ctx context.Context, chatID int64, us
 			noteID = id
 		}
 	}
-	if _, terr := h.quiz.EnsureTestTranslated(ctx, user, testID); terr != nil {
+	ready, terr := h.quiz.EnsureTestTranslated(ctx, user, testID)
+	if terr != nil || !ready {
 		// A translation failure never blocks the test: the Russian master
-		// version is served instead.
-		log.Printf("translate test %d: %v", testID, terr)
-		if noteID != 0 {
+		// version is served instead. ready=false here (this helper is only
+		// called when a translation IS wanted) means the translation failed
+		// or is incomplete — tell the user honestly.
+		log.Printf("translate test %d: ready=%v err=%v", testID, ready, terr)
+		if noteID == 0 {
+			h.sendText(ctx, chatID, "😔 Не получилось перевести тест на казахский — пока открываю его на русском. Попробуй позже ещё раз.")
+		} else {
 			if eerr := h.tg.EditMessageText(ctx, chatID, noteID,
 				"😔 Не получилось перевести тест на казахский — пока открываю его на русском. Попробуй позже ещё раз.", nil); eerr != nil {
 				log.Printf("edit translation note: %v", eerr)
