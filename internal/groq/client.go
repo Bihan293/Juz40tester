@@ -233,7 +233,7 @@ func (c *Client) ChatJSON(ctx context.Context, r Request) (*Result, error) {
 	}
 	useSchema := r.Schema != nil && !c.schemaDisabled(r.Model)
 	res, err := c.do(ctx, r, maxTokens, useSchema)
-	if err != nil && r.Effort != "" && isParamError(err, "reasoning") {
+	if err != nil && r.Effort != "" && isEffortError(err) {
 		log.Printf("groq: %s rejected reasoning_effort=%q (%v) — omitting it from now on", r.Model, r.Effort, err)
 		c.disableEffort(r.Model)
 		r.Effort = ""
@@ -256,8 +256,56 @@ func isParamError(err error, word string) bool {
 	return strings.Contains(strings.ToLower(ae.Message+" "+ae.Code), word)
 }
 
+// isValidationFailure reports that the MODEL OUTPUT failed the schema /
+// JSON validation (json_validate_failed, …). That is an ordinary failed
+// step — the caller moves on to the next provider; no feature flag is
+// touched.
+func isValidationFailure(err error) bool {
+	var ae *APIError
+	if !errors.As(err, &ae) || ae.Status != http.StatusBadRequest {
+		return false
+	}
+	s := strings.ToLower(ae.Message + " " + ae.Code)
+	return strings.Contains(s, "validate_failed") || strings.Contains(s, "validation_failed") ||
+		strings.Contains(s, "failed to validate") || strings.Contains(s, "failed_generation") ||
+		strings.Contains(s, "failed to generate json")
+}
+
+// isUnsupportedMessage reports a 400 whose text says a parameter is not
+// supported / has an invalid value.
+func isUnsupportedMessage(err error) bool {
+	var ae *APIError
+	if !errors.As(err, &ae) || ae.Status != http.StatusBadRequest {
+		return false
+	}
+	s := strings.ToLower(ae.Message + " " + ae.Code)
+	return strings.Contains(s, "not supported") || strings.Contains(s, "unsupported") ||
+		strings.Contains(s, "does not support") || strings.Contains(s, "invalid value") ||
+		strings.Contains(s, "not available") || strings.Contains(s, "unknown parameter") ||
+		strings.Contains(s, "unrecognized") ||
+		// The request's schema itself is rejected (not the model reply).
+		strings.Contains(s, "invalid json schema") || strings.Contains(s, "invalid schema")
+}
+
+// isSchemaError reports that the MODEL does not support json_schema
+// response_format at all — only then is the schema switched off for the
+// model. A plain json_validate_failed (the reply did not fit the schema)
+// is NOT such an error.
 func isSchemaError(err error) bool {
-	return isParamError(err, "schema") || isParamError(err, "response_format") || isParamError(err, "json")
+	if isValidationFailure(err) || !isUnsupportedMessage(err) {
+		return false
+	}
+	return isParamError(err, "response_format") || isParamError(err, "json_schema") ||
+		isParamError(err, "schema")
+}
+
+// isEffortError reports that the model explicitly rejects the
+// reasoning_effort parameter (not supported / invalid value).
+func isEffortError(err error) bool {
+	if isValidationFailure(err) || !isUnsupportedMessage(err) {
+		return false
+	}
+	return isParamError(err, "reasoning_effort") || isParamError(err, "reasoning effort")
 }
 
 func (c *Client) do(ctx context.Context, r Request, maxTokens int, useSchema bool) (*Result, error) {

@@ -128,7 +128,7 @@ type UserSubjectState struct {
 	UserID         int64
 	SubjectID      int64
 	TestsPage      int // last opened page of the tests grid
-	LastTestNumber int // highest chain test the user completed
+	LastTestNumber int // highest chain test that reached the unlock bar (permanent unlock watermark)
 	RequestedUpTo  int // chain tests already queued for generation
 }
 

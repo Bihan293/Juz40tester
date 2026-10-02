@@ -379,6 +379,19 @@ func TestFlowChainSharedAndUnlock(t *testing.T) {
 	if ok, _, _ := e.quiz.CanOpenTest(ctx, carl, &c[1]); ok {
 		t.Fatal("carl must not open Тест 2")
 	}
+	// Alice retries Тест 1 with mistakes and drops below the bar — the
+	// unlock is permanent, Тест 2 must stay open.
+	e.setStatuses(t, alice, t1, 10, 5)
+	e.quiz.OnTestCompleted(ctx, alice, test1, 10, 5)
+	if ok, reason, _ := e.quiz.CanOpenTest(ctx, alice, &c[1]); !ok {
+		t.Fatalf("Тест 2 must stay unlocked after a worse retry of Тест 1: %s", reason)
+	}
+	// Completing below the bar must not bump carl's watermark.
+	e.setStatuses(t, carl, t1, 5, 5)
+	e.quiz.OnTestCompleted(ctx, carl, test1, 5, 5)
+	if ok, _, _ := e.quiz.CanOpenTest(ctx, carl, &c[1]); ok {
+		t.Fatal("a completion below the bar must not unlock Тест 2")
+	}
 }
 
 func TestFlowWeakTopicsSharedClone(t *testing.T) {

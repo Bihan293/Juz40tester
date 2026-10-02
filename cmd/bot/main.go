@@ -122,6 +122,10 @@ func main() {
 	workerCtx, stopWorker := context.WithCancel(context.Background())
 	defer stopWorker()
 	go genSvc.RunWorker(workerCtx)
+	// Stale-attempt reaper: attempts left unfinished for staleAttemptAge
+	// are closed as abandoned (they would otherwise keep their questions
+	// "busy" for the quality sweep forever).
+	go reapStaleAttempts(workerCtx, attemptRepo)
 
 	// Bootstrap the AI chain: queue the generation of Тест 1 right away for
 	// EVERY subject whose chain is still empty — otherwise a fresh database
@@ -234,6 +238,37 @@ func main() {
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown: %v", err)
+	}
+}
+
+// staleAttemptAge: an in-progress attempt untouched this long is abandoned.
+const staleAttemptAge = 30 * 24 * time.Hour
+
+// reapStaleAttempts closes long-forgotten in-progress attempts once at
+// startup and then every 6 hours.
+func reapStaleAttempts(ctx context.Context, attempts *repositories.AttemptRepository) {
+	run := func() {
+		rctx, cancel := context.WithTimeout(ctx, time.Minute)
+		defer cancel()
+		n, err := attempts.AbandonStaleAttempts(rctx, staleAttemptAge)
+		if err != nil {
+			log.Printf("stale attempts reaper: %v", err)
+			return
+		}
+		if n > 0 {
+			log.Printf("stale attempts reaper: %d attempt(s) marked abandoned", n)
+		}
+	}
+	run()
+	ticker := time.NewTicker(6 * time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
 	}
 }
 

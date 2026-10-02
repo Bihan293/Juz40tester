@@ -469,9 +469,12 @@ func (r *GenerationRepository) HasPendingOrRunningPersonalJob(ctx context.Contex
 }
 
 // ClaimNextJob atomically picks a due pending job and marks it running:
-// urgent jobs first (they ignore not_before — a user is waiting), then
-// deferred jobs whose time has come (off-peak pre-generation). Returns nil
-// when nothing is due.
+// urgent jobs first, then deferred jobs whose time has come (off-peak
+// pre-generation). EVERY job honours not_before: urgent jobs are enqueued
+// with not_before = now() so they still run right away, while the retry
+// backoff set by FailJob (not_before = now() + retryDelay) now applies to
+// urgent jobs too — previously an urgent job burned all its retries within
+// a minute while a provider was down. Returns nil when nothing is due.
 func (r *GenerationRepository) ClaimNextJob(ctx context.Context) (*models.GenerationJob, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -486,7 +489,7 @@ func (r *GenerationRepository) ClaimNextJob(ctx context.Context) (*models.Genera
 	err = tx.QueryRow(ctx, `
 		SELECT id, kind, subject_id, test_number, topics_fingerprint, owner_user_id, status, attempts, urgent
 		FROM generation_jobs
-		WHERE status = 'pending' AND (urgent OR not_before <= now())
+		WHERE status = 'pending' AND not_before <= now()
 		ORDER BY urgent DESC, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED`).
@@ -705,6 +708,7 @@ func (r *GenerationRepository) UncheckedQuestions(ctx context.Context, limit int
 		       option_d, correct_answer, topic, difficulty
 		FROM questions
 		WHERE quality_checked_at IS NULL
+		  AND (quality_postponed_until IS NULL OR quality_postponed_until < now())
 		ORDER BY id
 		LIMIT $1`, limit)
 	if err != nil {
@@ -745,6 +749,33 @@ func (r *GenerationRepository) NoteQualityAttempt(ctx context.Context, id int64,
 	return err
 }
 
+// questionBusySQL: the question is on screen (unanswered) in an
+// in-progress attempt.
+const questionBusySQL = `
+	SELECT EXISTS (
+		SELECT 1 FROM attempt_questions aq
+		JOIN test_attempts a ON a.id = aq.attempt_id
+		WHERE aq.question_id = $1 AND NOT aq.answered AND a.status = 'in_progress'
+	)`
+
+// IsQuestionBusy reports whether the question is shown in an unanswered
+// position of an in-progress attempt. The quality sweep checks it BEFORE
+// paying the model for a rewrite (ReplaceQuestionContent would refuse it).
+func (r *GenerationRepository) IsQuestionBusy(ctx context.Context, id int64) (bool, error) {
+	var busy bool
+	err := r.pool.QueryRow(ctx, questionBusySQL, id).Scan(&busy)
+	return busy, err
+}
+
+// PostponeQualityCheck hides a busy question from the quality sweep for the
+// given delay (no AI call is made for it until then).
+func (r *GenerationRepository) PostponeQualityCheck(ctx context.Context, id int64, delay time.Duration) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE questions SET quality_postponed_until = now() + $2::interval
+		WHERE id = $1`, id, delay.String())
+	return err
+}
+
 // ErrQuestionBusy: the question is shown in an unanswered position of an
 // in-progress attempt — rewriting it now would change the text/key under a
 // student who is looking at it. The sweep retries later.
@@ -767,12 +798,7 @@ func (r *GenerationRepository) ReplaceQuestionContent(ctx context.Context, id in
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var busy bool
-	if err := tx.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM attempt_questions aq
-			JOIN test_attempts a ON a.id = aq.attempt_id
-			WHERE aq.question_id = $1 AND NOT aq.answered AND a.status = 'in_progress'
-		)`, id).Scan(&busy); err != nil {
+	if err := tx.QueryRow(ctx, questionBusySQL, id).Scan(&busy); err != nil {
 		return err
 	}
 	if busy {
