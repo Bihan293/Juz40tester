@@ -572,7 +572,7 @@ func (g *GeneratorService) EnsureChainTest(ctx context.Context, subjectID int64,
 	return g.gen.HasPendingOrRunningChainJob(ctx, subjectID, testNumber)
 }
 
-// ReviveChainTest re-queues the generation of a chain test whose job died
+// reviveChainTest re-queues the generation of a chain test whose job died
 // (status='failed' after exhausting retries) or got stuck while the queue
 // was broken. It is triggered by the user tapping the ⏳ button — previously
 // that tap only showed a toast and changed NOTHING, so a failed job left the
@@ -580,7 +580,12 @@ func (g *GeneratorService) EnsureChainTest(ctx context.Context, subjectID int64,
 // job already exists it is simply made urgent; a missing test with no active
 // job gets a fresh urgent job (the unique index treats 'failed' rows as
 // free slots). The tap is a no-op for tests that already exist.
-func (g *GeneratorService) ReviveChainTest(ctx context.Context, subjectID int64, testNumber int, ownerUserID int64) {
+//
+// Unexported on purpose: it performs NO unlock check. The only entry point
+// is QuizService.ReviveChainTest, which refuses test numbers above the
+// user's unlockedMax — so no caller can start a paid generation of a locked
+// test by bypassing that guard.
+func (g *GeneratorService) reviveChainTest(ctx context.Context, subjectID int64, testNumber int, ownerUserID int64) {
 	if !g.Enabled() || testNumber < 1 || testNumber > models.MaxVisibleTests {
 		return
 	}
@@ -739,29 +744,54 @@ func (g *GeneratorService) runWorkerLoop(ctx context.Context) (panicked bool) {
 const qualitySweepEvery = 5 * time.Minute
 
 // qualitySweepTick runs one bounded sweep over not-yet-audited questions.
+//
+// During a zero-downtime deploy two instances run at once; both sweeping
+// the same unchecked questions would pay twice for the same AI repairs. The
+// sweep therefore runs under a cluster-wide advisory lock (try-lock): the
+// instance that does not get it simply skips this tick.
 func (g *GeneratorService) qualitySweepTick(ctx context.Context) {
 	sctx, cancel := context.WithTimeout(ctx, jobTimeout)
 	defer cancel()
-	n, err := g.RunQualitySweep(sctx)
+	ran, n, err := g.runQualitySweepExclusive(sctx)
 	if err != nil {
 		log.Printf("quality sweep: %v", err)
+	}
+	if !ran {
+		log.Printf("quality sweep: skipped — another instance holds the sweep lock")
+		return
 	}
 	if n > 0 {
 		log.Printf("quality sweep: %d stored question(s) rewritten", n)
 	}
 }
 
+// runQualitySweepExclusive runs RunQualitySweep under the quality-sweep
+// advisory lock. ran = false when another instance is sweeping right now.
+func (g *GeneratorService) runQualitySweepExclusive(ctx context.Context) (ran bool, n int, err error) {
+	ran, err = g.gen.TryQualitySweepLock(ctx, func(lctx context.Context) error {
+		var serr error
+		n, serr = g.RunQualitySweep(lctx)
+		return serr
+	})
+	return ran, n, err
+}
+
 // reapStuckJobs returns 'running' jobs whose worker died (deploy/restart/OOM)
 // back to 'pending', so a crashed generation never leaves a test hanging in
 // ⏳ «Минуточку...» forever.
+// A job that already exhausted maxJobAttempts is parked as failed instead of
+// being re-queued (a job that crashes the process must not loop forever).
 func (g *GeneratorService) reapStuckJobs(ctx context.Context) {
-	n, err := g.gen.ResetStuckRunningJobs(ctx, stuckJobTimeout)
+	n, failed, err := g.gen.ResetStuckRunningJobs(ctx, stuckJobTimeout, maxJobAttempts)
 	if err != nil {
 		log.Printf("generator: reap stuck jobs: %v", err)
 		return
 	}
 	if n > 0 {
 		log.Printf("generator: re-queued %d stuck running job(s)", n)
+	}
+	if failed > 0 {
+		log.Printf("generator: parked %d stuck job(s) as failed (attempts exhausted)", failed)
 	}
 }
 
@@ -775,6 +805,13 @@ func (g *GeneratorService) processOne(ctx context.Context) {
 	if err != nil || job == nil {
 		return
 	}
+	g.executeJob(ctx, job)
+}
+
+// executeJob runs one claimed job and records its outcome: done, failed
+// (retry with backoff) or — when ctx was cancelled by a shutdown — released
+// back to the queue without spending an attempt.
+func (g *GeneratorService) executeJob(ctx context.Context, job *models.GenerationJob) {
 	log.Printf("generator: running job %d (kind=%s subject=%d test=%d owner=%d urgent=%v, attempt %d)",
 		job.ID, job.Kind, job.SubjectID, job.TestNumber, job.OwnerUserID, job.Urgent, job.Attempts)
 
@@ -796,6 +833,21 @@ func (g *GeneratorService) processOne(ctx context.Context) {
 		defer cancel()
 		return g.runJob(jobCtx, job)
 	}()
+	if runErr != nil && ctx.Err() != nil {
+		// Shutdown (SIGTERM / deploy) interrupted the job: it did not fail.
+		// Hand it back to the queue right away (pending, not_before = now(),
+		// attempts NOT increased) so the next instance picks it up instantly
+		// instead of waiting for the stuck-job reaper. ctx is already
+		// cancelled, so a short detached context is used for the update.
+		rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer rcancel()
+		if rerr := g.gen.ReleaseJob(rctx, job.ID); rerr != nil {
+			log.Printf("generator: release job %d on shutdown: %v", job.ID, rerr)
+		} else {
+			log.Printf("generator: job %d interrupted by shutdown — returned to the queue", job.ID)
+		}
+		return
+	}
 	if runErr != nil {
 		log.Printf("generator: job %d failed: %v", job.ID, runErr)
 		if ferr := g.gen.FailJob(ctx, job.ID, runErr, retryDelay, maxJobAttempts); ferr != nil {

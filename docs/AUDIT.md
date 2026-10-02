@@ -50,3 +50,23 @@
 ## Вывод
 
 Архитектура рабочая и не хрупкая: критичные места (ответы, очередь, миграции, webhook) защищены транзакциями и тестами. Можно смело добавлять админку и подписки по плану выше.
+
+## Часть 3 — надёжность и инфраструктура (#19–#31)
+
+| # | Что изменено | Тест |
+|---|---|---|
+| 19 | `cmd/bot/webhook.go`: `updateDispatcher` с `sync.WaitGroup`; при SIGTERM воркер отменяется, HTTP-сервер останавливается, апдейты в обработке дожидаются (таймаут 20 с, потом отмена контекста). Новые апдейты во время выключения → 503 (Telegram доставит повторно). Прерванная задача генерации → `ReleaseJob`: `pending`, `not_before=now()`, `attempts` не растёт | `TestWebhookShutdownWaitsForUpdates`, `TestWebhookShutdownTimeoutCancelsHandlers`, `TestShutdownReleasesRunningJob` (PG) |
+| 20 | Семафор на 32 одновременных апдейта; пул pgx через `pgxpool.ParseConfig`, `MaxConns = DB_MAX_CONNS` (по умолчанию 15) | `TestWebhookConcurrencyBounded`, `TestDBMaxConns` |
+| 21 | Миграции идут через отдельное прямое подключение: `MIGRATION_DATABASE_URL` или `DATABASE_URL` с убранным `-pooler` у хоста Neon (`database.DirectURL`, `MigrateURL`) | `TestDirectURL`, `TestMigrateConcurrent` (PG) |
+| 22 | `setWebhook` после старта HTTP, в фоне, с повтором и экспоненциальной паузой (2 с → 1 мин) вместо `log.Fatalf` | `TestSetWebhookRetries`, `TestSetWebhookStopsOnShutdown`, ручной запуск бинаря |
+| 23 | `RunQualitySweep` обёрнут в `pg_try_advisory_xact_lock` (`TryQualitySweepLock`); если lock занят — sweep пропускается | `TestQualitySweepSingleInstance` (PG) |
+| 24 | Backfill запускается в фоне после старта HTTP; история читается потоком, агрегируется по темам, запись — батчами upsert; `LOCK TABLE … EXCLUSIVE` + перезапись, а не прибавление, поэтому параллельные живые ответы не считаются дважды | `TestWeakTopicsBackfillMatchesLive`, `TestBackfillAfterLiveAnswersNoDoubleCount` (PG) |
+| 25 | Все `$n::interval` с Go-строкой заменены на `make_interval(secs => $n)` + `int(d.Seconds())` (`ResetStuckRunningJobs`, `FailJob`, `PostponeQualityCheck`, `AbandonStaleAttempts`) | `TestFailJobBackoffInterval`, `TestResetStuckRunningJobsRespectsAttempts`, `TestAttemptGuards`, `TestQualitySweepRepository` (PG) |
+| 26 | Обработчик зависших задач: если `attempts >= maxJobAttempts`, задача → `failed`; флаг `urgent` больше не выставляется всем подряд | `TestResetStuckRunningJobsRespectsAttempts` (PG) |
+| 27 | `DeletePersonalTest`: сначала берутся `question_id` удаляемого теста, удаляются только они и только если на них больше нет ссылок; всё в одной транзакции | `TestDeletePersonalTestOnlyOwnOrphans`, `TestFlowWeakTopicsSharedClone` (PG) |
+| 28 | `config.Load`: в production (`APP_ENV` не dev/local/test) без `WEBHOOK_SECRET` бот не запускается | `TestWebhookSecretRequiredInProduction`, ручной запуск бинаря |
+| 29 | Сломанный JSON апдейта логируется, Telegram получает 200 | `TestWebhookMalformedJSONReturns200`, ручной запуск бинаря |
+| 30 | `bot.Client.call`: на 429 читается `parameters.retry_after`, не больше 2 повторов, ожидание не дольше 30 с, иначе `RateLimitError` | `TestCall429RetriedAfterRetryAfter`, `TestCall429BoundedRetries`, `TestCall429TooLongWaitFailsFast`, `TestCallNon429ErrorNotRetried` |
+| 31 | Оставлен вариант в памяти; поведение после рестарта и при 429 проверено и описано в `docs/GROQ_LIMITS.md` | `TestLimiterAfterRestart`, `TestClient429PerDayBlocksForAnHour` |
+
+Повторная проверка: #13 — `TestReviveChainTestLockedIsRefusedAtServiceLevel` (у `GeneratorService.reviveChainTest` убран экспорт, единственный вход — `QuizService.ReviveChainTest` с проверкой `unlockedMax`); #16 — `TestReplaceQuestionContentAtomic` (ошибка подставлена триггером, после отката нет ни нового текста, ни потерянного прогресса); #18 — `TestEnsurePersonalTestKeepsActiveAttemptAndNormalizes`.

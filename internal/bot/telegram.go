@@ -148,44 +148,98 @@ func ReplyRow(texts ...string) []KeyboardButton {
 
 type apiResponse struct {
 	OK          bool            `json:"ok"`
+	ErrorCode   int             `json:"error_code,omitempty"`
 	Description string          `json:"description,omitempty"`
 	Result      json.RawMessage `json:"result,omitempty"`
+	Parameters  *struct {
+		RetryAfter int `json:"retry_after,omitempty"`
+	} `json:"parameters,omitempty"`
 }
 
+// maxRateLimitRetries bounds the retries of one call after Telegram 429
+// ("Too Many Requests: retry after N"). Never infinite.
+const maxRateLimitRetries = 2
+
+// maxRetryAfter caps how long one retry may wait: a longer flood-control
+// ban is not worth blocking an update handler for — the call fails instead.
+var maxRetryAfter = 30 * time.Second
+
+// RateLimitError is returned when Telegram keeps answering 429 after the
+// bounded retries (or asks for a wait longer than maxRetryAfter).
+type RateLimitError struct {
+	Method     string
+	RetryAfter time.Duration
+}
+
+func (e *RateLimitError) Error() string {
+	return fmt.Sprintf("telegram %s: rate limited (retry after %s)", e.Method, e.RetryAfter)
+}
+
+// call performs one Bot API request. On HTTP 429 it honours
+// parameters.retry_after and retries at most maxRateLimitRetries times —
+// previously a rate-limited message was silently lost.
 func (c *Client) call(ctx context.Context, method string, payload any, out any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
+	for attempt := 0; ; attempt++ {
+		retryAfter, err := c.callOnce(ctx, method, body, out)
+		if retryAfter <= 0 {
+			return err
+		}
+		if attempt >= maxRateLimitRetries || retryAfter > maxRetryAfter {
+			return &RateLimitError{Method: method, RetryAfter: retryAfter}
+		}
+		t := time.NewTimer(retryAfter)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
+}
+
+// callOnce sends the request once. retryAfter > 0 means Telegram answered
+// 429 and the request may be repeated after that delay.
+func (c *Client) callOnce(ctx context.Context, method string, body []byte, out any) (retryAfter time.Duration, err error) {
 	url := fmt.Sprintf("%s/bot%s/%s", c.baseURL, c.token, method)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	var ar apiResponse
 	if err := json.Unmarshal(raw, &ar); err != nil {
-		return fmt.Errorf("telegram %s: decode: %w", method, err)
+		return 0, fmt.Errorf("telegram %s: decode: %w", method, err)
 	}
 	if !ar.OK {
-		return fmt.Errorf("telegram %s: %s", method, ar.Description)
+		if resp.StatusCode == http.StatusTooManyRequests || ar.ErrorCode == http.StatusTooManyRequests {
+			wait := time.Second
+			if ar.Parameters != nil && ar.Parameters.RetryAfter > 0 {
+				wait = time.Duration(ar.Parameters.RetryAfter) * time.Second
+			}
+			return wait, fmt.Errorf("telegram %s: %s", method, ar.Description)
+		}
+		return 0, fmt.Errorf("telegram %s: %s", method, ar.Description)
 	}
 	if out != nil && len(ar.Result) > 0 {
 		if err := json.Unmarshal(ar.Result, out); err != nil {
-			return fmt.Errorf("telegram %s: result: %w", method, err)
+			return 0, fmt.Errorf("telegram %s: result: %w", method, err)
 		}
 	}
-	return nil
+	return 0, nil
 }
 
 // maxMessageRunes is the Telegram limit for one message text (4096

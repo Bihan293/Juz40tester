@@ -93,6 +93,16 @@ func (r *GenerationRepository) queryTopicStats(ctx context.Context, q string, ar
 // answers (countsForTopic). Safe with several instances: the marker row is
 // inserted in the same transaction — a concurrent instance blocks on it and
 // then sees the backfill as done.
+//
+// It runs in the background AFTER the HTTP server is up (audit #24), so live
+// answers may arrive meanwhile. To stay exact the transaction takes an
+// EXCLUSIVE lock on user_topic_stats before reading the history: a live
+// answer that already wrote its statistics is committed first (and is part
+// of the history read below); a later one waits and adds on top. The rows
+// are then OVERWRITTEN with the aggregate of the full history — never added
+// to — so nothing is counted twice. The history is streamed (not loaded into
+// memory) and aggregated per (user, subject, topic): one batched upsert per
+// topic instead of one INSERT per historical answer.
 func (r *GenerationRepository) BackfillTopicStats(ctx context.Context) error {
 	const name = "topic_stats_v1"
 	tx, err := r.pool.Begin(ctx)
@@ -111,6 +121,9 @@ func (r *GenerationRepository) BackfillTopicStats(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if _, err := tx.Exec(ctx, `LOCK TABLE user_topic_stats IN EXCLUSIVE MODE`); err != nil {
+		return err
+	}
 
 	rows, err := tx.Query(ctx, `
 		SELECT ta.user_id, q.subject_id, q.id, q.topic, aq.is_correct
@@ -122,43 +135,90 @@ func (r *GenerationRepository) BackfillTopicStats(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	type answer struct {
-		user, subject, question int64
-		topic                   string
-		correct                 bool
+	type qkey struct{ user, question int64 }
+	type tkey struct {
+		user, subject int64
+		key           string
 	}
-	var answers []answer
+	type agg struct {
+		topic          string
+		correct, wrong int
+		recent         []byte
+	}
+	status := map[qkey]int{}
+	stats := map[tkey]*agg{}
+	var order []tkey
+	n := 0
 	for rows.Next() {
-		var a answer
-		if err := rows.Scan(&a.user, &a.subject, &a.question, &a.topic, &a.correct); err != nil {
+		var user, subject, question int64
+		var topic string
+		var correct bool
+		if err := rows.Scan(&user, &subject, &question, &topic, &correct); err != nil {
 			rows.Close()
 			return err
 		}
-		answers = append(answers, a)
+		k := qkey{user, question}
+		prev := status[k]
+		status[k] = models.NextStatus(prev, correct)
+		if !countsForTopic(prev, correct) {
+			continue
+		}
+		key := models.NormalizeTopic(topic)
+		if key == "" {
+			continue
+		}
+		tk := tkey{user, subject, key}
+		a := stats[tk]
+		if a == nil {
+			a = &agg{}
+			stats[tk] = a
+			order = append(order, tk)
+		}
+		a.topic = topic
+		if correct {
+			a.correct++
+			a.recent = append(a.recent, '1')
+		} else {
+			a.wrong++
+			a.recent = append(a.recent, '0')
+		}
+		if len(a.recent) > models.TopicWindow {
+			a.recent = a.recent[len(a.recent)-models.TopicWindow:]
+		}
+		n++
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return err
 	}
 
-	type qkey struct{ user, question int64 }
-	status := map[qkey]int{}
-	n := 0
-	for _, a := range answers {
-		k := qkey{a.user, a.question}
-		prev := status[k]
-		status[k] = models.NextStatus(prev, a.correct)
-		if !countsForTopic(prev, a.correct) {
-			continue
+	const batchSize = 500
+	for i := 0; i < len(order); i += batchSize {
+		end := i + batchSize
+		if end > len(order) {
+			end = len(order)
 		}
-		if err := recordTopicAnswer(ctx, tx, a.user, a.subject, a.topic, a.correct); err != nil {
+		b := &pgx.Batch{}
+		for _, tk := range order[i:end] {
+			a := stats[tk]
+			b.Queue(`
+				INSERT INTO user_topic_stats (user_id, subject_id, topic_key, topic, correct_count, wrong_count, recent)
+				VALUES ($1, $2, $3, $4, $5, $6, $7)
+				ON CONFLICT (user_id, subject_id, topic_key) DO UPDATE SET
+					topic         = EXCLUDED.topic,
+					correct_count = EXCLUDED.correct_count,
+					wrong_count   = EXCLUDED.wrong_count,
+					recent        = EXCLUDED.recent,
+					updated_at    = now()`,
+				tk.user, tk.subject, tk.key, a.topic, a.correct, a.wrong, string(a.recent))
+		}
+		if err := tx.SendBatch(ctx, b).Close(); err != nil {
 			return err
 		}
-		n++
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	log.Printf("topic stats backfill: %d historical answers replayed", n)
+	log.Printf("topic stats backfill: %d historical answers replayed into %d topic rows", n, len(order))
 	return nil
 }

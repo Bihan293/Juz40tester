@@ -329,3 +329,72 @@ func TestSchemaAndEffortErrorClassification(t *testing.T) {
 		t.Fatal("explicit reasoning_effort rejection must disable it")
 	}
 }
+
+// TestLimiterAfterRestart (audit #31): the RPD/TPD counters live in memory
+// and start EMPTY after a restart. This pins the two mechanisms that keep a
+// restarted instance from overshooting the daily quota anyway:
+//  1. the first reply's x-ratelimit-remaining-requests (daily) re-syncs the
+//     limiter — when the day is nearly used up the model is blocked at once;
+//  2. a "per day" 429 blocks the model for at least an hour (no hammering),
+//     and the block is refused LOCALLY with daily=true (no waiting).
+func TestLimiterAfterRestart(t *testing.T) {
+	// "Before restart": the old process used most of the daily quota.
+	// "After restart": a brand-new limiter has empty windows.
+	fresh, clk := newTestLimiter(LimitsFor(ModelGPTOSS120B))
+	if _, _, reqDay, _ := fresh.snapshot(); reqDay != 0 {
+		t.Fatalf("fresh limiter must start empty, got %d", reqDay)
+	}
+	if _, err := fresh.acquire(context.Background(), 10, 0); err != nil {
+		t.Fatalf("first request after restart must be admitted: %v", err)
+	}
+	// 1. Server headers report the daily quota nearly gone → block.
+	h := http.Header{}
+	h.Set("x-ratelimit-limit-requests", "1000")
+	h.Set("x-ratelimit-remaining-requests", "20")
+	h.Set("x-ratelimit-reset-requests", "5h")
+	fresh.observeHeaders(h)
+	_, err := fresh.acquire(context.Background(), 10, time.Hour)
+	var rl *RateLimitError
+	if !errors.As(err, &rl) || rl.RetryAfter < 4*time.Hour {
+		t.Fatalf("restarted limiter must re-sync from server headers, got %v", err)
+	}
+
+	// 2. A "per day" 429 on another fresh limiter → long local block.
+	lim2, clk2 := newTestLimiter(LimitsFor(ModelGPTOSS120B))
+	lim2.block(time.Hour, "429 per day")
+	start := time.Now()
+	if _, err := lim2.acquire(context.Background(), 10, 24*time.Hour); !IsRateLimited(err) {
+		t.Fatalf("daily 429 must refuse locally, got %v", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatal("daily block must fail fast, not wait")
+	}
+	clk2.t = clk2.t.Add(61 * time.Minute)
+	if _, err := lim2.acquire(context.Background(), 10, 0); err != nil {
+		t.Fatalf("block must expire after retry-after: %v", err)
+	}
+	_ = clk
+}
+
+// TestClient429PerDayBlocksForAnHour: an HTTP 429 "per day" with a short
+// retry-after still blocks the model for >= 1h.
+func TestClient429PerDayBlocksForAnHour(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.Header().Set("retry-after", "2")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"message":"Rate limit reached on requests per day (RPD)"}}`)
+	}))
+	defer srv.Close()
+	c := New("k", srv.URL)
+	req := Request{Model: ModelQwen27B, Messages: []Message{{Role: "user", Content: "hi"}}, MaxTokens: 100}
+	_, err := c.ChatJSON(context.Background(), req)
+	var rl *RateLimitError
+	if !errors.As(err, &rl) || rl.RetryAfter < time.Hour {
+		t.Fatalf("per-day 429 must block >= 1h, got %v", err)
+	}
+	if _, err := c.ChatJSON(context.Background(), req); !IsRateLimited(err) || atomic.LoadInt32(&calls) != 1 {
+		t.Fatalf("blocked model must not be called again: err=%v calls=%d", err, calls)
+	}
+}

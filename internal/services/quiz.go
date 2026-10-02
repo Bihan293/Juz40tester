@@ -464,7 +464,7 @@ func (s *QuizService) ReviveChainTest(ctx context.Context, subjectID int64, test
 			subjectID, testNumber, userID, unlocked)
 		return
 	}
-	s.genSvc.ReviveChainTest(ctx, subjectID, testNumber, userID)
+	s.genSvc.reviveChainTest(ctx, subjectID, testNumber, userID)
 }
 
 // SubjectsWithWeakTopics returns only the subjects in which the user has at

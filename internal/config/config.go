@@ -15,10 +15,26 @@ type Config struct {
 	DatabaseURL string
 	WebhookURL  string
 	Port        string
-	// WebhookSecret (optional, WEBHOOK_SECRET): Telegram echoes it in the
+	// WebhookSecret (WEBHOOK_SECRET): Telegram echoes it in the
 	// X-Telegram-Bot-Api-Secret-Token header; requests without it are
-	// rejected. Without it anyone who knows the URL could forge updates.
+	// rejected. Without it anyone who knows the URL could forge updates, so
+	// it is REQUIRED in production (see Production / Load).
 	WebhookSecret string
+
+	// Production is true unless APP_ENV is one of development/dev/local/test.
+	// In production WEBHOOK_SECRET is mandatory.
+	Production bool
+
+	// MigrationDatabaseURL (MIGRATION_DATABASE_URL, optional): a DIRECT
+	// (non-pooler) connection string used only for migrations. Migrations are
+	// serialised by a SESSION-level pg_advisory_lock; behind a transaction-
+	// mode pooler (Neon "-pooler" host / PgBouncer) the lock and the unlock
+	// may land on different server connections. Defaults to DATABASE_URL with
+	// a Neon "-pooler" host rewritten to the direct host.
+	MigrationDatabaseURL string
+
+	// DBMaxConns (DB_MAX_CONNS, default 15): upper bound of the pgx pool.
+	DBMaxConns int
 
 	// DeepSeek API settings for AI test generation.
 	DeepSeekAPIKey        string
@@ -65,6 +81,17 @@ func Load() (*Config, error) {
 		GroqBaseURL:           strings.TrimSpace(os.Getenv("GROQ_BASE_URL")),
 		OffPeakStartHour:      -1,
 		OffPeakEndHour:        -1,
+		MigrationDatabaseURL:  strings.TrimSpace(os.Getenv("MIGRATION_DATABASE_URL")),
+		DBMaxConns:            defaultDBMaxConns,
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV"))) {
+	case "development", "dev", "local", "test":
+		cfg.Production = false
+	default:
+		cfg.Production = true
+	}
+	if n, ok := envIntOpt("DB_MAX_CONNS"); ok && n > 0 {
+		cfg.DBMaxConns = n
 	}
 	if start, ok := envIntOpt("GEN_OFFPEAK_START_HOUR"); ok {
 		if end, ok2 := envIntOpt("GEN_OFFPEAK_END_HOUR"); ok2 {
@@ -99,11 +126,21 @@ func Load() (*Config, error) {
 	if cfg.WebhookURL == "" {
 		missing = append(missing, "WEBHOOK_URL")
 	}
+	// A production webhook without a secret accepts forged updates from
+	// anyone who knows the URL — refuse to start instead of only warning.
+	if cfg.Production && cfg.WebhookSecret == "" {
+		missing = append(missing, "WEBHOOK_SECRET (required in production; set APP_ENV=development to run without it)")
+	}
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("missing required environment variables: %v", missing)
 	}
 	return cfg, nil
 }
+
+// defaultDBMaxConns bounds the pgx pool (the pgx default is max(4, NumCPU),
+// too small for concurrent updates + worker + reapers on a 1-CPU instance,
+// and unbounded concurrency would exhaust a Neon free-tier connection cap).
+const defaultDBMaxConns = 15
 
 // envIntOpt reads an integer env var; ok is false when it is unset or
 // unparsable (callers need to distinguish "unset" from an explicit value).
