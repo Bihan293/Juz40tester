@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -98,5 +99,39 @@ func TestCallNon429ErrorNotRetried(t *testing.T) {
 	c := NewClient("T").WithBaseURL(srv.URL)
 	if _, err := c.SendMessage(context.Background(), 1, "x", nil); err == nil || calls != 1 {
 		t.Fatalf("err=%v calls=%d", err, calls)
+	}
+}
+
+// TestTransportErrorDoesNotLeakToken (P0-1): a network failure returns a
+// *url.Error whose text embeds https://.../bot<TOKEN>/method. The error
+// returned to callers (and logged) must not contain the URL or the token.
+func TestTransportErrorDoesNotLeakToken(t *testing.T) {
+	const token = "123456:SECRET-bot-token"
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	base := srv.URL
+	srv.Close() // connection refused from now on
+
+	c := NewClient(token).WithBaseURL(base)
+	_, err := c.SendMessage(context.Background(), 1, "hi", nil)
+	if err == nil {
+		t.Fatal("expected a transport error")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, token) || strings.Contains(msg, "/bot") || strings.Contains(msg, base) {
+		t.Fatalf("error leaks URL/token: %q", msg)
+	}
+	if !strings.Contains(msg, "telegram sendMessage") {
+		t.Fatalf("error lost the method name: %q", msg)
+	}
+
+	// Context cancellation must stay detectable through the wrapper.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = c.SendMessage(ctx, 1, "hi", nil)
+	if err == nil || strings.Contains(err.Error(), token) {
+		t.Fatalf("cancelled call: err=%v", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("errors.Is(context.Canceled) lost: %v", err)
 	}
 }

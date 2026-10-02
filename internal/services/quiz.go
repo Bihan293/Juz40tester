@@ -32,10 +32,13 @@ type QuizService struct {
 	// starting a test at the same moment corrupt the source and panic.
 	rng   *mrand.Rand
 	rngMu sync.Mutex
+	// boards caches the heavy per-subject leaderboards (P0-4).
+	boards *leaderboardCache
 }
 
 func NewQuizService(subjects *repositories.SubjectRepository, attempts *repositories.AttemptRepository, state *repositories.StateRepository, gen *repositories.GenerationRepository, genSvc *GeneratorService, users ...*repositories.UserRepository) *QuizService {
-	s := &QuizService{subjects: subjects, attempts: attempts, state: state, gen: gen, genSvc: genSvc, rng: newSecureRand()}
+	s := &QuizService{subjects: subjects, attempts: attempts, state: state, gen: gen, genSvc: genSvc, rng: newSecureRand(),
+		boards: newLeaderboardCache(LeaderboardCacheTTL)}
 	if len(users) > 0 {
 		s.users = users[0]
 	}
@@ -794,15 +797,27 @@ func (s *QuizService) StreakLeaderboard(ctx context.Context, limit int) ([]model
 }
 
 // UnlockedTestsLeaderboard returns the top users of a subject by unlocked
-// chain tests ("уровни").
+// chain tests ("уровни"). The result is cached per subject for
+// LeaderboardCacheTTL — the underlying recursive aggregation scans every
+// user's progress in the subject.
 func (s *QuizService) UnlockedTestsLeaderboard(ctx context.Context, subjectID int64, limit int) ([]models.LeaderboardEntry, error) {
-	return s.subjects.UnlockedTestsLeaderboard(ctx, subjectID, limit)
+	if s.boards == nil {
+		return s.subjects.UnlockedTestsLeaderboard(ctx, subjectID, limit)
+	}
+	return s.boards.get(ctx, leaderboardKey{boardUnlocked, subjectID, limit}, func(ctx context.Context) ([]models.LeaderboardEntry, error) {
+		return s.subjects.UnlockedTestsLeaderboard(ctx, subjectID, limit)
+	})
 }
 
 // GreenLeaderboard returns the top users of a subject by mastered (🟢)
-// questions.
+// questions. Cached per subject for LeaderboardCacheTTL.
 func (s *QuizService) GreenLeaderboard(ctx context.Context, subjectID int64, limit int) ([]models.LeaderboardEntry, error) {
-	return s.subjects.GreenLeaderboard(ctx, subjectID, limit)
+	if s.boards == nil {
+		return s.subjects.GreenLeaderboard(ctx, subjectID, limit)
+	}
+	return s.boards.get(ctx, leaderboardKey{boardGreen, subjectID, limit}, func(ctx context.Context) ([]models.LeaderboardEntry, error) {
+		return s.subjects.GreenLeaderboard(ctx, subjectID, limit)
+	})
 }
 
 // SubjectProgress returns knowledge statistics of a single subject for the

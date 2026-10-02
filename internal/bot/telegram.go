@@ -5,9 +5,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -201,24 +203,43 @@ func (c *Client) call(ctx context.Context, method string, payload any, out any) 
 	}
 }
 
+// safeErr strips the request URL (https://api.telegram.org/bot<TOKEN>/...)
+// from transport errors. net/http returns *url.Error whose Error() embeds
+// the full URL — i.e. the bot token — and those errors end up in log.Printf
+// all over the bot. Only the method name and the underlying cause are kept;
+// as defence in depth any remaining occurrence of the token is redacted.
+func (c *Client) safeErr(method string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var urlErr *neturl.Error
+	if errors.As(err, &urlErr) {
+		err = urlErr.Err
+	}
+	if c.token != "" && strings.Contains(err.Error(), c.token) {
+		return fmt.Errorf("telegram %s: %s", method, strings.ReplaceAll(err.Error(), c.token, "<redacted>"))
+	}
+	return fmt.Errorf("telegram %s: %w", method, err)
+}
+
 // callOnce sends the request once. retryAfter > 0 means Telegram answered
 // 429 and the request may be repeated after that delay.
 func (c *Client) callOnce(ctx context.Context, method string, body []byte, out any) (retryAfter time.Duration, err error) {
 	url := fmt.Sprintf("%s/bot%s/%s", c.baseURL, c.token, method)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return 0, err
+		return 0, c.safeErr(method, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return 0, err
+		return 0, c.safeErr(method, err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return 0, err
+		return 0, c.safeErr(method, err)
 	}
 	var ar apiResponse
 	if err := json.Unmarshal(raw, &ar); err != nil {
