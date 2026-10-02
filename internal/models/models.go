@@ -100,7 +100,6 @@ func (q *Question) Options() []string {
 // Test kinds.
 const (
 	TestKindChain    = "chain"    // main linear chain: Тест 1, Тест 2, ...
-	TestKindWeak     = "weak"     // legacy weak-topics test (shared per topic fingerprint)
 	TestKindPersonal = "personal" // per-user weak-topics test (owner_user_id), deletable on finish
 )
 
@@ -129,7 +128,6 @@ type UserSubjectState struct {
 	SubjectID      int64
 	TestsPage      int // last opened page of the tests grid
 	LastTestNumber int // highest chain test that reached the unlock bar (permanent unlock watermark)
-	RequestedUpTo  int // chain tests already queued for generation
 }
 
 // GenerationJob is a queued AI test-generation task.
@@ -162,6 +160,17 @@ const (
 	// the chain is long enough for "100+ — серьёзно сложные тесты".
 	MaxVisibleTests = 200
 )
+
+// ClampVisibleTests caps a chain level for DISPLAY: after the last test of
+// the chain (MaxVisibleTests) is passed, the unlock watermark yields
+// MaxVisibleTests+1, which is not a real test. Access logic keeps the raw
+// value; the UI shows at most MaxVisibleTests.
+func ClampVisibleTests(n int) int {
+	if n > MaxVisibleTests {
+		return MaxVisibleTests
+	}
+	return n
+}
 
 // MeetsUnlockBar reports whether a test with the given 🟢/🟡 counts reached
 // the unlock bar «15🟢 + 5🟡». The bar means "at least 15 mastered AND the

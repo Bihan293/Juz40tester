@@ -24,6 +24,7 @@ import (
 	"github.com/Bihan293/Juz40tester/internal/models"
 	"github.com/Bihan293/Juz40tester/internal/repositories"
 	"github.com/Bihan293/Juz40tester/internal/services"
+	"github.com/Bihan293/Juz40tester/internal/testutil"
 )
 
 type fakeTG struct {
@@ -120,7 +121,7 @@ func TestStatisticsShowsStreak(t *testing.T) {
 	}
 
 	// Per-subject screen shows the flame too.
-	sid, err := subjects.EnsureSubject(ctx, "Биология "+time.Now().Format("150405.000000"))
+	sid, err := testutil.CreateSubject(ctx, pool, "Биология "+time.Now().Format("150405.000000"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,5 +150,68 @@ func TestStreakLine(t *testing.T) {
 		if got := streakLine(c.u); !strings.HasPrefix(got, c.want) {
 			t.Errorf("streakLine = %q, want prefix %q", got, c.want)
 		}
+	}
+}
+
+// #36: after the whole chain is passed (watermark = MaxVisibleTests) the
+// subject screen says «Открыто тестов: 200», never 201.
+func TestSubjectScreenShowsCappedLevel(t *testing.T) {
+	url := os.Getenv("TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	pool, err := database.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := database.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	f := &fakeTG{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var p map[string]any
+		_ = json.Unmarshal(body, &p)
+		if txt, ok := p["text"].(string); ok {
+			f.mu.Lock()
+			f.texts = append(f.texts, txt)
+			f.mu.Unlock()
+		}
+		_, _ = io.WriteString(w, `{"ok":true,"result":{"message_id":1,"chat":{"id":1,"type":"private"}}}`)
+	}))
+	defer srv.Close()
+
+	subjects := repositories.NewSubjectRepository(pool)
+	users := repositories.NewUserRepository(pool)
+	gen := repositories.NewGenerationRepository(pool)
+	state := repositories.NewStateRepository(pool)
+	attempts := repositories.NewAttemptRepository(pool)
+	quiz := services.NewQuizService(subjects, attempts, state, gen, nil, users)
+	h := New(bot.NewClient("T").WithBaseURL(srv.URL), users, quiz)
+
+	tgID := time.Now().UnixNano()%1_000_000_000 + 6_000_000_000
+	u, err := users.Upsert(ctx, &models.User{TelegramID: tgID, FirstName: "Max"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid, err := testutil.CreateSubject(ctx, pool, "Финал "+time.Now().Format("150405.000000"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO user_subject_state (user_id, subject_id, last_test_number) VALUES ($1, $2, $3)`,
+		u.ID, sid, models.MaxVisibleTests); err != nil {
+		t.Fatal(err)
+	}
+	text, _, err := h.renderSubject(ctx, u, sid, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text, "Открыто тестов: "+strconv.Itoa(models.MaxVisibleTests)+" ") {
+		t.Fatalf("level not capped:\n%s", text)
+	}
+	if strings.Contains(text, "Открыто тестов: "+strconv.Itoa(models.MaxVisibleTests+1)) {
+		t.Fatalf("shows %d:\n%s", models.MaxVisibleTests+1, text)
 	}
 }

@@ -25,6 +25,7 @@ import (
 	"github.com/Bihan293/Juz40tester/internal/groq"
 	"github.com/Bihan293/Juz40tester/internal/models"
 	"github.com/Bihan293/Juz40tester/internal/repositories"
+	"github.com/Bihan293/Juz40tester/internal/testutil"
 )
 
 var badDash = generatedQuestion{
@@ -101,7 +102,7 @@ func TestPipelineRepairsGiveawayQuestion(t *testing.T) {
 	state := repositories.NewStateRepository(pool)
 	g := NewGeneratorService(nil, &config.Config{}, gen, subjects, state).WithGroq(groq.New("k", srv.URL))
 
-	sid, err := subjects.EnsureSubject(ctx, "Русский язык "+time.Now().Format("150405.000000"))
+	sid, err := testutil.CreateSubject(ctx, pool, "Русский язык "+time.Now().Format("150405.000000"))
 	if err != nil {
 		t.Fatal(err)
 	}

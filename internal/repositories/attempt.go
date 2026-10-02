@@ -167,6 +167,31 @@ func (r *AttemptRepository) GetActiveAttempt(ctx context.Context, userID, testID
 	return &a, nil
 }
 
+// ActiveAttemptTests reports which of the given tests have an in-progress
+// attempt of the user — one query for a whole tests-grid page instead of
+// GetActiveAttempt per cell. Tests without an active attempt are absent.
+func (r *AttemptRepository) ActiveAttemptTests(ctx context.Context, userID int64, testIDs []int64) (map[int64]bool, error) {
+	out := make(map[int64]bool, len(testIDs))
+	if len(testIDs) == 0 {
+		return out, nil
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT DISTINCT test_id FROM test_attempts
+		WHERE user_id = $1 AND test_id = ANY($2) AND status = 'in_progress'`, userID, testIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
+}
+
 // GetAttemptForUser returns an attempt only if it belongs to the given user.
 func (r *AttemptRepository) GetAttemptForUser(ctx context.Context, attemptID, userID int64) (*models.TestAttempt, error) {
 	var a models.TestAttempt

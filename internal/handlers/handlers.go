@@ -32,7 +32,6 @@ const (
 	cbSubject     = "subj:open:"    // + subjectID
 	cbSubjectPage = "subj:page:"    // + subjectID:page
 	cbOpenTest    = "test:open:"    // + testID (opens the test straight away)
-	cbPending     = "test:pending"  // legacy: test is being generated (toast only)
 	cbPendingID   = "test:pending:" // + subjectID:testNumber — tap re-queues a stuck/failed generation
 	cbWeakMenu    = "weak:menu"     // weak-topics subject picker
 	cbWeakSubject = "weak:subj:"    // + subjectID (open/generate the personal weak test)
@@ -67,6 +66,14 @@ type Handler struct {
 	// callback; any later answer with a text is delivered as a chat message
 	// instead, so error texts are never silently lost.
 	answered sync.Map
+	// kbNotes remembers, per chat, the message that currently carries the
+	// bottom main-menu reply keyboard (chatID -> messageID). Telegram ties a
+	// reply keyboard to the message that sent it, so that note must stay in
+	// the chat while the menu is visible — but only the LATEST one: the
+	// previous note is deleted whenever a new one is sent or the menu is
+	// hidden for the next test, so at most one note exists per chat
+	// (before, every finished test left another «🏠 Главное меню…» line).
+	kbNotes sync.Map
 }
 
 // New creates a Handler.
@@ -164,20 +171,45 @@ func (h *Handler) hideReplyKeyboard(ctx context.Context, chatID int64) {
 	if err := h.tg.DeleteMessage(ctx, chatID, msgID); err != nil {
 		log.Printf("delete keyboard-removal note: %v", err)
 	}
+	// The menu is hidden now — the note that carried it is useless.
+	h.dropKeyboardNote(ctx, chatID)
 }
 
 // restoreReplyKeyboard brings the bottom main menu back once the test is
 // over (finished or exited) — it was hidden while the test ran.
 //
-// BUG FIX: the menu used to be restored by a service message that was
-// deleted right away. Telegram clients drop a reply keyboard together with
-// the message that carried it, so after a test the main menu never came
-// back (only the inline «⬅️ Главное меню» button helped, «📚 К предметам»
-// left the user stuck without a menu). The note now STAYS in the chat, so
-// the keyboard reliably reappears.
+// Telegram clients drop a reply keyboard together with the message that
+// carried it, so the note that restores the menu must stay in the chat
+// while the menu is visible. To keep that from turning into spam (one
+// «🏠 Главное меню…» line per finished test), only the LATEST note is
+// kept: the previous one is deleted right after the new one is sent
+// (deleting an OLDER message does not affect the keyboard of the newer
+// one), and the current one is deleted when the next test hides the menu.
 func (h *Handler) restoreReplyKeyboard(ctx context.Context, chatID int64) {
-	if _, err := h.tg.SendMessage(ctx, chatID, "🏠 Главное меню снова доступно — кнопки внизу 👇", mainMenuKeyboard()); err != nil {
+	msgID, err := h.tg.SendMessage(ctx, chatID, "🏠 Меню снова доступно 👇", mainMenuKeyboard())
+	if err != nil {
 		log.Printf("restore reply keyboard: %v", err)
+		return
+	}
+	if prev, loaded := h.kbNotes.Swap(chatID, msgID); loaded {
+		if old, ok := prev.(int64); ok && old != msgID {
+			if err := h.tg.DeleteMessage(ctx, chatID, old); err != nil {
+				log.Printf("delete previous menu note: %v", err)
+			}
+		}
+	}
+}
+
+// dropKeyboardNote deletes the remembered menu-restore note of the chat.
+func (h *Handler) dropKeyboardNote(ctx context.Context, chatID int64) {
+	prev, ok := h.kbNotes.LoadAndDelete(chatID)
+	if !ok {
+		return
+	}
+	if old, ok := prev.(int64); ok {
+		if err := h.tg.DeleteMessage(ctx, chatID, old); err != nil {
+			log.Printf("delete menu note: %v", err)
+		}
 	}
 }
 
@@ -317,7 +349,7 @@ func (h *Handler) renderSubject(ctx context.Context, user *models.User, subjectI
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s %s\n", subjectEmoji(scr.Subject.Name), scr.Subject.Name)
-	fmt.Fprintf(&b, "Открыто тестов: %d · страница %d/%d\n\n", scr.UnlockedMax, scr.Page+1, scr.TotalPages)
+	fmt.Fprintf(&b, "Открыто тестов: %d · страница %d/%d\n\n", scr.UnlockedShown, scr.Page+1, scr.TotalPages)
 	b.WriteString("Чтобы открыть следующий тест, доведи предыдущий до ")
 	fmt.Fprintf(&b, "%d🟢 + %d🟡", models.UnlockGreen, models.UnlockYellow)
 	b.WriteString(" — тогда я сразу начну его собирать ⏳")
@@ -603,7 +635,6 @@ func (h *Handler) openTest(ctx context.Context, cb *bot.CallbackQuery, user *mod
 	// The callback is acknowledged right away (a silent ack stops the spinner);
 	// every further notice goes to the chat as a normal, readable message.
 	h.answerCallback(ctx, cb, "")
-	cbAnswered := true
 	// Language subjects (Русский/Английский/Казахский язык, литература) are
 	// never translated — TestNeedsTranslation is false for them.
 	if h.quiz.TestNeedsTranslation(ctx, user, testID) {
@@ -613,14 +644,13 @@ func (h *Handler) openTest(ctx context.Context, cb *bot.CallbackQuery, user *mod
 	resume, err := h.quiz.ResumeOrNil(ctx, user.ID, testID)
 	if err != nil {
 		log.Printf("resume lookup %d: %v", testID, err)
-		h.failOpenTest(ctx, cb, cbAnswered, "Ошибка загрузки теста")
+		h.failOpenTest(ctx, cb, "Ошибка загрузки теста")
 		return
 	}
 	if resume != nil {
 		// Continue the saved attempt from the current question — the menu
 		// must be hidden for the resumed run too (the user may have left the
 		// test earlier and got the menu back).
-		h.ackOpenTest(ctx, cb, cbAnswered)
 		h.hideReplyKeyboard(ctx, cb.Message.Chat.ID)
 		h.showCurrentQuestion(ctx, cb, user, resume.ID)
 		return
@@ -628,39 +658,24 @@ func (h *Handler) openTest(ctx context.Context, cb *bot.CallbackQuery, user *mod
 
 	attempt, err := h.quiz.StartTest(ctx, user.ID, testID)
 	if errors.Is(err, repositories.ErrNotFound) {
-		h.failOpenTest(ctx, cb, cbAnswered, "Тест не найден")
+		h.failOpenTest(ctx, cb, "Тест не найден")
 		return
 	}
 	if err != nil {
 		log.Printf("start test %d: %v", testID, err)
-		h.failOpenTest(ctx, cb, cbAnswered, "Не удалось начать тест")
+		h.failOpenTest(ctx, cb, "Не удалось начать тест")
 		return
 	}
 	// A fresh attempt begins: hide the bottom menu for the whole run.
-	h.ackOpenTest(ctx, cb, cbAnswered)
 	h.hideReplyKeyboard(ctx, cb.Message.Chat.ID)
 	// Show the first question of the new attempt.
 	h.showCurrentQuestion(ctx, cb, user, attempt.ID)
 }
 
-// ackOpenTest acknowledges the test-button tap on the happy path (unless a
-// toast was already sent): an unanswered callback leaves a spinning loader
-// on the button under the user's finger.
-func (h *Handler) ackOpenTest(ctx context.Context, cb *bot.CallbackQuery, already bool) {
-	if already {
-		return
-	}
-	h.answerCallback(ctx, cb, "")
-}
-
-// failOpenTest reports an open-test failure. When the translation toast was
-// already sent the callback is spent (Telegram allows exactly ONE answer
-// per callback_query), so the error goes as a plain chat message instead.
-func (h *Handler) failOpenTest(ctx context.Context, cb *bot.CallbackQuery, cbAnswered bool, text string) {
-	if !cbAnswered {
-		h.answerCallback(ctx, cb, text)
-		return
-	}
+// failOpenTest reports an open-test failure. openTest acknowledges the
+// callback right away (Telegram allows exactly ONE answer per
+// callback_query), so the error always goes as a plain chat message.
+func (h *Handler) failOpenTest(ctx context.Context, cb *bot.CallbackQuery, text string) {
 	if _, err := h.tg.SendMessage(ctx, cb.Message.Chat.ID, text, nil); err != nil {
 		log.Printf("send open-test failure: %v", err)
 	}
@@ -1034,11 +1049,20 @@ func (h *Handler) renderProgress(ctx context.Context, user *models.User) (string
 	b.WriteString("\n\n📊 Ваша статистика по предметам:\n")
 	shown := 0
 	buttons := make([]bot.InlineKeyboardButton, 0, len(subjects))
+	// All subjects' summaries in a fixed number of queries (was ~4 per subject).
+	ids := make([]int64, 0, len(subjects))
+	for _, s := range subjects {
+		ids = append(ids, s.ID)
+	}
+	all, err := h.quiz.AllSubjectsProgress(ctx, user.ID, ids)
+	if err != nil {
+		log.Printf("progress summary: %v", err)
+		all = nil // keep the subject picker usable, just without summaries
+	}
 	for _, s := range subjects {
 		buttons = append(buttons, bot.Btn(subjectEmoji(s.Name)+" "+s.Name, cbProgSubject+strconv.FormatInt(s.ID, 10)))
-		sp, err := h.quiz.SubjectProgress(ctx, user.ID, s.ID)
-		if err != nil {
-			log.Printf("progress summary subject %d: %v", s.ID, err)
+		sp := all[s.ID]
+		if sp == nil {
 			continue
 		}
 		if sp.Green+sp.Yellow == 0 && sp.CorrectCount+sp.WrongCount == 0 {
@@ -1375,8 +1399,6 @@ func (h *Handler) handleCallback(ctx context.Context, cb *bot.CallbackQuery) {
 		h.flipSubjectPage(ctx, cb, user, data)
 	case strings.HasPrefix(data, cbPendingID):
 		h.handlePendingTest(ctx, cb, user, data)
-	case data == cbPending:
-		h.answerAlert(ctx, cb, "⏳ Тест ещё генерируется. Подожди минуточку и открой предмет снова.")
 	case data == cbWeakMenu:
 		h.answerCallback(ctx, cb, "")
 		h.editWeakMenu(ctx, cb, user)

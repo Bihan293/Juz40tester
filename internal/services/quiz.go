@@ -84,53 +84,6 @@ func (s *QuizService) ResumeOrNil(ctx context.Context, userID, testID int64) (*m
 	return s.attempts.GetActiveAttempt(ctx, userID, testID)
 }
 
-// SubjectInfo describes a subject screen: its tests and the unfinished
-// attempt per test (so the user can resume it).
-type SubjectInfo struct {
-	Subject       *models.Subject
-	Tests         []models.Test
-	QuestionCount map[int64]int                 // testID -> number of questions
-	Resume        map[int64]*models.TestAttempt // testID -> unfinished attempt
-}
-
-// GetSubjectInfo loads a subject with its tests and the user's unfinished
-// attempts for those tests.
-func (s *QuizService) GetSubjectInfo(ctx context.Context, userID, subjectID int64) (*SubjectInfo, error) {
-	subject, err := s.subjects.GetByID(ctx, subjectID)
-	if err != nil {
-		return nil, err
-	}
-	tests, err := s.subjects.ListTests(ctx, subjectID)
-	if err != nil {
-		return nil, err
-	}
-	if len(tests) == 0 {
-		return nil, repositories.ErrNotFound
-	}
-	info := &SubjectInfo{
-		Subject:       subject,
-		Tests:         tests,
-		QuestionCount: make(map[int64]int, len(tests)),
-		Resume:        make(map[int64]*models.TestAttempt, len(tests)),
-	}
-	for i := range tests {
-		t := &tests[i]
-		count, err := s.subjects.TestQuestionCount(ctx, t.ID)
-		if err != nil {
-			return nil, err
-		}
-		info.QuestionCount[t.ID] = count
-		resume, err := s.attempts.GetActiveAttempt(ctx, userID, t.ID)
-		if err != nil {
-			return nil, err
-		}
-		if resume != nil {
-			info.Resume[t.ID] = resume
-		}
-	}
-	return info, nil
-}
-
 // ---------------------------------------------------------------------------
 // Subject screen: paginated chain grid, unlock chain, pre-generation
 // ---------------------------------------------------------------------------
@@ -152,8 +105,13 @@ type SubjectScreen struct {
 	Slots       []TestSlot // the current page, up to TestsPerPage cells
 	Page        int        // current page (0-based, after clamping)
 	TotalPages  int
-	UnlockedMax int // highest unlocked chain test number
-	MaxVisible  int // min(MaxVisibleTests, UnlockedMax + lookahead)
+	UnlockedMax int // highest unlocked chain test number (access logic; may be MaxVisibleTests+1)
+	// UnlockedShown is UnlockedMax capped at MaxVisibleTests — the number
+	// shown to the user («Открыто тестов: N»). After the last test of the
+	// chain is passed the watermark makes UnlockedMax = 201, which is not a
+	// real test.
+	UnlockedShown int
+	MaxVisible    int // min(MaxVisibleTests, UnlockedMax + lookahead)
 }
 
 // WeakEntry is the per-user weak-topics test state of one subject.
@@ -179,23 +137,39 @@ type WeakEntry struct {
 // that reached the bar) keeps every test up to last_test_number+1 open,
 // even if a later retry of an earlier test drops its 🟢/🟡 below the bar.
 func (s *QuizService) unlockedMax(ctx context.Context, userID, subjectID int64, chain []models.Test) (int, error) {
+	n, _, err := s.unlockedWithProgress(ctx, userID, subjectID, chain)
+	return n, err
+}
+
+// unlockedWithProgress is unlockedMax that also returns the knowledge
+// progress it loaded, so callers that need both (the subject screen) do not
+// query TestProgressForUser twice.
+func (s *QuizService) unlockedWithProgress(ctx context.Context, userID, subjectID int64, chain []models.Test) (int, map[int64]*repositories.TestProgress, error) {
 	ids := make([]int64, 0, len(chain))
-	byNumber := make(map[int]*models.Test, len(chain))
 	for i := range chain {
 		ids = append(ids, chain[i].ID)
-		byNumber[chain[i].TestNumber] = &chain[i]
 	}
 	progress, err := s.gen.TestProgressForUser(ctx, userID, ids)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	watermark := 0
 	if s.state != nil {
 		st, err := s.state.Get(ctx, userID, subjectID)
 		if err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 		watermark = st.LastTestNumber
+	}
+	return computeUnlocked(chain, progress, watermark), progress, nil
+}
+
+// computeUnlocked is the pure unlock-chain walk shared by unlockedMax and
+// the batched statistics screen (no I/O — see unlockedMax for the rules).
+func computeUnlocked(chain []models.Test, progress map[int64]*repositories.TestProgress, watermark int) int {
+	byNumber := make(map[int]*models.Test, len(chain))
+	for i := range chain {
+		byNumber[chain[i].TestNumber] = &chain[i]
 	}
 	unlocked := 1 // Тест 1 всегда открыт
 	for {
@@ -213,7 +187,7 @@ func (s *QuizService) unlockedMax(ctx context.Context, userID, subjectID int64, 
 	if watermark+1 > unlocked {
 		unlocked = watermark + 1
 	}
-	return unlocked, nil
+	return unlocked
 }
 
 // GetSubjectScreen builds the tests-grid page: 3-per-row cells, lock marks,
@@ -230,7 +204,8 @@ func (s *QuizService) GetSubjectScreen(ctx context.Context, userID, subjectID in
 		return nil, err
 	}
 
-	unlockedMax, err := s.unlockedMax(ctx, userID, subjectID, chain)
+	// One progress query serves both the unlock walk and the grid marks.
+	unlockedMax, progress, err := s.unlockedWithProgress(ctx, userID, subjectID, chain)
 	if err != nil {
 		return nil, err
 	}
@@ -283,15 +258,6 @@ func (s *QuizService) GetSubjectScreen(ctx context.Context, userID, subjectID in
 		}
 	}
 
-	// Knowledge progress of the visible chain tests (lock/completed marks).
-	ids := make([]int64, 0, len(chain))
-	for _, t := range chain {
-		ids = append(ids, t.ID)
-	}
-	progress, err := s.gen.TestProgressForUser(ctx, userID, ids)
-	if err != nil {
-		return nil, err
-	}
 	byNumber := make(map[int]*models.Test, len(chain))
 	for i := range chain {
 		byNumber[chain[i].TestNumber] = &chain[i]
@@ -302,6 +268,18 @@ func (s *QuizService) GetSubjectScreen(ctx context.Context, userID, subjectID in
 	if end > maxVisible {
 		end = maxVisible
 	}
+	// Unfinished attempts of the page's tests — ONE query for the whole page
+	// instead of GetActiveAttempt per cell.
+	pageIDs := make([]int64, 0, models.TestsPerPage)
+	for n := start + 1; n <= end; n++ {
+		if t := byNumber[n]; t != nil {
+			pageIDs = append(pageIDs, t.ID)
+		}
+	}
+	active, err := s.attempts.ActiveAttemptTests(ctx, userID, pageIDs)
+	if err != nil {
+		return nil, err
+	}
 	slots := make([]TestSlot, 0, end-start)
 	for n := start + 1; n <= end; n++ {
 		slot := TestSlot{Number: n, Label: fmt.Sprintf("%d", n)}
@@ -311,11 +289,7 @@ func (s *QuizService) GetSubjectScreen(ctx context.Context, userID, subjectID in
 		if t != nil {
 			p := progress[t.ID]
 			slot.Completed = p != nil && models.MeetsUnlockBar(p.Green, p.Yellow)
-			resume, err := s.attempts.GetActiveAttempt(ctx, userID, t.ID)
-			if err != nil {
-				return nil, err
-			}
-			slot.Resume = resume != nil
+			slot.Resume = active[t.ID]
 		} else if slot.Unlocked {
 			slot.Pending = true
 		}
@@ -323,12 +297,13 @@ func (s *QuizService) GetSubjectScreen(ctx context.Context, userID, subjectID in
 	}
 
 	screen := &SubjectScreen{
-		Subject:     subject,
-		Slots:       slots,
-		Page:        page,
-		TotalPages:  totalPages,
-		UnlockedMax: unlockedMax,
-		MaxVisible:  maxVisible,
+		Subject:       subject,
+		Slots:         slots,
+		Page:          page,
+		TotalPages:    totalPages,
+		UnlockedMax:   unlockedMax,
+		UnlockedShown: models.ClampVisibleTests(unlockedMax),
+		MaxVisible:    maxVisible,
 	}
 	// NOTE: weak-topics tests are NOT looked up or generated here anymore —
 	// opening a subject screen must never trigger a paid generation. They
@@ -415,7 +390,7 @@ func (s *QuizService) OnTestCompleted(ctx context.Context, userID int64, test *m
 	}
 	// The bar is reached — remember it permanently (the unlock watermark):
 	// a later retry with mistakes must never lock the next tests again.
-	if err := s.state.SaveProgress(ctx, userID, test.SubjectID, test.TestNumber, 0); err != nil {
+	if err := s.state.SaveProgress(ctx, userID, test.SubjectID, test.TestNumber); err != nil {
 		return
 	}
 	if s.genSvc == nil || !s.genSvc.Enabled() {
@@ -678,18 +653,24 @@ func (s *QuizService) QuestionAtPosition(ctx context.Context, attemptID int64, u
 }
 
 func (s *QuizService) buildView(ctx context.Context, user *models.User, attempt *models.TestAttempt, aq *models.AttemptQuestion, q *models.Question) (*QuestionView, error) {
-	total, err := s.subjects.TestQuestionCount(ctx, attempt.TestID)
+	// ONE query per question for everything the view needs besides the
+	// translation row itself: total question count, the subject name
+	// (language subjects are never translated) and how many of the test's
+	// questions already have a Kazakh translation. It replaces
+	// TestQuestionCount + GetByID(subject) + TestQuestions + TranslatedCount.
+	meta, err := s.subjects.TestViewMeta(ctx, attempt.TestID, models.TestLangKK)
 	if err != nil {
 		return nil, err
 	}
+	total := meta.Total
 	// The Russian master row is the default; Kazakh users get the cached
 	// translation of THIS question (written once per question at test open).
 	text := q.Text
 	byLabel := map[string]string{
 		"A": q.OptionA, "B": q.OptionB, "C": q.OptionC, "D": q.OptionD,
 	}
-	if user != nil && user.TestLang == models.TestLangKK && s.translator != nil &&
-		s.subjectTranslatable(ctx, q.SubjectID) && s.testFullyTranslatedSafe(ctx, attempt.TestID) {
+	if user != nil && user.TestLang == models.TestLangKK && s.translator != nil && s.translator.Enabled() &&
+		!models.IsLanguageSubject(meta.SubjectName) && total > 0 && meta.Translated >= total {
 		// Only a COMPLETE translation is used — a partially translated test
 		// is shown entirely in Russian instead of a per-question mix.
 		if tr, terr := s.translator.TranslationFor(ctx, q.ID, models.TestLangKK); terr != nil {
@@ -714,17 +695,6 @@ func (s *QuizService) buildView(ctx context.Context, user *models.User, attempt 
 		Total:        total,
 		DisplayTexts: texts,
 	}, nil
-}
-
-// testFullyTranslatedSafe wraps TestFullyTranslated, treating lookup errors
-// as "not translated" (Russian master is always a safe fallback).
-func (s *QuizService) testFullyTranslatedSafe(ctx context.Context, testID int64) bool {
-	ok, err := s.TestFullyTranslated(ctx, testID)
-	if err != nil {
-		log.Printf("translation status test %d: %v", testID, err)
-		return false
-	}
-	return ok
 }
 
 // MapDisplayToOriginal converts the displayed letter (position in the
@@ -847,6 +817,49 @@ func (s *QuizService) SubjectProgress(ctx context.Context, userID, subjectID int
 		}
 	}
 	return s.subjects.SubjectProgress(ctx, userID, subjectID, ids)
+}
+
+// AllSubjectsProgress is SubjectProgress for every given subject in a fixed
+// number of queries (all chain tests, one knowledge-progress query, all
+// unlock watermarks, one aggregate) instead of ~4 queries per subject. The
+// result is identical to calling SubjectProgress for each subject.
+func (s *QuizService) AllSubjectsProgress(ctx context.Context, userID int64, subjectIDs []int64) (map[int64]*models.SubjectProgress, error) {
+	if len(subjectIDs) == 0 {
+		return map[int64]*models.SubjectProgress{}, nil
+	}
+	chains, err := s.subjects.ListChainTestsBySubject(ctx, subjectIDs)
+	if err != nil {
+		return nil, err
+	}
+	var allIDs []int64
+	for _, chain := range chains {
+		for _, t := range chain {
+			allIDs = append(allIDs, t.ID)
+		}
+	}
+	progress, err := s.gen.TestProgressForUser(ctx, userID, allIDs)
+	if err != nil {
+		return nil, err
+	}
+	watermarks := map[int64]int{}
+	if s.state != nil {
+		if watermarks, err = s.state.Watermarks(ctx, userID); err != nil {
+			return nil, err
+		}
+	}
+	open := make(map[int64][]int64, len(subjectIDs))
+	for _, sid := range subjectIDs {
+		chain := chains[sid]
+		unlocked := computeUnlocked(chain, progress, watermarks[sid])
+		ids := make([]int64, 0, len(chain))
+		for _, t := range chain {
+			if t.TestNumber <= unlocked {
+				ids = append(ids, t.ID)
+			}
+		}
+		open[sid] = ids
+	}
+	return s.subjects.SubjectProgressBatch(ctx, userID, subjectIDs, open)
 }
 
 // ---------------------------------------------------------------------------

@@ -34,6 +34,7 @@ import (
 	"github.com/Bihan293/Juz40tester/internal/groq"
 	"github.com/Bihan293/Juz40tester/internal/models"
 	"github.com/Bihan293/Juz40tester/internal/repositories"
+	"github.com/Bihan293/Juz40tester/internal/testutil"
 )
 
 // flowFakeAI answers generation requests with a valid test. For weak-topics
@@ -135,7 +136,7 @@ func newFlowEnv(t *testing.T) *flowEnv {
 	state := repositories.NewStateRepository(pool)
 	e.genSvc = NewGeneratorService(nil, &config.Config{}, e.gen, e.subjects, state).WithGroq(groq.New("k", srv.URL))
 	e.quiz = NewQuizService(e.subjects, e.attempts, state, e.gen, e.genSvc, e.users)
-	e.sid, err = e.subjects.EnsureSubject(ctx, "Биология flow "+time.Now().Format("150405.000000"))
+	e.sid, err = testutil.CreateSubject(ctx, pool, "Биология flow "+time.Now().Format("150405.000000"))
 	if err != nil {
 		t.Fatal(err)
 	}

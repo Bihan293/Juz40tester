@@ -19,6 +19,7 @@ import (
 
 	"github.com/Bihan293/Juz40tester/internal/database"
 	"github.com/Bihan293/Juz40tester/internal/models"
+	"github.com/Bihan293/Juz40tester/internal/testutil"
 )
 
 func testPool(t *testing.T) *pgxpool.Pool {
@@ -132,7 +133,7 @@ func TestQualitySweepRepository(t *testing.T) {
 	users := NewUserRepository(pool)
 	attempts := NewAttemptRepository(pool)
 
-	sid, err := subjects.EnsureSubject(ctx, "Тест качества "+time.Now().Format("150405.000000"))
+	sid, err := testutil.CreateSubject(ctx, pool, "Тест качества "+time.Now().Format("150405.000000"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,7 +273,7 @@ func TestAttemptGuards(t *testing.T) {
 	users := NewUserRepository(pool)
 	attempts := NewAttemptRepository(pool)
 
-	sid, err := subjects.EnsureSubject(ctx, "Тест попыток "+time.Now().Format("150405.000000"))
+	sid, err := testutil.CreateSubject(ctx, pool, "Тест попыток "+time.Now().Format("150405.000000"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -395,7 +396,7 @@ func TestReviveChainJobOrphanedAndDuplicates(t *testing.T) {
 	subjects := NewSubjectRepository(pool)
 	gen := NewGenerationRepository(pool)
 
-	sid, err := subjects.EnsureSubject(ctx, "Revive "+time.Now().Format("150405.000000"))
+	sid, err := testutil.CreateSubject(ctx, pool, "Revive "+time.Now().Format("150405.000000"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -455,5 +456,106 @@ func TestReviveChainJobOrphanedAndDuplicates(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("user with watermark missing from the level board")
+	}
+}
+
+// #34: repeated taps with unchanged profile on the same day must NOT write
+// the users row; a profile change or a new day must.
+func TestUpsertSkipsNoopWrites(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	repo := NewUserRepository(pool)
+	u := &models.User{TelegramID: time.Now().UnixNano()%1_000_000_000 + 4_000_000_000, FirstName: "Noop", Username: "noop"}
+
+	created, err := repo.upsertAt(ctx, u, d("2026-10-01"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.ID == 0 || created.StreakDays != 1 || created.FirstName != "Noop" {
+		t.Fatalf("new user not created correctly: %+v", created)
+	}
+	xmin := func() string {
+		var x string
+		if err := pool.QueryRow(ctx, `SELECT xmin::text FROM users WHERE id = $1`, created.ID).Scan(&x); err != nil {
+			t.Fatal(err)
+		}
+		return x
+	}
+	before := xmin()
+	for i := 0; i < 5; i++ { // five answers the same day
+		got, err := repo.upsertAt(ctx, u, d("2026-10-01"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.ID != created.ID || got.StreakDays != 1 || !got.UpdatedAt.Equal(created.UpdatedAt) {
+			t.Fatalf("no-op tap changed the row: %+v", got)
+		}
+	}
+	if after := xmin(); after != before {
+		t.Fatalf("no-op taps wrote the row (xmin %s → %s)", before, after)
+	}
+
+	// Profile change → written.
+	u.FirstName = "Renamed"
+	got, err := repo.upsertAt(ctx, u, d("2026-10-01"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.FirstName != "Renamed" || !got.UpdatedAt.After(created.UpdatedAt) || xmin() == before {
+		t.Fatalf("profile change not persisted: %+v", got)
+	}
+	// Next day → streak written.
+	got, err = repo.upsertAt(ctx, u, d("2026-10-02"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.StreakDays != 2 {
+		t.Fatalf("next-day streak = %d, want 2", got.StreakDays)
+	}
+	// test_lang (set separately) is returned on the read-only path too.
+	if err := repo.SetTestLang(ctx, got.ID, models.TestLangKK); err != nil {
+		t.Fatal(err)
+	}
+	got, err = repo.upsertAt(ctx, u, d("2026-10-02"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TestLang != models.TestLangKK || got.StreakDays != 2 {
+		t.Fatalf("read path lost data: %+v", got)
+	}
+}
+
+// #34: concurrent first contacts of the same user all succeed.
+func TestUpsertConcurrentFirstContact(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	repo := NewUserRepository(pool)
+	tg := time.Now().UnixNano()%1_000_000_000 + 5_000_000_000
+	errs := make(chan error, 8)
+	ids := make(chan int64, 8)
+	for i := 0; i < 8; i++ {
+		go func() {
+			u, err := repo.upsertAt(ctx, &models.User{TelegramID: tg, FirstName: "Race"}, d("2026-10-01"))
+			if err != nil {
+				errs <- err
+				return
+			}
+			ids <- u.ID
+			errs <- nil
+		}()
+	}
+	var first int64
+	for i := 0; i < 8; i++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(ids)
+	for id := range ids {
+		if first == 0 {
+			first = id
+		} else if id != first {
+			t.Fatalf("different ids for the same user: %d vs %d", first, id)
+		}
 	}
 }
