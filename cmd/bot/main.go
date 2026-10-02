@@ -141,6 +141,7 @@ func main() {
 	// an empty grid and ⏳ forever. Subjects are managed in the database
 	// (INSERT INTO subjects ...); there is no code-level seed anymore. No-op
 	// when generation is disabled.
+	warnIfNoSubjects(ctx, subjectRepo)
 	if genSvc.Enabled() {
 		subjects, serr := subjectRepo.List(ctx)
 		if serr != nil {
@@ -334,5 +335,20 @@ func selfPing(ctx context.Context, url string) {
 				_ = resp.Body.Close()
 			}
 		}
+	}
+}
+
+// warnIfNoSubjects logs a clear hint on a fresh database: subjects are not
+// seeded by code (migration 000002 removed the old seed) and must be added
+// with SQL, otherwise «📚 Предметы» stays empty.
+func warnIfNoSubjects(ctx context.Context, subjects *repositories.SubjectRepository) {
+	list, err := subjects.List(ctx)
+	if err != nil {
+		log.Printf("subjects check: %v", err)
+		return
+	}
+	if len(list) == 0 {
+		log.Println("subjects: the database has NO subjects — there is no built-in seed. " +
+			"Add them with SQL, e.g. INSERT INTO subjects (name, position) VALUES ('Биология', 1); see README «База данных»")
 	}
 }

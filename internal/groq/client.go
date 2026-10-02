@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Bihan293/Juz40tester/internal/httpx"
 )
 
 // Message is a single chat message.
@@ -104,7 +106,7 @@ func New(apiKey, baseURL string) *Client {
 	return &Client{
 		apiKey:         apiKey,
 		baseURL:        strings.TrimRight(baseURL, "/"),
-		httpClient:     &http.Client{Timeout: 120 * time.Second},
+		httpClient:     httpx.NewClient(120 * time.Second),
 		limiters:       map[string]*limiter{},
 		schemaRejected: map[string]bool{},
 		effortRejected: map[string]bool{},

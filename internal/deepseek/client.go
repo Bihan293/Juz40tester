@@ -42,6 +42,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Bihan293/Juz40tester/internal/httpx"
 )
 
 // DefaultModel is used when DEEPSEEK_MODEL is not set: the strong
@@ -152,7 +154,7 @@ func New(apiKey, model, reasonerModel, baseURL string) *Client {
 		model:         model,
 		reasonerModel: reasonerModel,
 		baseURL:       strings.TrimRight(baseURL, "/"),
-		httpClient:    &http.Client{Timeout: 300 * time.Second},
+		httpClient:    httpx.NewClient(300 * time.Second),
 	}
 }
 

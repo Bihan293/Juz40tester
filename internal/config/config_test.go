@@ -143,3 +143,32 @@ func TestDBMaxConns(t *testing.T) {
 		t.Fatalf("DB_MAX_CONNS override = %d", cfg.DBMaxConns)
 	}
 }
+
+func TestGenWorkersConfig(t *testing.T) {
+	t.Setenv("BOT_TOKEN", "x")
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("WEBHOOK_URL", "https://example.onrender.com")
+	t.Setenv("WEBHOOK_SECRET", "s3cret")
+	for _, c := range []struct {
+		env    string
+		want   int
+		dsEnv  string
+		wantDS int
+	}{
+		{"", DefaultGenWorkers, "", DefaultGenDeepSeekConcurrency},
+		{"6", 6, "3", 3},
+		{"500", MaxGenWorkers, "0", DefaultGenDeepSeekConcurrency},
+		{"junk", DefaultGenWorkers, "-1", DefaultGenDeepSeekConcurrency},
+	} {
+		t.Setenv("GEN_WORKERS", c.env)
+		t.Setenv("GEN_DEEPSEEK_CONCURRENCY", c.dsEnv)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.GenWorkers != c.want || cfg.GenDeepSeekConcurrency != c.wantDS {
+			t.Fatalf("GEN_WORKERS=%q GEN_DEEPSEEK_CONCURRENCY=%q -> %d/%d, want %d/%d",
+				c.env, c.dsEnv, cfg.GenWorkers, cfg.GenDeepSeekConcurrency, c.want, c.wantDS)
+		}
+	}
+}

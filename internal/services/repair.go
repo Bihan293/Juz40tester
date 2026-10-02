@@ -332,6 +332,13 @@ func (g *GeneratorService) RunQualitySweep(ctx context.Context) (int, error) {
 			if ctx.Err() != nil {
 				return repaired, ctx.Err()
 			}
+			// Low priority: stop paying for repairs (and eating the Groq
+			// quota) as soon as a user is waiting for a generation. The
+			// remaining questions stay unchecked for the next sweep.
+			if g.urgentWorkPending(ctx) {
+				log.Printf("quality sweep: yielding to urgent user generations — %d repair(s) left for later", len(list)-start)
+				return repaired, nil
+			}
 			end := start + repairBatch
 			if end > len(list) {
 				end = len(list)

@@ -38,6 +38,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Bihan293/Juz40tester/internal/config"
@@ -98,12 +99,62 @@ type GeneratorService struct {
 	state      *repositories.StateRepository
 	translator *TranslatorService // nil until WithTranslator wires it
 	now        func() time.Time   // injectable for tests
+
+	// wake nudges an idle worker the moment a job is enqueued in this
+	// instance (buffered, size 1 — signals coalesce). The 20s ticker stays
+	// only as a fallback for jobs enqueued by another instance / retries.
+	wake chan struct{}
+	// dsSem bounds paid DeepSeek generation calls in flight across all
+	// workers (cfg.GenDeepSeekConcurrency).
+	dsSem chan struct{}
 }
 
 func NewGeneratorService(ds *deepseek.Client, cfg *config.Config, gen *repositories.GenerationRepository, subjects *repositories.SubjectRepository, state *repositories.StateRepository) *GeneratorService {
+	dsConc := config.DefaultGenDeepSeekConcurrency
+	if cfg != nil && cfg.GenDeepSeekConcurrency > 0 {
+		dsConc = cfg.GenDeepSeekConcurrency
+	}
 	return &GeneratorService{
 		ds: ds, cfg: cfg, gen: gen, subjects: subjects, state: state,
-		now: time.Now,
+		now:   time.Now,
+		wake:  make(chan struct{}, 1),
+		dsSem: make(chan struct{}, dsConc),
+	}
+}
+
+// notifyWorkers wakes one idle worker without blocking (no-op when a wake
+// is already pending or the service was built without a channel in tests).
+func (g *GeneratorService) notifyWorkers() {
+	if g == nil || g.wake == nil {
+		return
+	}
+	select {
+	case g.wake <- struct{}{}:
+	default:
+	}
+}
+
+// workerCount is the configured size of the generation worker pool.
+func (g *GeneratorService) workerCount() int {
+	n := config.DefaultGenWorkers
+	if g.cfg != nil && g.cfg.GenWorkers > 0 {
+		n = g.cfg.GenWorkers
+	}
+	return min(n, config.MaxGenWorkers)
+}
+
+// acquireDeepSeek takes a slot of the paid-generation semaphore (or fails
+// with ctx). A nil semaphore (tests building the struct directly) is
+// unbounded.
+func (g *GeneratorService) acquireDeepSeek(ctx context.Context) (release func(), err error) {
+	if g.dsSem == nil {
+		return func() {}, nil
+	}
+	select {
+	case g.dsSem <- struct{}{}:
+		return func() { <-g.dsSem }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 
@@ -569,6 +620,9 @@ func (g *GeneratorService) EnsureChainTest(ctx context.Context, subjectID int64,
 	if inserted && urgent {
 		log.Printf("generator: queued URGENT chain job: subject %d test %d", subjectID, testNumber)
 	}
+	if urgent {
+		g.notifyWorkers()
+	}
 	return g.gen.HasPendingOrRunningChainJob(ctx, subjectID, testNumber)
 }
 
@@ -662,6 +716,7 @@ func (g *GeneratorService) EnsurePersonalTest(ctx context.Context, userID, subje
 	if err := g.gen.EnqueuePersonalJob(ctx, subjectID, userID, fp); err != nil {
 		return nil, false, nil, err
 	}
+	g.notifyWorkers()
 	pending, err = g.gen.HasPendingOrRunningPersonalJob(ctx, subjectID, userID)
 	if err != nil {
 		return nil, false, nil, err
@@ -673,14 +728,20 @@ func (g *GeneratorService) EnsurePersonalTest(ctx context.Context, userID, subje
 // Worker
 // ---------------------------------------------------------------------------
 
-// RunWorker processes the generation queue until ctx is cancelled. One job
-// at a time is enough: generation is rare and expensive.
+// RunWorker processes the generation queue until ctx is cancelled.
 //
-// The loop itself is wrapped in a recover: if processOne ever panics, the
-// worker must NOT die — a dead worker leaves every queued test hanging in
+// It starts a pool of cfg.GenWorkers generation workers (GEN_WORKERS,
+// default 4) plus ONE separate low-priority quality-sweep goroutine, and
+// returns only when all of them have stopped. Every worker claims jobs with
+// ClaimNextJob (FOR UPDATE SKIP LOCKED + status flip to 'running' in the same
+// transaction), so a job is never executed by two workers — neither inside
+// this instance nor across instances during a zero-downtime deploy.
+//
+// Each worker loop is wrapped in a recover: if it ever panics, the worker
+// must NOT die — a dead pool leaves every queued test hanging in
 // ⏳ «Минуточку...» forever. The loop is restarted after a short pause
-// (backoff against crash-looping) and keeps draining the queue. Only a
-// context cancellation (shutdown) stops the worker for good.
+// (backoff against crash-looping). Only a context cancellation (shutdown)
+// stops the workers for good.
 func (g *GeneratorService) RunWorker(ctx context.Context) {
 	if !g.Enabled() {
 		return
@@ -692,14 +753,37 @@ func (g *GeneratorService) RunWorker(ctx context.Context) {
 	if g.ds != nil {
 		route = append(route, "deepseek "+g.ds.ReasonerModel()+" (paid fallback)")
 	}
-	log.Printf("generator worker started, provider route: %s", strings.Join(route, " → "))
+	n := g.workerCount()
+	log.Printf("generator: starting %d worker(s) + quality sweep, provider route: %s", n, strings.Join(route, " → "))
+	var wg sync.WaitGroup
+	for i := 1; i <= n; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			g.superviseLoop(ctx, fmt.Sprintf("generator worker %d", id), func(ctx context.Context) bool {
+				return g.runWorkerLoop(ctx, id)
+			})
+		}(i)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		g.superviseLoop(ctx, "quality sweep", g.runSweepLoop)
+	}()
+	wg.Wait()
+	log.Println("generator: all workers stopped")
+}
+
+// superviseLoop runs loop until ctx is cancelled, restarting it after a 5s
+// pause whenever it returns because of a recovered panic.
+func (g *GeneratorService) superviseLoop(ctx context.Context, name string, loop func(context.Context) (panicked bool)) {
 	for {
-		panicked := g.runWorkerLoop(ctx)
+		panicked := loop(ctx)
 		if ctx.Err() != nil {
 			return
 		}
 		if panicked {
-			log.Printf("generator worker: loop recovered from a panic — restarting in 5s")
+			log.Printf("%s: loop recovered from a panic — restarting in 5s", name)
 			select {
 			case <-ctx.Done():
 				return
@@ -709,39 +793,104 @@ func (g *GeneratorService) RunWorker(ctx context.Context) {
 	}
 }
 
-// runWorkerLoop is the worker's ticker loop. It reports (via the return
-// value) whether it ended because of a panic (true — the caller restarts
-// it) or because the context was cancelled (false — clean shutdown).
-// processOne additionally recovers panics per-job, so a panic normally never
-// escapes it; the loop-level recover is the last line of defence.
-func (g *GeneratorService) runWorkerLoop(ctx context.Context) (panicked bool) {
+// workerPollEvery is the FALLBACK poll of an idle worker: jobs enqueued in
+// this instance wake a worker immediately (notifyWorkers); the poll only
+// picks up jobs enqueued by another instance and retries whose backoff
+// (not_before) has expired.
+const workerPollEvery = 20 * time.Second
+
+// runWorkerLoop is one worker's loop. It reports (via the return value)
+// whether it ended because of a panic (true — the caller restarts it) or
+// because the context was cancelled (false — clean shutdown). executeJob
+// additionally recovers panics per-job, so a panic normally never escapes
+// it; the loop-level recover is the last line of defence.
+//
+// On every wake-up (signal or fallback tick) the worker DRAINS the queue:
+// it claims and runs jobs back to back until nothing is due, instead of
+// handling one job per tick.
+func (g *GeneratorService) runWorkerLoop(ctx context.Context, id int) (panicked bool) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("generator worker: PANIC recovered: %v", r)
+			log.Printf("generator worker %d: PANIC recovered: %v", id, r)
 			panicked = true
 		}
 	}()
-	ticker := time.NewTicker(20 * time.Second)
+	ticker := time.NewTicker(workerPollEvery)
 	defer ticker.Stop()
+	for {
+		g.drainQueue(ctx)
+		select {
+		case <-ctx.Done():
+			log.Printf("generator worker %d stopped", id)
+			return false
+		case <-g.wake:
+		case <-ticker.C:
+		}
+	}
+}
+
+// drainQueue reaps dead jobs, then claims and executes due jobs one after
+// another until the queue has nothing due (or ctx is cancelled). After a
+// successful claim it passes the wake signal on, so another idle worker
+// also looks at the queue — a burst of N jobs is spread over the pool
+// within milliseconds instead of one job per 20s tick.
+func (g *GeneratorService) drainQueue(ctx context.Context) {
+	g.reapStuckJobs(ctx)
+	for ctx.Err() == nil {
+		job, err := g.claimDue(ctx)
+		if err != nil || job == nil {
+			return
+		}
+		g.notifyWorkers()
+		g.executeJob(ctx, job)
+	}
+}
+
+// qualitySweepEvery: how often stored questions are audited (local, free)
+// and the flagged ones rewritten.
+const qualitySweepEvery = 5 * time.Minute
+
+// runSweepLoop is the dedicated low-priority quality-sweep goroutine. It is
+// separate from the generation workers, so a long sweep (bounded by
+// jobTimeout) never delays a user's test; and it is skipped (and aborted
+// between repair batches) while urgent user jobs are due or running, so it
+// never competes with them for the Groq quota.
+func (g *GeneratorService) runSweepLoop(ctx context.Context) (panicked bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("quality sweep: PANIC recovered: %v", r)
+			panicked = true
+		}
+	}()
 	sweep := time.NewTicker(qualitySweepEvery)
 	defer sweep.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("generator worker stopped")
 			return false
-		case <-ticker.C:
-			g.processOne(ctx)
 		case <-sweep.C:
+			if g.urgentWorkPending(ctx) {
+				log.Printf("quality sweep: postponed — urgent user generations in the queue")
+				continue
+			}
 			g.qualitySweepTick(ctx)
 		}
 	}
 }
 
-// qualitySweepEvery: how often stored questions are audited (local, free)
-// and the flagged ones rewritten. Runs in the same goroutine as the queue,
-// so a sweep never competes with a generation for the Groq quota.
-const qualitySweepEvery = 5 * time.Minute
+// urgentWorkPending reports whether user-facing jobs are due or running.
+// A database error counts as "busy" (skip this sweep tick, retry later).
+func (g *GeneratorService) urgentWorkPending(ctx context.Context) bool {
+	if g == nil || g.gen == nil {
+		return false
+	}
+	busy, err := g.gen.HasUrgentWork(ctx)
+	if err != nil {
+		log.Printf("quality sweep: check urgent work: %v", err)
+		return true
+	}
+	return busy
+}
 
 // qualitySweepTick runs one bounded sweep over not-yet-audited questions.
 //
@@ -793,19 +942,6 @@ func (g *GeneratorService) reapStuckJobs(ctx context.Context) {
 	if failed > 0 {
 		log.Printf("generator: parked %d stuck job(s) as failed (attempts exhausted)", failed)
 	}
-}
-
-// processOne reaps stuck jobs and runs at most one due job. It NEVER
-// propagates a panic: a crashed job is marked failed (retryable), the
-// worker stays alive and keeps draining the queue. A propagated panic used
-// to kill the whole worker goroutine — with nothing left to consume the
-// queue, every waiting test hung in ⏳ «Минуточку...» for good.
-func (g *GeneratorService) processOne(ctx context.Context) {
-	job, err := g.claimDue(ctx)
-	if err != nil || job == nil {
-		return
-	}
-	g.executeJob(ctx, job)
 }
 
 // executeJob runs one claimed job and records its outcome: done, failed
@@ -861,11 +997,12 @@ func (g *GeneratorService) executeJob(ctx context.Context, job *models.Generatio
 	log.Printf("generator: job %d done -> test %d", job.ID, testID)
 }
 
-// claimDue reaps dead jobs and claims the next one. Errors are logged and
-// swallowed (nil job): the worker ticks again in 20 seconds — a transient
-// database hiccup must never stop queue processing.
+// claimDue claims the next due job. Errors are logged and returned (the
+// worker stops draining and retries on the next wake-up / fallback tick) —
+// a transient database hiccup must never stop queue processing. A job
+// executed by executeJob NEVER propagates a panic: a crashed job is marked
+// failed (retryable) and the worker keeps draining the queue.
 func (g *GeneratorService) claimDue(ctx context.Context) (*models.GenerationJob, error) {
-	g.reapStuckJobs(ctx)
 	job, err := g.gen.ClaimNextJob(ctx)
 	if err != nil {
 		log.Printf("generator: claim job: %v", err)
@@ -1132,6 +1269,13 @@ func (g *GeneratorService) generationSteps(messages []deepseek.Message, kind str
 			name:    "deepseek/" + ds.ReasonerModel() + "(" + effort + ")",
 			reserve: deepseekGenReserve,
 			run: func(ctx context.Context) (string, error) {
+				// Bound the paid calls in flight across the worker pool:
+				// more workers must not mean a proportional DeepSeek burst.
+				release, err := g.acquireDeepSeek(ctx)
+				if err != nil {
+					return "", err
+				}
+				defer release()
 				return ds.GenerateJSON(ctx, messages, genMaxTokens, effort)
 			},
 		})

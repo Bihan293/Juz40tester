@@ -1,10 +1,13 @@
 package services
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
+	"github.com/Bihan293/Juz40tester/internal/config"
 	"github.com/Bihan293/Juz40tester/internal/models"
 )
 
@@ -303,4 +306,53 @@ func TestChainPromptStemTruncationIsValidUTF8(t *testing.T) {
 	if !utf8.ValidString(p) {
 		t.Fatal("chain prompt must stay valid UTF-8 after truncating stems")
 	}
+}
+
+func TestWorkerCountDefaultsAndCap(t *testing.T) {
+	cases := []struct {
+		cfg  *config.Config
+		want int
+	}{
+		{nil, config.DefaultGenWorkers},
+		{&config.Config{}, config.DefaultGenWorkers},
+		{&config.Config{GenWorkers: 6}, 6},
+		{&config.Config{GenWorkers: 1000}, config.MaxGenWorkers},
+	}
+	for _, c := range cases {
+		g := &GeneratorService{cfg: c.cfg}
+		if got := g.workerCount(); got != c.want {
+			t.Fatalf("workerCount(%+v) = %d, want %d", c.cfg, got, c.want)
+		}
+	}
+}
+
+func TestNotifyWorkersNeverBlocks(t *testing.T) {
+	g := NewGeneratorService(nil, &config.Config{}, nil, nil, nil)
+	for i := 0; i < 100; i++ {
+		g.notifyWorkers() // buffered size 1: extra signals coalesce
+	}
+	select {
+	case <-g.wake:
+	default:
+		t.Fatal("wake signal lost")
+	}
+	(&GeneratorService{}).notifyWorkers() // nil channel: no-op
+}
+
+func TestDeepSeekSemaphoreBoundsParallelCalls(t *testing.T) {
+	g := NewGeneratorService(nil, &config.Config{GenDeepSeekConcurrency: 2}, nil, nil, nil)
+	r1, _ := g.acquireDeepSeek(context.Background())
+	r2, _ := g.acquireDeepSeek(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := g.acquireDeepSeek(ctx); err == nil {
+		t.Fatal("third paid call must wait for a free slot")
+	}
+	r1()
+	r3, err := g.acquireDeepSeek(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2()
+	r3()
 }

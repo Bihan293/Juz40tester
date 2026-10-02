@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/Bihan293/Juz40tester/internal/httpx"
 )
 
 // Client is a thin Telegram Bot API client.
@@ -26,7 +28,7 @@ type Client struct {
 func NewClient(token string) *Client {
 	return &Client{
 		token:      token,
-		httpClient: &http.Client{Timeout: 15 * time.Second},
+		httpClient: httpx.NewClient(15 * time.Second),
 		baseURL:    "https://api.telegram.org",
 	}
 }
