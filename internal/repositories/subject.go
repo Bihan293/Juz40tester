@@ -59,11 +59,6 @@ func (r *SubjectRepository) GetByID(ctx context.Context, id int64) (*models.Subj
 	return &s, nil
 }
 
-// ListTests returns all active tests of a subject ordered by test number.
-func (r *SubjectRepository) ListTests(ctx context.Context, subjectID int64) ([]models.Test, error) {
-	return r.listTests(ctx, subjectID, "")
-}
-
 // ListChainTests returns only the chain tests of a subject (the main linear
 // sequence), ordered by test number. 'weak' tests are excluded.
 func (r *SubjectRepository) ListChainTests(ctx context.Context, subjectID int64) ([]models.Test, error) {
@@ -272,6 +267,127 @@ func (r *SubjectRepository) SubjectProgress(ctx context.Context, userID, subject
 	return &sp, nil
 }
 
+// SubjectProgressBatch is SubjectProgress for many subjects in ONE query:
+// openTests[subjectID] is the explicit list of tests counted for that
+// subject (same semantics as SubjectProgress — COUNT DISTINCT per subject,
+// locked tests excluded by the caller). Subjects that do not exist are
+// absent from the result.
+func (r *SubjectRepository) SubjectProgressBatch(ctx context.Context, userID int64, subjectIDs []int64, openTests map[int64][]int64) (map[int64]*models.SubjectProgress, error) {
+	out := make(map[int64]*models.SubjectProgress, len(subjectIDs))
+	if len(subjectIDs) == 0 {
+		return out, nil
+	}
+	// Flatten (subject, test) pairs; the test list is scoped per subject so
+	// a test id can never leak into another subject's totals.
+	var pairSubj, pairTest []int64
+	for _, sid := range subjectIDs {
+		for _, tid := range openTests[sid] {
+			pairSubj = append(pairSubj, sid)
+			pairTest = append(pairTest, tid)
+		}
+	}
+	rows, err := r.pool.Query(ctx, `
+		WITH open_tests AS (
+		    SELECT * FROM unnest($3::bigint[], $4::bigint[]) AS o(subject_id, test_id)
+		),
+		stat AS (
+		    SELECT o.subject_id,
+		           COUNT(DISTINCT tq.question_id)                                 AS total_questions,
+		           COUNT(DISTINCT tq.question_id) FILTER (WHERE p.status = 2)     AS green,
+		           COUNT(DISTINCT tq.question_id) FILTER (WHERE p.status = 1)     AS yellow,
+		           COUNT(DISTINCT tq.question_id) FILTER (WHERE COALESCE(p.status, 0) = 0) AS red,
+		           COALESCE(SUM(p.correct_count), 0)                              AS correct_count,
+		           COALESCE(SUM(p.wrong_count), 0)                                AS wrong_count
+		    FROM open_tests o
+		    JOIN test_questions tq ON tq.test_id = o.test_id
+		    LEFT JOIN user_question_progress p
+		           ON p.question_id = tq.question_id AND p.user_id = $1
+		    GROUP BY o.subject_id
+		)
+		SELECT s.id, s.name,
+		       COALESCE(st.total_questions, 0), COALESCE(st.green, 0),
+		       COALESCE(st.yellow, 0), COALESCE(st.red, 0),
+		       COALESCE(st.correct_count, 0), COALESCE(st.wrong_count, 0)
+		FROM subjects s
+		LEFT JOIN stat st ON st.subject_id = s.id
+		WHERE s.id = ANY($2)`, userID, subjectIDs, pairSubj, pairTest)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var sp models.SubjectProgress
+		if err := rows.Scan(&sp.SubjectID, &sp.SubjectName, &sp.TotalQuestions,
+			&sp.Green, &sp.Yellow, &sp.Red, &sp.CorrectCount, &sp.WrongCount); err != nil {
+			return nil, err
+		}
+		out[sp.SubjectID] = &sp
+	}
+	return out, rows.Err()
+}
+
+// ListChainTestsBySubject is ListChainTests for many subjects in one query
+// (same filter and per-subject order by test number).
+func (r *SubjectRepository) ListChainTestsBySubject(ctx context.Context, subjectIDs []int64) (map[int64][]models.Test, error) {
+	out := make(map[int64][]models.Test, len(subjectIDs))
+	if len(subjectIDs) == 0 {
+		return out, nil
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, subject_id, test_number, title, is_active, kind, topics
+		FROM tests
+		WHERE subject_id = ANY($1) AND is_active AND kind = $2
+		ORDER BY subject_id, test_number`, subjectIDs, models.TestKindChain)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var t models.Test
+		var topicsJSON []byte
+		if err := rows.Scan(&t.ID, &t.SubjectID, &t.TestNumber, &t.Title, &t.IsActive, &t.Kind, &topicsJSON); err != nil {
+			return nil, err
+		}
+		if len(topicsJSON) > 0 {
+			_ = json.Unmarshal(topicsJSON, &t.Topics)
+		}
+		out[t.SubjectID] = append(out[t.SubjectID], t)
+	}
+	return out, rows.Err()
+}
+
+// TestViewMeta is what rendering one question needs about its test.
+type TestViewMeta struct {
+	Total       int    // questions attached to the test
+	SubjectName string // subject of the test (language subjects are never translated)
+	Translated  int    // test questions that have a cached translation in lang
+}
+
+// TestViewMeta loads, in ONE query, the question count, the subject name and
+// the number of translated questions of a test (replaces TestQuestionCount +
+// GetByID + TestQuestions + TranslatedQuestionCount per rendered question).
+func (r *SubjectRepository) TestViewMeta(ctx context.Context, testID int64, lang string) (*TestViewMeta, error) {
+	var m TestViewMeta
+	err := r.pool.QueryRow(ctx, `
+		SELECT s.name,
+		       (SELECT COUNT(*) FROM test_questions tq WHERE tq.test_id = t.id),
+		       (SELECT COUNT(DISTINCT tr.question_id)
+		          FROM test_questions tq
+		          JOIN question_translations tr
+		            ON tr.question_id = tq.question_id AND tr.lang = $2
+		         WHERE tq.test_id = t.id)
+		FROM tests t
+		JOIN subjects s ON s.id = t.subject_id
+		WHERE t.id = $1`, testID, lang).Scan(&m.SubjectName, &m.Total, &m.Translated)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
 // UnlockedTestsLeaderboard ranks users by their chain LEVEL in the subject
 // — exactly the value QuizService.unlockedMax computes for the bot itself:
 // Тест 1 is always open; walking the chain by test number, test n+1 opens
@@ -378,26 +494,4 @@ func (r *SubjectRepository) GreenLeaderboard(ctx context.Context, subjectID int6
 		out = append(out, e)
 	}
 	return out, rows.Err()
-}
-
-// EnsureSubject makes sure a subject with the given name exists and returns
-// its id. Subjects are managed in the database directly, but this helper
-// stays for operational scripts/tests. Idempotent.
-func (r *SubjectRepository) EnsureSubject(ctx context.Context, name string) (int64, error) {
-	var subjectID int64
-	err := r.pool.QueryRow(ctx, `
-		INSERT INTO subjects (name, position)
-		VALUES ($1, (SELECT COALESCE(MAX(position), 0) + 1 FROM subjects))
-		ON CONFLICT (name) DO NOTHING
-		RETURNING id`, name).Scan(&subjectID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		// Subject already exists — reuse it.
-		if err := r.pool.QueryRow(ctx,
-			`SELECT id FROM subjects WHERE name = $1`, name).Scan(&subjectID); err != nil {
-			return 0, err
-		}
-	} else if err != nil {
-		return 0, err
-	}
-	return subjectID, nil
 }

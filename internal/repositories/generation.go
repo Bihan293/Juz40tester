@@ -27,11 +27,10 @@ func NewGenerationRepository(pool *pgxpool.Pool) *GenerationRepository {
 // TestProgress holds the knowledge-status breakdown of one test for one
 // user (used by the unlock rule and by the 🔒/✅ marks in the grid).
 type TestProgress struct {
-	Green    int
-	Yellow   int
-	Red      int
-	Total    int
-	Answered bool // user has at least one completed attempt of this test
+	Green  int
+	Yellow int
+	Red    int
+	Total  int
 }
 
 // TestProgressForUser aggregates the user's CURRENT knowledge statuses over
@@ -46,12 +45,7 @@ func (r *GenerationRepository) TestProgressForUser(ctx context.Context, userID i
 		       COUNT(*)                                                            AS total,
 		       COUNT(*) FILTER (WHERE p.status = 2)                                AS green,
 		       COUNT(*) FILTER (WHERE p.status = 1)                                AS yellow,
-		       COUNT(*) FILTER (WHERE COALESCE(p.status, 0) = 0)                   AS red,
-		       EXISTS(
-		           SELECT 1 FROM test_attempts ta
-		           WHERE ta.test_id = tq.test_id AND ta.user_id = $1
-		             AND ta.status = 'completed'
-		       )                                                                   AS answered
+		       COUNT(*) FILTER (WHERE COALESCE(p.status, 0) = 0)                   AS red
 		FROM test_questions tq
 		LEFT JOIN user_question_progress p
 		       ON p.question_id = tq.question_id AND p.user_id = $1
@@ -64,7 +58,7 @@ func (r *GenerationRepository) TestProgressForUser(ctx context.Context, userID i
 	for rows.Next() {
 		var tp TestProgress
 		var testID int64
-		if err := rows.Scan(&testID, &tp.Total, &tp.Green, &tp.Yellow, &tp.Red, &tp.Answered); err != nil {
+		if err := rows.Scan(&testID, &tp.Total, &tp.Green, &tp.Yellow, &tp.Red); err != nil {
 			return nil, err
 		}
 		out[testID] = &tp
