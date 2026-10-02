@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -184,7 +185,7 @@ func TestQualitySweepRepository(t *testing.T) {
 		ids[i] = stored[i].ID
 		order[i] = []string{"A", "B", "C", "D"}
 	}
-	att, err := attempts.CreateAttempt(ctx, user.ID, test.ID, ids, order)
+	att, err := attempts.CreateAttempt(ctx, user.ID, test.ID, ids, order, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,5 +253,131 @@ func TestQualitySweepRepository(t *testing.T) {
 	}
 	if _, err := subjects.GreenLeaderboard(ctx, sid, 10); err != nil {
 		t.Fatalf("green board: %v", err)
+	}
+}
+
+// TestAttemptGuards covers: a single in-progress attempt per (user, test),
+// replace on retry, out-of-order answers rejected, finishing only after all
+// questions are answered, busy/postpone of the quality sweep and the stale
+// attempts reaper.
+func TestAttemptGuards(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	subjects := NewSubjectRepository(pool)
+	gen := NewGenerationRepository(pool)
+	users := NewUserRepository(pool)
+	attempts := NewAttemptRepository(pool)
+
+	sid, err := subjects.EnsureSubject(ctx, "Тест попыток "+time.Now().Format("150405.000000"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	qs := make([]models.SeedQuestion, 3)
+	for i := range qs {
+		qs[i] = models.SeedQuestion{
+			Text:    "Вопрос про попытки " + string(rune('A'+i)),
+			Options: [4]string{"раз", "два", "три", "четыре"},
+			Correct: 0, Topic: "Тема", Difficulty: 2,
+		}
+	}
+	test, err := gen.CreateGeneratedTest(ctx, &models.Test{SubjectID: sid, TestNumber: 1, Title: "Тест 1", Kind: models.TestKindChain}, qs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := subjects.TestQuestions(ctx, test.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := users.upsertAt(ctx, &models.User{TelegramID: time.Now().UnixNano()%1_000_000_000 + 3_000_000_000}, d("2026-10-01"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]int64, len(stored))
+	order := make([][]string, len(stored))
+	for i := range stored {
+		ids[i] = stored[i].ID
+		order[i] = []string{"A", "B", "C", "D"}
+	}
+
+	// Concurrent "double tap": exactly one in-progress attempt.
+	var wg sync.WaitGroup
+	got := make([]int64, 4)
+	for i := range got {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			a, err := attempts.CreateAttempt(ctx, user.ID, test.ID, ids, order, false)
+			if err != nil {
+				t.Errorf("create: %v", err)
+				return
+			}
+			got[i] = a.ID
+		}(i)
+	}
+	wg.Wait()
+	for _, id := range got {
+		if id != got[0] {
+			t.Fatalf("double tap created several attempts: %v", got)
+		}
+	}
+	var open int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM test_attempts WHERE user_id=$1 AND test_id=$2 AND status='in_progress'`, user.ID, test.ID).Scan(&open); err != nil || open != 1 {
+		t.Fatalf("open attempts: %d %v", open, err)
+	}
+
+	// The question at position 1 is busy now.
+	busy, err := gen.IsQuestionBusy(ctx, ids[0])
+	if err != nil || !busy {
+		t.Fatalf("question must be busy: %v %v", busy, err)
+	}
+	if err := gen.PostponeQualityCheck(ctx, ids[0], time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	unchecked, _ := gen.UncheckedQuestions(ctx, 100000)
+	for _, q := range unchecked {
+		if q.ID == ids[0] {
+			t.Fatal("postponed question must be hidden from the sweep")
+		}
+	}
+
+	// Retry replaces the open attempt.
+	a2, err := attempts.CreateAttempt(ctx, user.ID, test.ID, ids, order, true)
+	if err != nil || a2.ID == got[0] {
+		t.Fatalf("retry must create a new attempt: %v %v", a2, err)
+	}
+	var st string
+	_ = pool.QueryRow(ctx, `SELECT status FROM test_attempts WHERE id=$1`, got[0]).Scan(&st)
+	if st != models.AttemptAbandoned {
+		t.Fatalf("old attempt must be abandoned, got %s", st)
+	}
+
+	// Answering the LAST position first is rejected and does not finish.
+	if _, err := attempts.SubmitAnswer(ctx, user.ID, a2.ID, 3, "A"); !errors.Is(err, ErrAnswerOutOfOrder) {
+		t.Fatalf("out-of-order answer must be rejected, got %v", err)
+	}
+	for pos := 1; pos <= 3; pos++ {
+		res, err := attempts.SubmitAnswer(ctx, user.ID, a2.ID, pos, "A")
+		if err != nil {
+			t.Fatalf("answer %d: %v", pos, err)
+		}
+		if res.Finished != (pos == 3) {
+			t.Fatalf("finished at pos %d = %v", pos, res.Finished)
+		}
+	}
+
+	// Stale attempts reaper.
+	a3, err := attempts.CreateAttempt(ctx, user.ID, test.ID, ids, order, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE test_attempts SET updated_at = now() - interval '40 days' WHERE id=$1`, a3.ID); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := attempts.AbandonStaleAttempts(ctx, 30*24*time.Hour); err != nil || n < 1 {
+		t.Fatalf("reaper: %d %v", n, err)
+	}
+	_ = pool.QueryRow(ctx, `SELECT status FROM test_attempts WHERE id=$1`, a3.ID).Scan(&st)
+	if st != models.AttemptAbandoned {
+		t.Fatalf("stale attempt must be abandoned, got %s", st)
 	}
 }

@@ -762,6 +762,11 @@ func (h *Handler) handleAnswer(ctx context.Context, cb *bot.CallbackQuery, user 
 		h.answerCallback(ctx, cb, "Попытка не найдена")
 		return
 	}
+	if errors.Is(err, repositories.ErrAnswerOutOfOrder) {
+		// Stale / forged callback for a question that is not the current one.
+		h.answerCallback(ctx, cb, "Этот вопрос уже неактуален")
+		return
+	}
 	if err != nil {
 		log.Printf("submit answer: %v", err)
 		h.answerCallback(ctx, cb, "Не удалось сохранить ответ")
@@ -954,7 +959,7 @@ func (h *Handler) retryTest(ctx context.Context, cb *bot.CallbackQuery, user *mo
 	}
 	// Every retry is a brand-new attempt with fresh shuffled question and
 	// option orders.
-	newAttempt, err := h.quiz.StartTest(ctx, user.ID, sum.Test.ID)
+	newAttempt, err := h.quiz.RestartTest(ctx, user.ID, sum.Test.ID)
 	if err != nil {
 		log.Printf("retry test: %v", err)
 		h.sendText(ctx, cb.Message.Chat.ID, "Не удалось начать тест 😔")

@@ -57,13 +57,18 @@ const (
 	// retryDelay is the backoff applied between job retries.
 	retryDelay = 10 * time.Minute
 	// jobTimeout bounds a single generation run. It covers the whole
-	// provider route (Groq steps, a possible wait for the per-minute Groq
-	// window, then the DeepSeek fallback) and stays well below
-	// stuckJobTimeout (the heartbeat keeps a live job fresh anyway).
-	jobTimeout = 8 * time.Minute
+	// provider route (up to 3 Groq steps of groqStepTimeout each, then the
+	// DeepSeek fallback, then the repair of flagged questions) and stays
+	// below stuckJobTimeout (the heartbeat keeps a live job fresh anyway).
+	// The Groq steps are cut so that deepseekGenReserve is always left for
+	// the paid fallback + repair (see aiStep.reserve).
+	jobTimeout = 14 * time.Minute
 	// stuckJobTimeout: a 'running' job idle longer than this is returned to
 	// 'pending' (the worker died mid-generation — deploy, restart, OOM).
-	stuckJobTimeout = 10 * time.Minute
+	stuckJobTimeout = 20 * time.Minute
+	// deepseekGenReserve: time guaranteed to the DeepSeek generation step
+	// (and the repair round after it) — the free Groq steps never use it.
+	deepseekGenReserve = 4 * time.Minute
 	// genMaxTokens caps the model output INCLUDING the hidden thinking
 	// tokens — the hard cost limiter of one generation. 20 questions with
 	// 4 options each need ~3000–3800 visible tokens, leaving ~4000 for the
@@ -1072,7 +1077,8 @@ func (g *GeneratorService) generationSteps(messages []deepseek.Message, kind str
 		}
 		ds := g.ds
 		steps = append(steps, aiStep{
-			name: "deepseek/" + ds.ReasonerModel() + "(" + effort + ")",
+			name:    "deepseek/" + ds.ReasonerModel() + "(" + effort + ")",
+			reserve: deepseekGenReserve,
 			run: func(ctx context.Context) (string, error) {
 				return ds.GenerateJSON(ctx, messages, genMaxTokens, effort)
 			},

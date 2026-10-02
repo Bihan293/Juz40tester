@@ -1,6 +1,12 @@
 package deepseek
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"sync"
 	"testing"
 )
 
@@ -42,5 +48,76 @@ func TestDefaults(t *testing.T) {
 	c := New("key", "", "", "")
 	if c.ReasonerModel() != DefaultReasonerModel || c.Model() != DefaultModel {
 		t.Fatal("empty env model names must fall back to the defaults")
+	}
+}
+
+func TestThinkingParamErrorClassification(t *testing.T) {
+	if isThinkingParamError(errors.New("deepseek: HTTP 400: maximum context length exceeded")) {
+		t.Fatal("a context-length 400 must not disable thinking")
+	}
+	if !isThinkingParamError(errors.New("deepseek: unknown field reasoning_effort (invalid_request_error)")) {
+		t.Fatal("explicit reasoning_effort rejection must be detected")
+	}
+	if isParamError(errors.New("deepseek: HTTP 400: This model's maximum context length is 128k")) {
+		t.Fatal("context-length errors must not route to the pricier fallback")
+	}
+	if isParamError(context.DeadlineExceeded) || isParamError(errors.New("deepseek: HTTP 500: oops")) {
+		t.Fatal("timeouts / 5xx must not route to the pricier fallback")
+	}
+}
+
+// TestFallbackRouting: a 5xx on the reasoner must NOT go to the pricier
+// fallback model, and an explicit thinking rejection disables thinking
+// once — the next call goes straight to the reasoner without thinking.
+func TestFallbackRouting(t *testing.T) {
+	var mu sync.Mutex
+	var calls []string
+	mode := "5xx"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		_, thinking := req["thinking"]
+		mu.Lock()
+		tag := req["model"].(string)
+		if thinking {
+			tag += "+thinking"
+		}
+		calls = append(calls, tag)
+		m := mode
+		mu.Unlock()
+		switch {
+		case m == "5xx":
+			w.WriteHeader(500)
+			_, _ = w.Write([]byte(`{"error":{"message":"overloaded","type":"server_error"}}`))
+		case m == "reject-thinking" && thinking:
+			w.WriteHeader(400)
+			_, _ = w.Write([]byte(`{"error":{"message":"unknown field thinking","type":"invalid_request_error"}}`))
+		default:
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"ok\":true}"},"finish_reason":"stop"}]}`))
+		}
+	}))
+	defer srv.Close()
+	c := New("k", "pro", "flash", srv.URL)
+
+	if _, err := c.GenerateJSON(context.Background(), []Message{{Role: "user", Content: "x"}}, 100, ThinkingEffortLow); err == nil {
+		t.Fatal("5xx must be returned as an error")
+	}
+	if len(calls) != 1 || calls[0] != "flash+thinking" || c.thinkingDisabled() {
+		t.Fatalf("5xx must not retry / fall back / disable thinking: %v", calls)
+	}
+
+	calls, mode = nil, "reject-thinking"
+	if _, err := c.GenerateJSON(context.Background(), []Message{{Role: "user", Content: "x"}}, 100, ThinkingEffortLow); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 2 || calls[1] != "flash" || !c.thinkingDisabled() {
+		t.Fatalf("thinking rejection must retry reasoner without thinking: %v", calls)
+	}
+	calls = nil
+	if _, err := c.GenerateJSON(context.Background(), []Message{{Role: "user", Content: "x"}}, 100, ThinkingEffortLow); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 || calls[0] != "flash" {
+		t.Fatalf("with thinking disabled the first call must go without thinking: %v", calls)
 	}
 }

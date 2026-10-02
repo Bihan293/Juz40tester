@@ -17,6 +17,7 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Bihan293/Juz40tester/internal/deepseek"
 	"github.com/Bihan293/Juz40tester/internal/groq"
@@ -93,7 +94,8 @@ func (g *GeneratorService) repairSteps(messages []deepseek.Message) []aiStep {
 	if g.ds != nil {
 		ds := g.ds
 		steps = append(steps, aiStep{
-			name: "deepseek/" + ds.ReasonerModel() + "(low)",
+			name:    "deepseek/" + ds.ReasonerModel() + "(low)",
+			reserve: deepseekRepairReserve,
 			run: func(ctx context.Context) (string, error) {
 				return ds.GenerateJSON(ctx, messages, repairMaxTokens, deepseek.ThinkingEffortLow)
 			},
@@ -249,6 +251,12 @@ const (
 	// sweepMaxQuestionAttempts: after this many failed repairs a question is
 	// left as is (logged) — the sweep must not spend money on it forever.
 	sweepMaxQuestionAttempts = 3
+	// sweepBusyPostpone: a flagged question that is on screen in an
+	// unfinished attempt is skipped by the sweep for this long (no AI call).
+	sweepBusyPostpone = 6 * time.Hour
+	// deepseekRepairReserve: time guaranteed to the paid DeepSeek repair
+	// step — the free Groq repair steps are cut to leave it.
+	deepseekRepairReserve = 3 * time.Minute
 )
 
 // RunQualitySweep audits stored questions that have not been checked yet.
@@ -301,7 +309,25 @@ func (g *GeneratorService) RunQualitySweep(ctx context.Context) (int, error) {
 		if err != nil {
 			return repaired, err
 		}
-		list := bySubject[sid]
+		// Questions on screen in an unfinished attempt are filtered out
+		// BEFORE the paid rewrite (ReplaceQuestionContent would refuse them
+		// and the model output would be thrown away) and postponed, so the
+		// sweep does not pay for them again on every tick.
+		list := make([]models.Question, 0, len(bySubject[sid]))
+		for _, q := range bySubject[sid] {
+			busy, err := g.gen.IsQuestionBusy(ctx, q.ID)
+			if err != nil {
+				return repaired, err
+			}
+			if busy {
+				if err := g.gen.PostponeQualityCheck(ctx, q.ID, sweepBusyPostpone); err != nil {
+					return repaired, err
+				}
+				log.Printf("quality sweep: question %d is in an active attempt — postponed for %s", q.ID, sweepBusyPostpone)
+				continue
+			}
+			list = append(list, q)
+		}
 		for start := 0; start < len(list); start += repairBatch {
 			if ctx.Err() != nil {
 				return repaired, ctx.Err()
@@ -337,9 +363,15 @@ func (g *GeneratorService) RunQualitySweep(ctx context.Context) (int, error) {
 					Text: nq.Text, Options: opts, Correct: nq.Correct, Topic: q.Topic, Difficulty: nq.Difficulty,
 				})
 				if errors.Is(err, repositories.ErrQuestionBusy) {
-					// A student is looking at it right now — stays unchecked,
-					// the next sweep tick rewrites it.
-					log.Printf("quality sweep: question %d is in an active attempt — postponed", q.ID)
+					// Became busy during the rewrite (rare race) — the paid
+					// attempt counts, and the question is postponed.
+					if err := g.gen.NoteQualityAttempt(ctx, q.ID, sweepMaxQuestionAttempts); err != nil {
+						return repaired, err
+					}
+					if err := g.gen.PostponeQualityCheck(ctx, q.ID, sweepBusyPostpone); err != nil {
+						return repaired, err
+					}
+					log.Printf("quality sweep: question %d became busy during rewrite — postponed", q.ID)
 					continue
 				}
 				if err != nil {

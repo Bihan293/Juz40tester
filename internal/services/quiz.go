@@ -174,7 +174,12 @@ type WeakEntry struct {
 // (e.g. tests 2 and 3 exist but test 1 was removed) must never lock test 1
 // itself — otherwise the user would be asked to pass a test that does not
 // exist in order to open the first one.
-func (s *QuizService) unlockedMax(ctx context.Context, userID int64, chain []models.Test) (int, error) {
+//
+// Once a test has reached the bar, the unlock is PERMANENT: the per-user
+// watermark user_subject_state.last_test_number (the highest chain test
+// that reached the bar) keeps every test up to last_test_number+1 open,
+// even if a later retry of an earlier test drops its 🟢/🟡 below the bar.
+func (s *QuizService) unlockedMax(ctx context.Context, userID, subjectID int64, chain []models.Test) (int, error) {
 	ids := make([]int64, 0, len(chain))
 	byNumber := make(map[int]*models.Test, len(chain))
 	for i := range chain {
@@ -185,6 +190,14 @@ func (s *QuizService) unlockedMax(ctx context.Context, userID int64, chain []mod
 	if err != nil {
 		return 0, err
 	}
+	watermark := 0
+	if s.state != nil {
+		st, err := s.state.Get(ctx, userID, subjectID)
+		if err != nil {
+			return 0, err
+		}
+		watermark = st.LastTestNumber
+	}
 	unlocked := 1 // Тест 1 всегда открыт
 	for {
 		t := byNumber[unlocked]
@@ -192,10 +205,14 @@ func (s *QuizService) unlockedMax(ctx context.Context, userID int64, chain []mod
 			break // следующий тест ещё не сгенерирован — цепочка упирается сюда
 		}
 		p := progress[t.ID]
-		if p == nil || !models.MeetsUnlockBar(p.Green, p.Yellow) {
+		passed := unlocked <= watermark || (p != nil && models.MeetsUnlockBar(p.Green, p.Yellow))
+		if !passed {
 			break // следующий тест закрыт
 		}
 		unlocked++
+	}
+	if watermark+1 > unlocked {
+		unlocked = watermark + 1
 	}
 	return unlocked, nil
 }
@@ -214,7 +231,7 @@ func (s *QuizService) GetSubjectScreen(ctx context.Context, userID, subjectID in
 		return nil, err
 	}
 
-	unlockedMax, err := s.unlockedMax(ctx, userID, chain)
+	unlockedMax, err := s.unlockedMax(ctx, userID, subjectID, chain)
 	if err != nil {
 		return nil, err
 	}
@@ -345,7 +362,7 @@ func (s *QuizService) CanOpenTest(ctx context.Context, userID int64, test *model
 	if err != nil {
 		return false, "", err
 	}
-	unlocked, err := s.unlockedMax(ctx, userID, chain)
+	unlocked, err := s.unlockedMax(ctx, userID, test.SubjectID, chain)
 	if err != nil {
 		return false, "", err
 	}
@@ -378,8 +395,8 @@ func (s *QuizService) CanOpenTest(ctx context.Context, userID int64, test *model
 	return false, reason, nil
 }
 
-// OnTestCompleted is called after an attempt is finished: bumps the chain
-// watermark and, ONLY when the attempt reached the unlock bar
+// OnTestCompleted is called after an attempt is finished: ONLY when the
+// attempt reached the unlock bar it bumps the chain unlock watermark and when the attempt reached the unlock bar
 // (15🟢 + 5🟡), queues the generation of the next chain test URGENTLY.
 //
 // Why only at the bar: the user wants the AI to see the FULL knowledge
@@ -391,15 +408,18 @@ func (s *QuizService) OnTestCompleted(ctx context.Context, userID int64, test *m
 	if test.Kind != models.TestKindChain || s.state == nil {
 		return
 	}
+	// Not at the bar yet — nothing to unlock or generate. The user keeps
+	// training this same test; generation starts exactly when the bar is
+	// crossed.
+	if !models.MeetsUnlockBar(green, yellow) {
+		return
+	}
+	// The bar is reached — remember it permanently (the unlock watermark):
+	// a later retry with mistakes must never lock the next tests again.
 	if err := s.state.SaveProgress(ctx, userID, test.SubjectID, test.TestNumber, 0); err != nil {
 		return
 	}
 	if s.genSvc == nil || !s.genSvc.Enabled() {
-		return
-	}
-	// Not at the bar yet — nothing to generate. The user keeps training
-	// this same test; generation starts exactly when the bar is crossed.
-	if !models.MeetsUnlockBar(green, yellow) {
 		return
 	}
 	chain, err := s.subjects.ListChainTests(ctx, test.SubjectID)
@@ -538,6 +558,17 @@ func (s *QuizService) FinishPersonalTest(ctx context.Context, userID, testID int
 // test_attempt; the shuffled orders are persisted in attempt_questions so a
 // resumed attempt keeps its original order.
 func (s *QuizService) StartTest(ctx context.Context, userID, testID int64) (*models.TestAttempt, error) {
+	return s.startTest(ctx, userID, testID, false)
+}
+
+// RestartTest starts a brand-new attempt («🔄 Пройти ещё раз»): any attempt
+// of this test that is still in progress is closed as abandoned first, so
+// a double tap never leaves two open attempts.
+func (s *QuizService) RestartTest(ctx context.Context, userID, testID int64) (*models.TestAttempt, error) {
+	return s.startTest(ctx, userID, testID, true)
+}
+
+func (s *QuizService) startTest(ctx context.Context, userID, testID int64, replace bool) (*models.TestAttempt, error) {
 	test, err := s.subjects.GetTest(ctx, testID)
 	if err != nil {
 		return nil, err
@@ -570,7 +601,7 @@ func (s *QuizService) StartTest(ctx context.Context, userID, testID int64) (*mod
 		orders[i] = ord
 	}
 	s.rngMu.Unlock()
-	return s.attempts.CreateAttempt(ctx, userID, test.ID, ids, orders)
+	return s.attempts.CreateAttempt(ctx, userID, test.ID, ids, orders, replace)
 }
 
 // QuestionView is a question rendered for the user inside an attempt.
@@ -761,7 +792,7 @@ func (s *QuizService) SubjectProgress(ctx context.Context, userID, subjectID int
 	if err != nil {
 		return nil, err
 	}
-	unlocked, err := s.unlockedMax(ctx, userID, chain)
+	unlocked, err := s.unlockedMax(ctx, userID, subjectID, chain)
 	if err != nil {
 		return nil, err
 	}

@@ -307,3 +307,25 @@ func TestClientDisabledWithoutKey(t *testing.T) {
 		t.Fatal("client without key must be disabled")
 	}
 }
+
+func TestSchemaAndEffortErrorClassification(t *testing.T) {
+	mk := func(msg, code string) error { return &APIError{Status: 400, Message: msg, Code: code} }
+	if isSchemaError(mk("Failed to validate JSON against schema", "json_validate_failed")) {
+		t.Fatal("json_validate_failed must not disable json_schema")
+	}
+	if isSchemaError(mk("Invalid JSON in output", "")) {
+		t.Fatal("a generic json error must not disable json_schema")
+	}
+	if !isSchemaError(mk("response_format json_schema is not supported by this model", "")) {
+		t.Fatal("explicit json_schema unsupported must disable it")
+	}
+	if !isSchemaError(mk("invalid value for response_format", "")) {
+		t.Fatal("invalid value for response_format must disable it")
+	}
+	if isEffortError(mk("the reasoning output was too long", "")) {
+		t.Fatal("a 400 merely mentioning reasoning must not disable reasoning_effort")
+	}
+	if !isEffortError(mk("reasoning_effort 'none' is not supported", "")) {
+		t.Fatal("explicit reasoning_effort rejection must disable it")
+	}
+}

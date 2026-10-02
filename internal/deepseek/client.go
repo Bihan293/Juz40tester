@@ -249,20 +249,7 @@ func (c *Client) GenerateJSON(ctx context.Context, messages []Message, maxTokens
 	if effort == "" {
 		effort = ThinkingEffortLow
 	}
-	raw, err := c.call(ctx, c.reasonerModel, messages, 0, maxTokens, true, effort)
-	if err != nil && !c.thinkingDisabled() && isParamError(err) {
-		log.Printf("deepseek: thinking params rejected (%v) — retrying without them", err)
-		c.setThinkingUnsupported()
-		raw, err = c.call(ctx, c.reasonerModel, messages, 0, maxTokens, true, "")
-	}
-	if err != nil && c.thinkingDisabled() {
-		// Thinking mode unusable at all — last resort: the non-thinking
-		// fallback model (deepseek-v4-pro — strong, but pricier; it must
-		// never become the default).
-		log.Printf("deepseek: %s failed (%v) — falling back to %s (non-thinking)", c.reasonerModel, err, c.model)
-		raw, err = c.call(ctx, c.model, messages, 0.7, maxTokens, true, "")
-	}
-	return raw, err
+	return c.jsonWithFallback(ctx, "generate", messages, maxTokens, effort, 0.7)
 }
 
 // TranslateJSON asks the model for a pure translation (JSON mode, low
@@ -271,26 +258,64 @@ func (c *Client) GenerateJSON(ctx context.Context, messages []Message, maxTokens
 // per question; the result is cached in the database and reused by every
 // user, so this entry point is expected to be called rarely.
 func (c *Client) TranslateJSON(ctx context.Context, messages []Message, maxTokens int) (string, error) {
-	raw, err := c.call(ctx, c.reasonerModel, messages, 0, maxTokens, true, ThinkingEffortLow)
-	if err != nil && !c.thinkingDisabled() && isParamError(err) {
-		log.Printf("deepseek: thinking params rejected on translate (%v) — retrying without them", err)
+	return c.jsonWithFallback(ctx, "translate", messages, maxTokens, ThinkingEffortLow, 0.3)
+}
+
+// jsonWithFallback runs the provider route shared by GenerateJSON and
+// TranslateJSON:
+//
+//  1. thinking mode on the reasoner model — skipped entirely once the model
+//     has explicitly rejected the thinking parameters (no wasted 400 call);
+//  2. the same reasoner model WITHOUT thinking parameters — only after an
+//     explicit thinking-parameter rejection (the flag is set only then);
+//  3. the pricier non-thinking fallback (c.model) — ONLY when the reasoner
+//     rejected the request parameters. Timeouts, 5xx, truncated replies and
+//     context-length errors are returned as is: the job retries later
+//     instead of silently paying ~3x for v4-pro.
+func (c *Client) jsonWithFallback(ctx context.Context, op string, messages []Message, maxTokens int, effort string, fallbackTemp float64) (string, error) {
+	if !c.thinkingDisabled() {
+		raw, err := c.call(ctx, c.reasonerModel, messages, 0, maxTokens, true, effort)
+		if err == nil || !isThinkingParamError(err) {
+			return raw, err
+		}
+		log.Printf("deepseek: thinking params rejected on %s (%v) — retrying without them", op, err)
 		c.setThinkingUnsupported()
-		raw, err = c.call(ctx, c.reasonerModel, messages, 0, maxTokens, true, "")
 	}
-	if err != nil && c.thinkingDisabled() {
-		log.Printf("deepseek: %s failed on translate (%v) — falling back to %s (non-thinking)", c.reasonerModel, err, c.model)
-		raw, err = c.call(ctx, c.model, messages, 0.3, maxTokens, true, "")
+	raw, err := c.call(ctx, c.reasonerModel, messages, 0, maxTokens, true, "")
+	if err != nil && isParamError(err) {
+		// The reasoner rejects the request itself — last resort: the
+		// non-thinking fallback model (deepseek-v4-pro — strong, but
+		// pricier; it must never become the default).
+		log.Printf("deepseek: %s rejected %s request (%v) — falling back to %s (non-thinking)", c.reasonerModel, op, err, c.model)
+		raw, err = c.call(ctx, c.model, messages, fallbackTemp, maxTokens, true, "")
 	}
 	return raw, err
 }
 
+// isThinkingParamError reports an explicit rejection of the thinking-mode
+// knobs (the error text names "thinking" or "reasoning_effort"). Any other
+// 400 (too long context, bad JSON, …) must NOT disable thinking forever.
+func isThinkingParamError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "thinking") || strings.Contains(s, "reasoning_effort")
+}
+
 // isParamError reports whether the API rejected request parameters (HTTP 400
-// class) rather than failing for a transient reason.
+// class) rather than failing for a transient reason. Context-length errors
+// are excluded — a different model would not help with them.
 func isParamError(err error) bool {
 	if err == nil {
 		return false
 	}
 	s := err.Error()
+	ls := strings.ToLower(s)
+	if strings.Contains(ls, "context length") || strings.Contains(ls, "context_length") ||
+		strings.Contains(ls, "maximum context") || strings.Contains(ls, "too long") {
+		return false
+	}
 	return strings.Contains(s, "HTTP 400") ||
 		strings.Contains(s, "invalid_request") ||
 		strings.Contains(s, "unknown field") ||

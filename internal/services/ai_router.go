@@ -29,6 +29,44 @@ import (
 type aiStep struct {
 	name string // for logs, e.g. "groq/openai/gpt-oss-120b(medium)"
 	run  func(ctx context.Context) (string, error)
+	// timeout bounds this single step (0 = only the parent context).
+	timeout time.Duration
+	// reserve is the time this (paid) step needs to run. Every EARLIER step
+	// is cut so that at least `reserve` of the parent deadline is left for
+	// it — the free Groq steps can never eat the time of the paid DeepSeek
+	// fallback (or of the repair that follows the generation).
+	reserve time.Duration
+}
+
+// groqStepTimeout bounds one Groq step: the local rate-limiter wait
+// (MaxWait) plus the HTTP request itself.
+const groqStepTimeout = 150 * time.Second
+
+// stepContext derives the context of step i: its own timeout, further cut
+// so that the largest reserve of the later steps stays available. ok=false
+// means there is no time left for this step at all (it is skipped).
+func stepContext(ctx context.Context, steps []aiStep, i int) (context.Context, context.CancelFunc, bool) {
+	var reserve time.Duration
+	for _, later := range steps[i+1:] {
+		if later.reserve > reserve {
+			reserve = later.reserve
+		}
+	}
+	timeout := steps[i].timeout
+	if dl, has := ctx.Deadline(); has && reserve > 0 {
+		left := time.Until(dl) - reserve
+		if left <= 0 {
+			return ctx, func() {}, false
+		}
+		if timeout == 0 || left < timeout {
+			timeout = left
+		}
+	}
+	if timeout <= 0 {
+		return ctx, func() {}, true
+	}
+	sctx, cancel := context.WithTimeout(ctx, timeout)
+	return sctx, cancel, true
 }
 
 // runSteps executes steps in order until validate accepts a reply. It
@@ -36,13 +74,20 @@ type aiStep struct {
 // Errors of every failed step are joined into the final error.
 func runSteps(ctx context.Context, task string, steps []aiStep, validate func(raw string) error) (string, string, error) {
 	var errs []error
-	for _, st := range steps {
+	for i, st := range steps {
 		if ctx.Err() != nil {
 			errs = append(errs, ctx.Err())
 			break
 		}
+		sctx, cancel, ok := stepContext(ctx, steps, i)
+		if !ok {
+			log.Printf("ai[%s]: %s skipped — time is reserved for the next provider", task, st.name)
+			errs = append(errs, fmt.Errorf("%s: skipped (time reserved for fallback)", st.name))
+			continue
+		}
 		started := time.Now()
-		raw, err := st.run(ctx)
+		raw, err := st.run(sctx)
+		cancel()
 		if err == nil {
 			err = validate(raw)
 			if err != nil {
@@ -81,7 +126,7 @@ func groqStep(gc *groq.Client, req groq.Request) aiStep {
 	if req.Effort != "" {
 		name += "(" + req.Effort + ")"
 	}
-	return aiStep{name: name, run: func(ctx context.Context) (string, error) {
+	return aiStep{name: name, timeout: groqStepTimeout, run: func(ctx context.Context) (string, error) {
 		res, err := gc.ChatJSON(ctx, req)
 		if err != nil {
 			return "", err

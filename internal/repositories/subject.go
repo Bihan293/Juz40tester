@@ -276,7 +276,9 @@ func (r *SubjectRepository) SubjectProgress(ctx context.Context, userID, subject
 // subject they have unlocked. A test counts as unlocked for a user when it
 // is test 1 or when the previous test of the chain reached the unlock bar
 // (UnlockGreen 🟢 + UnlockYellow 🟡). Only tests that already exist are
-// considered, so the board never counts phantom slots.
+// considered, so the board never counts phantom slots. Tests up to the
+// user's permanent unlock watermark (last_test_number + 1) count as
+// unlocked too — exactly like QuizService.unlockedMax.
 func (r *SubjectRepository) UnlockedTestsLeaderboard(ctx context.Context, subjectID int64, limit int) ([]models.LeaderboardEntry, error) {
 	rows, err := r.pool.Query(ctx, `
 		WITH chain AS (
@@ -294,7 +296,9 @@ func (r *SubjectRepository) UnlockedTestsLeaderboard(ctx context.Context, subjec
 		),
 		unlocked AS (
 			SELECT p.user_id, c.test_number,
-			       (c.test_number = 1) OR EXISTS (
+			       (c.test_number = 1)
+			       OR c.test_number <= COALESCE(uss.last_test_number, 0) + 1
+			       OR EXISTS (
 			           SELECT 1 FROM chain pc
 			           JOIN prog pp ON pp.test_id = pc.id AND pp.user_id = p.user_id
 			           WHERE pc.test_number = c.test_number - 1
@@ -302,6 +306,8 @@ func (r *SubjectRepository) UnlockedTestsLeaderboard(ctx context.Context, subjec
 			       ) AS is_unlocked
 			FROM prog p
 			JOIN chain c ON c.id = p.test_id
+			LEFT JOIN user_subject_state uss
+			       ON uss.user_id = p.user_id AND uss.subject_id = $1
 		)
 		SELECT u.id, u.first_name, u.username, `+liveStreakSQL("$5")+`,
 		       COUNT(*) FILTER (WHERE un.is_unlocked) AS unlocked_tests

@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Bihan293/Juz40tester/internal/models"
@@ -23,6 +25,10 @@ type AnswerResult struct {
 	NewStatus       int // knowledge status of the question after this answer (0=🔴,1=🟡,2=🟢)
 }
 
+// ErrAnswerOutOfOrder: the answered position is not the first unanswered
+// question of the attempt (stale callback, forged client, race).
+var ErrAnswerOutOfOrder = errors.New("answer is not for the current question")
+
 // AttemptRepository manages test attempts, answers and knowledge progress.
 type AttemptRepository struct {
 	pool *pgxpool.Pool
@@ -34,16 +40,64 @@ func NewAttemptRepository(pool *pgxpool.Pool) *AttemptRepository {
 
 // CreateAttempt atomically creates a new attempt with shuffled questions and
 // shuffled answer options for every question.
-func (r *AttemptRepository) CreateAttempt(ctx context.Context, userID, testID int64, questionIDs []int64, optionOrders [][]string) (*models.TestAttempt, error) {
+//
+// At most ONE in-progress attempt per (user, test) exists (unique partial
+// index idx_attempts_in_progress_unique):
+//   - replace = false (opening a test): an already open attempt is returned
+//     as is — a double tap never creates a second attempt;
+//   - replace = true («🔄 Пройти ещё раз»): the open attempt (if any) is
+//     closed as 'abandoned' in the same transaction, then the new one is
+//     inserted.
+//
+// A concurrent creation that loses the race on the unique index gets the
+// winner's attempt instead of an error.
+func (r *AttemptRepository) CreateAttempt(ctx context.Context, userID, testID int64, questionIDs []int64, optionOrders [][]string, replace bool) (*models.TestAttempt, error) {
 	if len(questionIDs) != len(optionOrders) {
 		return nil, errors.New("questions and option orders length mismatch")
 	}
+	a, err := r.createAttemptTx(ctx, userID, testID, questionIDs, optionOrders, replace)
+	if isUniqueViolation(err) {
+		existing, gerr := r.GetActiveAttempt(ctx, userID, testID)
+		if gerr != nil {
+			return nil, gerr
+		}
+		if existing != nil {
+			return existing, nil
+		}
+	}
+	return a, err
+}
 
+func (r *AttemptRepository) createAttemptTx(ctx context.Context, userID, testID int64, questionIDs []int64, optionOrders [][]string, replace bool) (*models.TestAttempt, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+
+	if replace {
+		if _, err := tx.Exec(ctx, `
+			UPDATE test_attempts SET status = 'abandoned', updated_at = now()
+			WHERE user_id = $1 AND test_id = $2 AND status = 'in_progress'`, userID, testID); err != nil {
+			return nil, err
+		}
+	} else {
+		var a models.TestAttempt
+		err := tx.QueryRow(ctx, `
+			SELECT id, user_id, test_id, status, current_position, correct_count, wrong_count, started_at, completed_at
+			FROM test_attempts
+			WHERE user_id = $1 AND test_id = $2 AND status = 'in_progress'
+			ORDER BY id DESC
+			LIMIT 1`, userID, testID).
+			Scan(&a.ID, &a.UserID, &a.TestID, &a.Status, &a.CurrentPosition,
+				&a.CorrectCount, &a.WrongCount, &a.StartedAt, &a.CompletedAt)
+		if err == nil {
+			return &a, tx.Commit(ctx)
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return nil, err
+		}
+	}
 
 	var a models.TestAttempt
 	if err := tx.QueryRow(ctx, `
@@ -72,6 +126,25 @@ func (r *AttemptRepository) CreateAttempt(ctx context.Context, userID, testID in
 		return nil, err
 	}
 	return &a, nil
+}
+
+// isUniqueViolation reports a PostgreSQL unique_violation (SQLSTATE 23505).
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+// AbandonStaleAttempts closes in-progress attempts that were not touched
+// for olderThan (the user left the test and never came back). Such attempts
+// would otherwise keep their questions "busy" for the quality sweep forever.
+func (r *AttemptRepository) AbandonStaleAttempts(ctx context.Context, olderThan time.Duration) (int64, error) {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE test_attempts SET status = 'abandoned', updated_at = now()
+		WHERE status = 'in_progress' AND updated_at < now() - $1::interval`, olderThan.String())
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 // GetActiveAttempt returns the user's in-progress attempt for a test, or nil.
@@ -244,6 +317,19 @@ func (r *AttemptRepository) SubmitAnswer(ctx context.Context, userID, attemptID 
 		return &AnswerResult{AlreadyAnswered: true}, nil
 	}
 
+	// 3b. Only the CURRENT question (the lowest unanswered position) may be
+	// answered — a stale/forged callback for a later position must neither
+	// skip questions nor finish the attempt early.
+	var minUnanswered int
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(MIN(position), 0) FROM attempt_questions
+		WHERE attempt_id = $1 AND NOT answered`, attemptID).Scan(&minUnanswered); err != nil {
+		return nil, err
+	}
+	if position != minUnanswered {
+		return nil, ErrAnswerOutOfOrder
+	}
+
 	// 4. Load the question and evaluate the answer.
 	q := &models.Question{}
 	if err := tx.QueryRow(ctx, `
@@ -314,12 +400,15 @@ func (r *AttemptRepository) SubmitAnswer(ctx context.Context, userID, attemptID 
 	}
 
 	// 7. Advance the attempt counters and position.
-	var total int
-	if err := tx.QueryRow(ctx,
-		`SELECT COUNT(*) FROM attempt_questions WHERE attempt_id = $1`, attemptID).Scan(&total); err != nil {
+	// The attempt is finished only when NO unanswered question is left
+	// (not merely because the answered position is the last one).
+	var finished bool
+	if err := tx.QueryRow(ctx, `
+		SELECT NOT EXISTS (
+			SELECT 1 FROM attempt_questions WHERE attempt_id = $1 AND NOT answered
+		)`, attemptID).Scan(&finished); err != nil {
 		return nil, err
 	}
-	finished := position >= total
 
 	err = tx.QueryRow(ctx, `
 		UPDATE test_attempts
@@ -327,7 +416,8 @@ func (r *AttemptRepository) SubmitAnswer(ctx context.Context, userID, attemptID 
 		    wrong_count   = wrong_count   + $4,
 		    current_position = $5,
 		    status = CASE WHEN $6 THEN 'completed' ELSE status END,
-		    completed_at = CASE WHEN $6 THEN now() ELSE completed_at END
+		    completed_at = CASE WHEN $6 THEN now() ELSE completed_at END,
+		    updated_at = now()
 		WHERE id = $1 AND user_id = $2
 		RETURNING id, user_id, test_id, status, current_position, correct_count, wrong_count, started_at, completed_at`,
 		attemptID, userID, correctInc, wrongInc, position, finished).

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Bihan293/Juz40tester/internal/deepseek"
 	"github.com/Bihan293/Juz40tester/internal/groq"
@@ -165,4 +166,29 @@ func stepNames(steps []aiStep) string {
 		names[i] = s.name
 	}
 	return strings.Join(names, ",")
+}
+
+// TestStepContextReservesTimeForPaidStep: earlier (free) steps are cut so
+// the reserve of a later paid step stays available.
+func TestStepContextReservesTimeForPaidStep(t *testing.T) {
+	steps := []aiStep{
+		{name: "free", timeout: time.Hour},
+		{name: "paid", reserve: 4 * time.Minute},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	sctx, scancel, ok := stepContext(ctx, steps, 0)
+	defer scancel()
+	if !ok {
+		t.Fatal("free step must run when time is left")
+	}
+	dl, _ := sctx.Deadline()
+	if left := time.Until(dl); left > time.Minute+time.Second {
+		t.Fatalf("free step must leave the reserve: got %v", left)
+	}
+	short, c2 := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer c2()
+	if _, _, ok := stepContext(short, steps, 0); ok {
+		t.Fatal("free step must be skipped when only the reserve is left")
+	}
 }
