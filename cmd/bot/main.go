@@ -13,15 +13,13 @@ package main
 
 import (
 	"context"
-	"crypto/subtle"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -45,13 +43,24 @@ func main() {
 
 	ctx := context.Background()
 
-	pool, err := database.Connect(ctx, cfg.DatabaseURL)
+	// Bounded pool (audit #20): the pgx default is max(4, NumCPU); together
+	// with the bounded update concurrency below this keeps the instance
+	// inside the Neon connection cap.
+	pool, err := database.ConnectPool(ctx, cfg.DatabaseURL, int32(cfg.DBMaxConns))
 	if err != nil {
 		log.Fatalf("database: %v", err)
 	}
 	defer pool.Close()
 
-	if err := database.Migrate(ctx, pool); err != nil {
+	// Migrations are serialised by a SESSION-level advisory lock, which is
+	// unreliable behind a transaction-mode pooler (audit #21): they run over
+	// a separate DIRECT connection (MIGRATION_DATABASE_URL, or DATABASE_URL
+	// with the Neon "-pooler" host rewritten to the direct endpoint).
+	migURL := cfg.MigrationDatabaseURL
+	if migURL == "" {
+		migURL = database.DirectURL(cfg.DatabaseURL)
+	}
+	if err := database.MigrateURL(ctx, migURL); err != nil {
 		log.Fatalf("migrations: %v", err)
 	}
 	log.Println("migrations applied")
@@ -63,12 +72,6 @@ func main() {
 	stateRepo := repositories.NewStateRepository(pool)
 	genRepo := repositories.NewGenerationRepository(pool)
 	translationRepo := repositories.NewTranslationRepository(pool)
-
-	// One-off: build the per-topic statistics (source of weak topics) from
-	// the answer history stored before they existed. No-op once done.
-	if err := genRepo.BackfillTopicStats(ctx); err != nil {
-		log.Printf("topic stats backfill: %v", err)
-	}
 
 	// DeepSeek AI test generation. Optional: without DEEPSEEK_API_KEY the bot
 	// still works with the seeded tests, AI generation is simply disabled.
@@ -119,13 +122,18 @@ func main() {
 	// Background worker: processes the AI test-generation queue (thinking
 	// model with adaptive effort, off-peak deferral, cost logging). No-op
 	// without an API key.
+	// On shutdown workerCtx is cancelled: a running job is handed back to
+	// the queue (pending, attempts unchanged) and the background loops are
+	// awaited (bgWG) before the pool is closed.
 	workerCtx, stopWorker := context.WithCancel(context.Background())
 	defer stopWorker()
-	go genSvc.RunWorker(workerCtx)
+	var bgWG sync.WaitGroup
+	bgWG.Add(2)
+	go func() { defer bgWG.Done(); genSvc.RunWorker(workerCtx) }()
 	// Stale-attempt reaper: attempts left unfinished for staleAttemptAge
 	// are closed as abandoned (they would otherwise keep their questions
 	// "busy" for the quality sweep forever).
-	go reapStaleAttempts(workerCtx, attemptRepo)
+	go func() { defer bgWG.Done(); reapStaleAttempts(workerCtx, attemptRepo) }()
 
 	// Bootstrap the AI chain: queue the generation of Тест 1 right away for
 	// EVERY subject whose chain is still empty — otherwise a fresh database
@@ -157,15 +165,12 @@ func main() {
 		}
 	}
 
-	// Register webhook (WEBHOOK_URL is the public base URL of this service).
 	webhookEndpoint := cfg.WebhookURL + "/telegram/webhook"
 	if cfg.WebhookSecret == "" {
-		log.Println("webhook: WEBHOOK_SECRET not set — incoming updates are NOT authenticated (set it in production)")
+		// Only reachable with APP_ENV=development (config.Load refuses a
+		// production start without the secret).
+		log.Println("webhook: WEBHOOK_SECRET not set — incoming updates are NOT authenticated (development mode)")
 	}
-	if err := tg.SetWebhook(ctx, webhookEndpoint, cfg.WebhookSecret); err != nil {
-		log.Fatalf("set webhook: %v", err)
-	}
-	log.Printf("webhook set: %s", webhookEndpoint)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
@@ -186,35 +191,11 @@ func main() {
 	// Self-ping: free hosting tiers (Render) suspend an idle service, which
 	// also freezes the background generation worker. A lightweight loop pings
 	// our own /ping endpoint to keep the instance awake. Silent on purpose.
-	go selfPing(context.Background(), cfg.WebhookURL+"/ping")
-	mux.HandleFunc("POST /telegram/webhook", func(w http.ResponseWriter, r *http.Request) {
-		if cfg.WebhookSecret != "" &&
-			subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Telegram-Bot-Api-Secret-Token")), []byte(cfg.WebhookSecret)) != 1 {
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
-		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-		if err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
-			return
-		}
-		var upd bot.Update
-		if err := json.Unmarshal(body, &upd); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
-			return
-		}
-		// Respond to Telegram immediately, process asynchronously.
-		w.WriteHeader(http.StatusOK)
-		// Detach from the request context so processing survives the response.
-		// A timeout guards against a hung provider/DB call leaking the
-		// goroutine forever (translation of a test may legitimately take a
-		// minute or two, hence the generous bound).
-		go func() {
-			uctx, cancel := context.WithTimeout(context.Background(), updateTimeout)
-			defer cancel()
-			h.HandleUpdate(uctx, &upd)
-		}()
-	})
+	go selfPing(workerCtx, cfg.WebhookURL+"/ping")
+
+	// Updates: bounded concurrency + tracked for graceful shutdown.
+	updates := newUpdateDispatcher(cfg.WebhookSecret, maxConcurrentUpdates, updateTimeout, h.HandleUpdate)
+	mux.Handle("POST /telegram/webhook", updates)
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,
@@ -229,15 +210,69 @@ func main() {
 		}
 	}()
 
+	// Register the webhook AFTER the server is up, retrying temporary
+	// Telegram/network failures instead of log.Fatalf (audit #22: a short
+	// Telegram outage used to crash-loop the service).
+	go func() {
+		err := setWebhookWithRetry(workerCtx, func(c context.Context) error {
+			return tg.SetWebhook(c, webhookEndpoint, cfg.WebhookSecret)
+		}, 2*time.Second, time.Minute)
+		if err == nil {
+			log.Printf("webhook set: %s", webhookEndpoint)
+		}
+	}()
+
+	// One-off: build the per-topic statistics (source of weak topics) from
+	// the answer history stored before they existed. Runs in the background
+	// after the HTTP server is up so a large history never delays startup /
+	// the Render health check (audit #24). No-op once done.
+	bgWG.Add(1)
+	go func() {
+		defer bgWG.Done()
+		if err := genRepo.BackfillTopicStats(workerCtx); err != nil {
+			log.Printf("topic stats backfill: %v", err)
+		}
+	}()
+
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
 
 	log.Println("shutting down...")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
+	// 1. Stop the worker first: a running generation is interrupted and
+	//    handed back to 'pending' (attempts unchanged) right away, so the
+	//    new instance can pick it up without waiting for the stuck-job reaper.
+	stopWorker()
+	// 2. Stop accepting HTTP requests (in-flight webhook calls finish).
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("shutdown: %v", err)
+		log.Printf("shutdown: http: %v", err)
+	}
+	// 3. Wait for acknowledged updates that are still being processed.
+	if err := updates.Shutdown(shutdownCtx); err != nil {
+		log.Printf("shutdown: some updates did not finish in time: %v", err)
+	}
+	// 4. Wait for the background loops before the DB pool is closed.
+	waitTimeout(&bgWG, 5*time.Second)
+	log.Println("shutdown complete")
+}
+
+// maxConcurrentUpdates bounds simultaneously processed Telegram updates.
+const maxConcurrentUpdates = 32
+
+// shutdownTimeout bounds the graceful wait for HTTP + in-flight updates
+// (Render sends SIGKILL ~30 s after SIGTERM).
+const shutdownTimeout = 20 * time.Second
+
+// waitTimeout waits for wg at most d.
+func waitTimeout(wg *sync.WaitGroup, d time.Duration) {
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(d):
+		log.Printf("shutdown: background tasks did not stop within %s", d)
 	}
 }
 

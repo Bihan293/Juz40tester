@@ -140,7 +140,7 @@ func isUniqueViolation(err error) bool {
 func (r *AttemptRepository) AbandonStaleAttempts(ctx context.Context, olderThan time.Duration) (int64, error) {
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE test_attempts SET status = 'abandoned', updated_at = now()
-		WHERE status = 'in_progress' AND updated_at < now() - $1::interval`, olderThan.String())
+		WHERE status = 'in_progress' AND updated_at < now() - make_interval(secs => $1)`, durationSecs(olderThan))
 	if err != nil {
 		return 0, err
 	}

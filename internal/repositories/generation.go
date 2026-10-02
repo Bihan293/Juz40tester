@@ -304,23 +304,41 @@ func (r *GenerationRepository) DeletePersonalTest(ctx context.Context, userID, t
 		return tx.Commit(ctx)
 	}
 
+	// Collect the questions of THIS test before the test row (and with it,
+	// via ON DELETE CASCADE, its test_questions links) goes away. Only these
+	// questions may become orphans — the old full-table
+	// «DELETE FROM questions WHERE NOT EXISTS (test_questions)» scanned every
+	// question of the database on each finished personal test.
+	var qids []int64
+	rows, err := tx.Query(ctx, `SELECT question_id FROM test_questions WHERE test_id = $1`, testID)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		qids = append(qids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `DELETE FROM tests WHERE id = $1`, testID); err != nil {
 		return err
 	}
-	// Orphaned questions of the deleted test (not referenced by any other
-	// test) go away together with their progress rows.
-	if _, err := tx.Exec(ctx, `
-		DELETE FROM user_question_progress
-		WHERE question_id IN (
-		    SELECT q.id FROM questions q
-		    WHERE NOT EXISTS (SELECT 1 FROM test_questions tq WHERE tq.question_id = q.id)
-		)`); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(ctx, `
-		DELETE FROM questions
-		WHERE NOT EXISTS (SELECT 1 FROM test_questions tq WHERE tq.question_id = questions.id)`); err != nil {
-		return err
+	if len(qids) > 0 {
+		// Questions of the deleted test that no other test references go
+		// away; their progress / attempt rows cascade. Questions still linked
+		// to another test are left untouched.
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM questions q
+			WHERE q.id = ANY($1::bigint[])
+			  AND NOT EXISTS (SELECT 1 FROM test_questions tq WHERE tq.question_id = q.id)`, qids); err != nil {
+			return err
+		}
 	}
 	return tx.Commit(ctx)
 }
@@ -465,20 +483,94 @@ func (r *GenerationRepository) TouchRunningJob(ctx context.Context, jobID int64)
 // for longer than stuckFor back to 'pending'. A job stays 'running' forever
 // when the worker crashes mid-generation (deploy, OOM, restart) — without
 // this reaper the affected tests would hang in ⏳ «Минуточку...» for good.
-// The re-queued job is marked URGENT (not_before = now()): the worker only
-// abandons jobs it was actively processing, so the job is by definition
-// already wanted; leaving the old deferral would send a recovered job to
-// the BACK of the off-peak queue instead of the head.
-func (r *GenerationRepository) ResetStuckRunningJobs(ctx context.Context, stuckFor time.Duration) (int64, error) {
-	tag, err := r.pool.Exec(ctx, `
+//
+// A job that already used maxAttempts attempts is parked as 'failed'
+// instead: if that very job is what kills the process (OOM, panic in a
+// dependency), re-queuing it forever would crash-loop the worker. Its
+// urgency is kept as is — a deferred (off-peak) job is not promoted to
+// urgent just because a worker died; not_before = now() only because the
+// job was already due when it was claimed. Returns how many jobs were
+// re-queued (pending) and parked (failed).
+func (r *GenerationRepository) ResetStuckRunningJobs(ctx context.Context, stuckFor time.Duration, maxAttempts int) (requeued, failed int64, err error) {
+	rows, err := r.pool.Query(ctx, `
 		UPDATE generation_jobs
-		SET status = 'pending', urgent = TRUE, not_before = now(), updated_at = now()
-		WHERE status = 'running' AND updated_at < now() - $1::interval`,
-		stuckFor.String())
+		SET status     = CASE WHEN attempts >= $2 THEN 'failed' ELSE 'pending' END,
+		    last_error = CASE WHEN attempts >= $2 THEN 'stuck in running: attempts exhausted' ELSE last_error END,
+		    not_before = CASE WHEN attempts >= $2 THEN not_before ELSE now() END,
+		    updated_at = now()
+		WHERE status = 'running' AND updated_at < now() - make_interval(secs => $1)
+		RETURNING status`,
+		durationSecs(stuckFor), maxAttempts)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	return tag.RowsAffected(), nil
+	defer rows.Close()
+	for rows.Next() {
+		var st string
+		if err := rows.Scan(&st); err != nil {
+			return 0, 0, err
+		}
+		if st == "failed" {
+			failed++
+		} else {
+			requeued++
+		}
+	}
+	return requeued, failed, rows.Err()
+}
+
+// ReleaseJob hands a 'running' job back to the queue WITHOUT counting the
+// interrupted run as an attempt: the worker is shutting down (deploy,
+// SIGTERM), the job did not fail. status = 'pending', not_before = now(),
+// attempts is restored to its value before the claim (ClaimNextJob
+// increments it). Without this the job sat in 'running' until the
+// stuck-job reaper picked it up (up to stuckJobTimeout later).
+func (r *GenerationRepository) ReleaseJob(ctx context.Context, jobID int64) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE generation_jobs
+		SET status = 'pending', not_before = now(),
+		    attempts = GREATEST(attempts - 1, 0), updated_at = now()
+		WHERE id = $1 AND status = 'running'`, jobID)
+	return err
+}
+
+// durationSecs converts a duration to whole seconds for make_interval
+// (instead of passing Go's "10m0s" text as ::interval — it happens to parse,
+// but is fragile).
+func durationSecs(d time.Duration) int {
+	return int(d.Seconds())
+}
+
+// qualitySweepLockKey is the advisory-lock key that keeps the quality sweep
+// on ONE instance at a time (zero-downtime deploys run two instances).
+const qualitySweepLockKey int64 = 0x6a757a3430737770 // "juz40swp"
+
+// TryExclusive runs fn only when the cluster-wide advisory lock `key` is
+// free; otherwise it returns ran = false immediately (another instance holds
+// it). A transaction-level lock (pg_try_advisory_xact_lock) is used, so it
+// is also correct behind a transaction-mode pooler (Neon -pooler /
+// PgBouncer): the lock lives exactly as long as the transaction that pins
+// one server connection. The transaction does no other work, so it holds no
+// snapshot between statements.
+func (r *GenerationRepository) TryExclusive(ctx context.Context, key int64, fn func(context.Context) error) (ran bool, err error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	var got bool
+	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock($1)`, key).Scan(&got); err != nil {
+		return false, err
+	}
+	if !got {
+		return false, nil
+	}
+	return true, fn(ctx)
+}
+
+// TryQualitySweepLock is TryExclusive with the quality-sweep key.
+func (r *GenerationRepository) TryQualitySweepLock(ctx context.Context, fn func(context.Context) error) (bool, error) {
+	return r.TryExclusive(ctx, qualitySweepLockKey, fn)
 }
 
 // HasPendingOrRunningChainJob reports whether an active (pending/running)
@@ -569,10 +661,10 @@ func (r *GenerationRepository) FailJob(ctx context.Context, jobID int64, jobErr 
 		UPDATE generation_jobs
 		SET status = CASE WHEN attempts >= $2 THEN 'failed' ELSE 'pending' END,
 		    last_error = $3,
-		    not_before = CASE WHEN attempts >= $2 THEN not_before ELSE now() + $4::interval END,
+		    not_before = CASE WHEN attempts >= $2 THEN not_before ELSE now() + make_interval(secs => $4) END,
 		    updated_at = now()
 		WHERE id = $1`,
-		jobID, maxAttempts, fmt.Sprintf("%v", jobErr), retryDelay.String())
+		jobID, maxAttempts, fmt.Sprintf("%v", jobErr), durationSecs(retryDelay))
 	return err
 }
 
@@ -806,8 +898,8 @@ func (r *GenerationRepository) IsQuestionBusy(ctx context.Context, id int64) (bo
 // given delay (no AI call is made for it until then).
 func (r *GenerationRepository) PostponeQualityCheck(ctx context.Context, id int64, delay time.Duration) error {
 	_, err := r.pool.Exec(ctx, `
-		UPDATE questions SET quality_postponed_until = now() + $2::interval
-		WHERE id = $1`, id, delay.String())
+		UPDATE questions SET quality_postponed_until = now() + make_interval(secs => $2)
+		WHERE id = $1`, id, durationSecs(delay))
 	return err
 }
 

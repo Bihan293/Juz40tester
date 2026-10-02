@@ -81,11 +81,65 @@ func TestWebhookURLTrimsTrailingSlash(t *testing.T) {
 	t.Setenv("BOT_TOKEN", "x")
 	t.Setenv("DATABASE_URL", "postgres://x")
 	t.Setenv("WEBHOOK_URL", "https://example.onrender.com/")
+	t.Setenv("WEBHOOK_SECRET", "s3cret")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	if cfg.WebhookURL != "https://example.onrender.com" {
 		t.Fatalf("trailing slash must be trimmed, got %q", cfg.WebhookURL)
+	}
+}
+
+// TestWebhookSecretRequiredInProduction (audit #28): a production webhook
+// without WEBHOOK_SECRET must refuse to start; development may run without.
+func TestWebhookSecretRequiredInProduction(t *testing.T) {
+	t.Setenv("BOT_TOKEN", "x")
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("WEBHOOK_URL", "https://example.onrender.com")
+	t.Setenv("WEBHOOK_SECRET", "")
+
+	t.Setenv("APP_ENV", "")
+	if _, err := Load(); err == nil {
+		t.Fatal("production (default) without WEBHOOK_SECRET must fail")
+	}
+	t.Setenv("APP_ENV", "production")
+	if _, err := Load(); err == nil {
+		t.Fatal("APP_ENV=production without WEBHOOK_SECRET must fail")
+	}
+	t.Setenv("APP_ENV", "development")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("development must start without a secret: %v", err)
+	}
+	if cfg.Production {
+		t.Fatal("APP_ENV=development must not be production")
+	}
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("WEBHOOK_SECRET", "s3cret")
+	if _, err := Load(); err != nil {
+		t.Fatalf("production with a secret must start: %v", err)
+	}
+}
+
+// TestDBMaxConns (audit #20): the pool size is bounded by default and
+// overridable.
+func TestDBMaxConns(t *testing.T) {
+	t.Setenv("BOT_TOKEN", "x")
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("WEBHOOK_URL", "https://example.onrender.com")
+	t.Setenv("WEBHOOK_SECRET", "s")
+	t.Setenv("DB_MAX_CONNS", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DBMaxConns != defaultDBMaxConns {
+		t.Fatalf("default DBMaxConns = %d", cfg.DBMaxConns)
+	}
+	t.Setenv("DB_MAX_CONNS", "7")
+	cfg, _ = Load()
+	if cfg.DBMaxConns != 7 {
+		t.Fatalf("DB_MAX_CONNS override = %d", cfg.DBMaxConns)
 	}
 }

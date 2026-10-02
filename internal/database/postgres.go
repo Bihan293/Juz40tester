@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -14,9 +15,24 @@ import (
 	"github.com/Bihan293/Juz40tester/migrations"
 )
 
-// Connect creates a pgx connection pool and verifies connectivity.
+// Connect creates a pgx connection pool with the pgx default size and
+// verifies connectivity (used by tests and tools).
 func Connect(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
-	pool, err := pgxpool.New(ctx, databaseURL)
+	return ConnectPool(ctx, databaseURL, 0)
+}
+
+// ConnectPool creates a pgx connection pool bounded by maxConns (0 = keep
+// the URL's pool_max_conns / the pgx default) and verifies connectivity.
+// An explicit pool_max_conns in the URL always wins over maxConns.
+func ConnectPool(ctx context.Context, databaseURL string, maxConns int32) (*pgxpool.Pool, error) {
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse database url: %w", err)
+	}
+	if maxConns > 0 && !strings.Contains(databaseURL, "pool_max_conns") {
+		cfg.MaxConns = maxConns
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create pool: %w", err)
 	}
@@ -27,6 +43,45 @@ func Connect(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 	}
 
 	return pool, nil
+}
+
+// DirectURL returns a connection string that bypasses a Neon connection
+// pooler: the "-pooler" suffix of the first host label is removed
+// (ep-xxx-pooler.region.aws.neon.tech -> ep-xxx.region.aws.neon.tech).
+// Other URLs are returned unchanged. Session-level advisory locks (the
+// migration lock) are only reliable on a direct connection: behind a
+// transaction-mode pooler pg_advisory_lock and pg_advisory_unlock may run on
+// different server connections.
+func DirectURL(databaseURL string) string {
+	u, err := url.Parse(databaseURL)
+	if err != nil || u.Host == "" {
+		return databaseURL
+	}
+	host := u.Hostname()
+	label, rest, _ := strings.Cut(host, ".")
+	if !strings.HasSuffix(label, "-pooler") {
+		return databaseURL
+	}
+	newHost := strings.TrimSuffix(label, "-pooler")
+	if rest != "" {
+		newHost += "." + rest
+	}
+	if p := u.Port(); p != "" {
+		newHost += ":" + p
+	}
+	u.Host = newHost
+	return u.String()
+}
+
+// MigrateURL runs the migrations over a dedicated, short-lived DIRECT
+// connection (see DirectURL) and closes it afterwards.
+func MigrateURL(ctx context.Context, databaseURL string) error {
+	pool, err := ConnectPool(ctx, databaseURL, 2)
+	if err != nil {
+		return fmt.Errorf("migration connection: %w", err)
+	}
+	defer pool.Close()
+	return Migrate(ctx, pool)
 }
 
 // migrationLockKey is the pg_advisory_lock key that serializes migrations
