@@ -217,8 +217,12 @@ func TestQualitySweepRepository(t *testing.T) {
 		t.Fatalf("rewrite not applied: %+v", q)
 	}
 	st, err := subjects.QuestionStatuses(ctx, user.ID, []int64{bad.ID})
-	if err != nil || st[bad.ID] != models.StatusPartial {
-		t.Fatalf("progress lost after rewrite: %v %v", st, err)
+	// A rewritten question is a NEW question: the old 🟢/🟡 must be reset.
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s, ok := st[bad.ID]; ok && s != models.StatusNone {
+		t.Fatalf("stale progress kept after rewrite: %v", st)
 	}
 
 	// Mark/attempt bookkeeping.
@@ -379,5 +383,77 @@ func TestAttemptGuards(t *testing.T) {
 	_ = pool.QueryRow(ctx, `SELECT status FROM test_attempts WHERE id=$1`, a3.ID).Scan(&st)
 	if st != models.AttemptAbandoned {
 		t.Fatalf("stale attempt must be abandoned, got %s", st)
+	}
+}
+
+// TestReviveChainJobOrphanedAndDuplicates covers audit #11/#12: a 'done'
+// job whose test is gone must be released and revived; several failed rows
+// must be revived one at a time without a unique-index violation.
+func TestReviveChainJobOrphanedAndDuplicates(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	subjects := NewSubjectRepository(pool)
+	gen := NewGenerationRepository(pool)
+
+	sid, err := subjects.EnsureSubject(ctx, "Revive "+time.Now().Format("150405.000000"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// #11: orphaned done row (test_id NULL — the test was deleted).
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO generation_jobs (kind, subject_id, test_number, status)
+		VALUES ('chain', $1, 1, 'done')`, sid); err != nil {
+		t.Fatal(err)
+	}
+	revived, err := gen.ReviveChainJob(ctx, sid, 1, 0)
+	if err != nil || !revived {
+		t.Fatalf("orphaned done job not revived: %v %v", revived, err)
+	}
+	if ok, _ := gen.HasPendingOrRunningChainJob(ctx, sid, 1); !ok {
+		t.Fatal("expected an active job after revive")
+	}
+
+	// #12: two failed rows for test 2 — revive must not violate the index.
+	for i := 0; i < 2; i++ {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO generation_jobs (kind, subject_id, test_number, status)
+			VALUES ('chain', $1, 2, 'failed')`, sid); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if revived, err := gen.ReviveChainJob(ctx, sid, 2, 0); err != nil || !revived {
+		t.Fatalf("revive failed rows: %v %v", revived, err)
+	}
+	// Second call: an active job exists — nothing revived, no error.
+	if revived, err := gen.ReviveChainJob(ctx, sid, 2, 0); err != nil || revived {
+		t.Fatalf("second revive must be a no-op: %v %v", revived, err)
+	}
+
+	// #15: a user with no answers but a watermark is ranked by level.
+	users := NewUserRepository(pool)
+	u, err := users.upsertAt(ctx, &models.User{TelegramID: time.Now().UnixNano()%1_000_000_000 + 3_000_000_000}, d("2026-10-01"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO user_subject_state (user_id, subject_id, last_test_number)
+		VALUES ($1, $2, 3)`, u.ID, sid); err != nil {
+		t.Fatal(err)
+	}
+	board, err := subjects.UnlockedTestsLeaderboard(ctx, sid, 10)
+	if err != nil {
+		t.Fatalf("unlocked board: %v", err)
+	}
+	found := false
+	for _, e := range board {
+		if e.UserID == u.ID {
+			found = true
+			if e.UnlockedTests != 4 {
+				t.Fatalf("level = %d, want 4", e.UnlockedTests)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("user with watermark missing from the level board")
 	}
 }

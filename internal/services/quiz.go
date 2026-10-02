@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log"
 	mrand "math/rand"
-	"strings"
 	"sync"
 
 	"github.com/Bihan293/Juz40tester/internal/models"
@@ -441,8 +440,28 @@ func (s *QuizService) OnTestCompleted(ctx context.Context, userID int64, test *m
 // a tap on a ⏳ (still generating) test button re-queues the job as URGENT.
 // Safe to call for any (subject, testNumber) — it is a no-op when the test
 // already exists, generation is disabled, or a healthy job is in flight.
+//
+// The test number comes from callback data, which can be stale or forged:
+// only tests the user has actually unlocked (testNumber <= unlockedMax) may
+// trigger a (paid) generation — otherwise any Тест 50/100 could be
+// generated on demand.
 func (s *QuizService) ReviveChainTest(ctx context.Context, subjectID int64, testNumber int, userID int64) {
-	if s.genSvc == nil {
+	if s.genSvc == nil || testNumber < 1 {
+		return
+	}
+	chain, err := s.subjects.ListChainTests(ctx, subjectID)
+	if err != nil {
+		log.Printf("revive chain test: list subject %d: %v", subjectID, err)
+		return
+	}
+	unlocked, err := s.unlockedMax(ctx, userID, subjectID, chain)
+	if err != nil {
+		log.Printf("revive chain test: unlocked subject %d user %d: %v", subjectID, userID, err)
+		return
+	}
+	if testNumber > unlocked {
+		log.Printf("revive chain test: refused subject %d test %d for user %d (unlocked up to %d)",
+			subjectID, testNumber, userID, unlocked)
 		return
 	}
 	s.genSvc.ReviveChainTest(ctx, subjectID, testNumber, userID)
@@ -520,15 +539,27 @@ func (s *QuizService) EnsurePersonalTest(ctx context.Context, userID, subjectID 
 	if err != nil || test == nil || len(topics) == 0 {
 		return test, pending, topics, err
 	}
-	// Match topics case-insensitively (the generator normalises them).
+	// Match topics with the canonical normalisation used everywhere else
+	// (case + inner whitespace), so «Тема  X» and «тема x» are the same.
 	weak := make(map[string]bool, len(topics))
 	for _, t := range topics {
-		weak[strings.ToLower(strings.TrimSpace(t))] = true
+		weak[models.NormalizeTopic(t)] = true
 	}
 	for _, t := range test.Topics {
-		if weak[strings.ToLower(strings.TrimSpace(t))] {
+		if weak[models.NormalizeTopic(t)] {
 			return test, false, topics, nil // still trains a real gap — keep it
 		}
+	}
+	// Never delete a test the user is in the middle of: the started attempt
+	// (and its progress) would vanish silently. The stale test is replaced
+	// only once no attempt is in progress.
+	active, aerr := s.attempts.GetActiveAttempt(ctx, userID, test.ID)
+	if aerr != nil {
+		log.Printf("personal test %d: active attempt lookup: %v", test.ID, aerr)
+		return test, false, topics, nil // unknown — keep the test
+	}
+	if active != nil {
+		return test, false, topics, nil
 	}
 	// Stale: nothing left to train in this test. Delete it and build a fresh
 	// one from the current weak topics (clone of a matching fingerprint when
@@ -658,7 +689,9 @@ func (s *QuizService) buildView(ctx context.Context, user *models.User, attempt 
 		"A": q.OptionA, "B": q.OptionB, "C": q.OptionC, "D": q.OptionD,
 	}
 	if user != nil && user.TestLang == models.TestLangKK && s.translator != nil &&
-		s.subjectTranslatable(ctx, q.SubjectID) {
+		s.subjectTranslatable(ctx, q.SubjectID) && s.testFullyTranslatedSafe(ctx, attempt.TestID) {
+		// Only a COMPLETE translation is used — a partially translated test
+		// is shown entirely in Russian instead of a per-question mix.
 		if tr, terr := s.translator.TranslationFor(ctx, q.ID, models.TestLangKK); terr != nil {
 			log.Printf("translation lookup q%d: %v", q.ID, terr)
 		} else if tr != nil {
@@ -681,6 +714,17 @@ func (s *QuizService) buildView(ctx context.Context, user *models.User, attempt 
 		Total:        total,
 		DisplayTexts: texts,
 	}, nil
+}
+
+// testFullyTranslatedSafe wraps TestFullyTranslated, treating lookup errors
+// as "not translated" (Russian master is always a safe fallback).
+func (s *QuizService) testFullyTranslatedSafe(ctx context.Context, testID int64) bool {
+	ok, err := s.TestFullyTranslated(ctx, testID)
+	if err != nil {
+		log.Printf("translation status test %d: %v", testID, err)
+		return false
+	}
+	return ok
 }
 
 // MapDisplayToOriginal converts the displayed letter (position in the
@@ -852,13 +896,21 @@ func (s *QuizService) ResolveTestForUser(ctx context.Context, user *models.User,
 		}
 		return resolved, false, nil
 	}
+	// A partially translated test must never be served half Russian, half
+	// Kazakh: when any question lacks a translation the WHOLE test falls
+	// back to the Russian master and translated=false is reported.
+	for _, q := range questions {
+		if tr[q.ID] == nil {
+			log.Printf("translator: test %d only partially translated (q%d missing) — Russian fallback", testID, q.ID)
+			resolved = resolved[:0]
+			for _, rq := range questions {
+				resolved = append(resolved, russianQuestion(&rq))
+			}
+			return resolved, false, nil
+		}
+	}
 	for _, q := range questions {
 		t := tr[q.ID]
-		if t == nil {
-			// A single missing translation must not break the test either.
-			resolved = append(resolved, russianQuestion(&q))
-			continue
-		}
 		resolved = append(resolved, ResolvedQuestion{
 			QuestionID:    q.ID,
 			Text:          t.Text,

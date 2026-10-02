@@ -272,16 +272,19 @@ func (r *SubjectRepository) SubjectProgress(ctx context.Context, userID, subject
 	return &sp, nil
 }
 
-// UnlockedTestsLeaderboard ranks users by how many CHAIN tests of the
-// subject they have unlocked. A test counts as unlocked for a user when it
-// is test 1 or when the previous test of the chain reached the unlock bar
-// (UnlockGreen 🟢 + UnlockYellow 🟡). Only tests that already exist are
-// considered, so the board never counts phantom slots. Tests up to the
-// user's permanent unlock watermark (last_test_number + 1) count as
-// unlocked too — exactly like QuizService.unlockedMax.
+// UnlockedTestsLeaderboard ranks users by their chain LEVEL in the subject
+// — exactly the value QuizService.unlockedMax computes for the bot itself:
+// Тест 1 is always open; walking the chain by test number, test n+1 opens
+// while test n exists and is either within the permanent watermark
+// (user_subject_state.last_test_number) or currently meets the unlock bar
+// (UnlockGreen 🟢 + UnlockYellow 🟡). The walk stops at the first locked
+// or missing test; finally the level is at least last_test_number + 1.
+// An open-but-not-started test counts too (the previous implementation only
+// looked at tests the user had already answered something in, and did not
+// stop at the first locked test of the chain).
 func (r *SubjectRepository) UnlockedTestsLeaderboard(ctx context.Context, subjectID int64, limit int) ([]models.LeaderboardEntry, error) {
 	rows, err := r.pool.Query(ctx, `
-		WITH chain AS (
+		WITH RECURSIVE chain AS (
 			SELECT id, test_number FROM tests
 			WHERE subject_id = $1 AND is_active AND kind = 'chain'
 		),
@@ -294,26 +297,39 @@ func (r *SubjectRepository) UnlockedTestsLeaderboard(ctx context.Context, subjec
 			JOIN user_question_progress p ON p.question_id = tq.question_id
 			GROUP BY tq.test_id, p.user_id
 		),
-		unlocked AS (
-			SELECT p.user_id, c.test_number,
-			       (c.test_number = 1)
-			       OR c.test_number <= COALESCE(uss.last_test_number, 0) + 1
-			       OR EXISTS (
-			           SELECT 1 FROM chain pc
-			           JOIN prog pp ON pp.test_id = pc.id AND pp.user_id = p.user_id
-			           WHERE pc.test_number = c.test_number - 1
-			             AND pp.green >= $3 AND pp.green + pp.yellow >= $3 + $4
-			       ) AS is_unlocked
-			FROM prog p
-			JOIN chain c ON c.id = p.test_id
+		players AS (
+			SELECT DISTINCT user_id FROM prog
+			UNION
+			SELECT user_id FROM user_subject_state
+			WHERE subject_id = $1 AND last_test_number > 0
+		),
+		wm AS (
+			SELECT pl.user_id, COALESCE(uss.last_test_number, 0) AS watermark
+			FROM players pl
 			LEFT JOIN user_subject_state uss
-			       ON uss.user_id = p.user_id AND uss.subject_id = $1
+			       ON uss.user_id = pl.user_id AND uss.subject_id = $1
+		),
+		walk AS (
+			SELECT w.user_id, w.watermark, 1 AS n FROM wm w
+			UNION ALL
+			SELECT wk.user_id, wk.watermark, wk.n + 1
+			FROM walk wk
+			JOIN chain c ON c.test_number = wk.n
+			LEFT JOIN prog pp ON pp.test_id = c.id AND pp.user_id = wk.user_id
+			WHERE wk.n < 100000
+			  AND (wk.n <= wk.watermark
+			       OR (COALESCE(pp.green, 0) >= $3
+			           AND COALESCE(pp.green, 0) + COALESCE(pp.yellow, 0) >= $3 + $4))
+		),
+		levels AS (
+			SELECT user_id, GREATEST(MAX(n), MAX(watermark) + 1) AS level
+			FROM walk
+			GROUP BY user_id
 		)
 		SELECT u.id, u.first_name, u.username, `+liveStreakSQL("$5")+`,
-		       COUNT(*) FILTER (WHERE un.is_unlocked) AS unlocked_tests
-		FROM unlocked un
-		JOIN users u ON u.id = un.user_id
-		GROUP BY u.id, u.first_name, u.username, u.streak_days, u.last_active_date
+		       l.level AS unlocked_tests
+		FROM levels l
+		JOIN users u ON u.id = l.user_id
 		ORDER BY unlocked_tests DESC, u.id
 		LIMIT $2`, subjectID, limit, models.UnlockGreen, models.UnlockYellow, models.StreakToday(time.Now()).Format("2006-01-02"))
 	if err != nil {
@@ -342,7 +358,7 @@ func (r *SubjectRepository) GreenLeaderboard(ctx context.Context, subjectID int6
 		FROM user_question_progress p
 		JOIN questions q ON q.id = p.question_id AND q.subject_id = $1
 		JOIN test_questions tq ON tq.question_id = q.id
-		JOIN tests t ON t.id = tq.test_id AND t.is_active
+		JOIN tests t ON t.id = tq.test_id AND t.is_active AND t.kind = 'chain'
 		JOIN users u ON u.id = p.user_id
 		WHERE p.status = 2
 		GROUP BY u.id, u.first_name, u.username, u.streak_days, u.last_active_date
