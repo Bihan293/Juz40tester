@@ -589,6 +589,19 @@ func (r *GenerationRepository) HasPendingOrRunningPersonalJob(ctx context.Contex
 	return exists, err
 }
 
+// HasUrgentWork reports whether a user-facing (urgent) job is due in the
+// queue or currently running. The low-priority quality sweep yields to such
+// work: it would otherwise compete with user generations for the Groq quota
+// (and spill them over to the paid DeepSeek fallback).
+func (r *GenerationRepository) HasUrgentWork(ctx context.Context) (bool, error) {
+	var exists bool
+	err := r.pool.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM generation_jobs
+		              WHERE urgent AND (status = 'running'
+		                    OR (status = 'pending' AND not_before <= now())))`).Scan(&exists)
+	return exists, err
+}
+
 // ClaimNextJob atomically picks a due pending job and marks it running:
 // urgent jobs first, then deferred jobs whose time has come (off-peak
 // pre-generation). EVERY job honours not_before: urgent jobs are enqueued

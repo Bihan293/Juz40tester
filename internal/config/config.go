@@ -36,6 +36,17 @@ type Config struct {
 	// DBMaxConns (DB_MAX_CONNS, default 15): upper bound of the pgx pool.
 	DBMaxConns int
 
+	// GenWorkers (GEN_WORKERS, default 4, max 16): number of concurrent
+	// generation-queue workers. Each claims jobs with FOR UPDATE SKIP LOCKED,
+	// so a job never runs twice. Kept small on purpose: the Groq free tier
+	// serves ~1 test per minute per model, extra workers mostly spill over
+	// to the paid DeepSeek fallback.
+	GenWorkers int
+	// GenDeepSeekConcurrency (GEN_DEEPSEEK_CONCURRENCY, default 2): max
+	// number of paid DeepSeek generation calls in flight at once across all
+	// workers — bounds the cost burst when Groq is saturated.
+	GenDeepSeekConcurrency int
+
 	// DeepSeek API settings for AI test generation.
 	DeepSeekAPIKey        string
 	DeepSeekModel         string // non-thinking fallback model (DEEPSEEK_MODEL), default deepseek-v4-pro
@@ -68,21 +79,23 @@ type Config struct {
 // all required variables are set. No secrets are hardcoded in the codebase.
 func Load() (*Config, error) {
 	cfg := &Config{
-		BotToken:              os.Getenv("BOT_TOKEN"),
-		DatabaseURL:           os.Getenv("DATABASE_URL"),
-		WebhookURL:            strings.TrimRight(os.Getenv("WEBHOOK_URL"), "/"),
-		Port:                  os.Getenv("PORT"),
-		WebhookSecret:         strings.TrimSpace(os.Getenv("WEBHOOK_SECRET")),
-		DeepSeekAPIKey:        os.Getenv("DEEPSEEK_API_KEY"),
-		DeepSeekModel:         os.Getenv("DEEPSEEK_MODEL"),
-		DeepSeekReasonerModel: os.Getenv("DEEPSEEK_REASONER_MODEL"),
-		DeepSeekBaseURL:       os.Getenv("DEEPSEEK_BASE_URL"),
-		GroqAPIKey:            strings.TrimSpace(os.Getenv("GROQ_API_KEY")),
-		GroqBaseURL:           strings.TrimSpace(os.Getenv("GROQ_BASE_URL")),
-		OffPeakStartHour:      -1,
-		OffPeakEndHour:        -1,
-		MigrationDatabaseURL:  strings.TrimSpace(os.Getenv("MIGRATION_DATABASE_URL")),
-		DBMaxConns:            defaultDBMaxConns,
+		BotToken:               os.Getenv("BOT_TOKEN"),
+		DatabaseURL:            os.Getenv("DATABASE_URL"),
+		WebhookURL:             strings.TrimRight(os.Getenv("WEBHOOK_URL"), "/"),
+		Port:                   os.Getenv("PORT"),
+		WebhookSecret:          strings.TrimSpace(os.Getenv("WEBHOOK_SECRET")),
+		DeepSeekAPIKey:         os.Getenv("DEEPSEEK_API_KEY"),
+		DeepSeekModel:          os.Getenv("DEEPSEEK_MODEL"),
+		DeepSeekReasonerModel:  os.Getenv("DEEPSEEK_REASONER_MODEL"),
+		DeepSeekBaseURL:        os.Getenv("DEEPSEEK_BASE_URL"),
+		GroqAPIKey:             strings.TrimSpace(os.Getenv("GROQ_API_KEY")),
+		GroqBaseURL:            strings.TrimSpace(os.Getenv("GROQ_BASE_URL")),
+		OffPeakStartHour:       -1,
+		OffPeakEndHour:         -1,
+		MigrationDatabaseURL:   strings.TrimSpace(os.Getenv("MIGRATION_DATABASE_URL")),
+		DBMaxConns:             defaultDBMaxConns,
+		GenWorkers:             DefaultGenWorkers,
+		GenDeepSeekConcurrency: DefaultGenDeepSeekConcurrency,
 	}
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV"))) {
 	case "development", "dev", "local", "test":
@@ -92,6 +105,12 @@ func Load() (*Config, error) {
 	}
 	if n, ok := envIntOpt("DB_MAX_CONNS"); ok && n > 0 {
 		cfg.DBMaxConns = n
+	}
+	if n, ok := envIntOpt("GEN_WORKERS"); ok && n > 0 {
+		cfg.GenWorkers = min(n, MaxGenWorkers)
+	}
+	if n, ok := envIntOpt("GEN_DEEPSEEK_CONCURRENCY"); ok && n > 0 {
+		cfg.GenDeepSeekConcurrency = n
 	}
 	if start, ok := envIntOpt("GEN_OFFPEAK_START_HOUR"); ok {
 		if end, ok2 := envIntOpt("GEN_OFFPEAK_END_HOUR"); ok2 {
@@ -141,6 +160,16 @@ func Load() (*Config, error) {
 // too small for concurrent updates + worker + reapers on a 1-CPU instance,
 // and unbounded concurrency would exhaust a Neon free-tier connection cap).
 const defaultDBMaxConns = 15
+
+const (
+	// DefaultGenWorkers is the default size of the generation worker pool.
+	DefaultGenWorkers = 4
+	// MaxGenWorkers caps GEN_WORKERS: more workers than this only fight
+	// over the Groq quota and the DB pool and multiply DeepSeek spend.
+	MaxGenWorkers = 16
+	// DefaultGenDeepSeekConcurrency bounds parallel paid generations.
+	DefaultGenDeepSeekConcurrency = 2
+)
 
 // envIntOpt reads an integer env var; ok is false when it is unset or
 // unparsable (callers need to distinguish "unset" from an explicit value).

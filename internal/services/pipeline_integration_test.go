@@ -143,6 +143,11 @@ func TestPipelineRepairsGiveawayQuestion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The sweep yields to urgent user jobs; park the ones other tests left
+	// in the shared database so this sweep actually runs.
+	if _, err := pool.Exec(ctx, `UPDATE generation_jobs SET status = 'failed' WHERE status IN ('pending','running')`); err != nil {
+		t.Fatal(err)
+	}
 	before := atomic.LoadInt32(&repairCalls)
 	n, err := g.RunQualitySweep(ctx)
 	if err != nil {

@@ -287,6 +287,12 @@ func (h *Handler) renderSubjects(ctx context.Context, chatID int64) (string, *bo
 	// Subject buttons — one per row so long names ("Математика",
 	// "Грамотность чтения") fit and stay readable. Each subject gets its
 	// own emoji to avoid confusion.
+	if len(subjects) == 0 {
+		// Fresh database: subjects are added by the administrator (no
+		// built-in seed) — say so instead of an empty picker.
+		return "📚 Предметов пока нет — скоро они появятся.",
+			&bot.InlineKeyboardMarkup{InlineKeyboard: [][]bot.InlineKeyboardButton{bot.Row(bot.Btn("⬅️ Главное меню", cbMainMenu))}}, nil
+	}
 	buttons := make([]bot.InlineKeyboardButton, 0, len(subjects))
 	for _, s := range subjects {
 		buttons = append(buttons, bot.Btn(subjectEmoji(s.Name)+" "+s.Name, cbSubject+strconv.FormatInt(s.ID, 10)))
