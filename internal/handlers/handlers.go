@@ -109,6 +109,23 @@ func (h *Handler) ensureUser(ctx context.Context, from *bot.TgUser) (*models.Use
 
 // --- Messages ---------------------------------------------------------------
 
+// commandKey normalises a Telegram command for routing: "/start payload"
+// (deep link), "/start@MyBot" and "/start@MyBot payload" all become
+// "/start". Non-command text (reply-keyboard buttons) is returned as is.
+func commandKey(text string) string {
+	if !strings.HasPrefix(text, "/") {
+		return text
+	}
+	cmd := text
+	if i := strings.IndexAny(cmd, " \t\n"); i >= 0 {
+		cmd = cmd[:i]
+	}
+	if i := strings.IndexByte(cmd, '@'); i >= 0 {
+		cmd = cmd[:i]
+	}
+	return cmd
+}
+
 func (h *Handler) handleMessage(ctx context.Context, m *bot.Message) {
 	// The bot is a personal tutor: it only talks in private chats. If it is
 	// ever added to a group, it must not answer every group message with the
@@ -123,7 +140,7 @@ func (h *Handler) handleMessage(ctx context.Context, m *bot.Message) {
 	}
 
 	text := strings.TrimSpace(m.Text)
-	switch text {
+	switch commandKey(text) {
 	case "/start":
 		h.sendMainMenu(ctx, m.Chat.ID, user, true)
 	case kbSubjects, "/subjects":

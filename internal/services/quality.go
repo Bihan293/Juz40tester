@@ -307,7 +307,7 @@ func auditQuestion(text string, options []string, correct int) qualityReport {
 			if j, ok := seenLetters[l]; ok && seen[n] == i {
 				// Same words, different punctuation: legitimate ONLY for
 				// punctuation questions (the marks ARE the answer there).
-				if !isPunctuationQuestion(stem) {
+				if !isPunctuationQuestion(stem) && !isSpellingQuestion(stem) {
 					rep.hard("варианты %s и %s различаются только знаками препинания", optionLetters[j], optionLetters[i])
 				}
 			} else if !ok {
@@ -326,7 +326,7 @@ func auditQuestion(text string, options []string, correct int) qualityReport {
 			rep.hard("вариант %s типа «все/ни один из перечисленных» — недопустим", optionLetters[i])
 		}
 	}
-	if containsAny(stem, []string{"подсказка", "(ответ", "ответ:"}) {
+	if stemLeaksAnswer(stem) {
 		rep.hard("в тексте вопроса есть подсказка/ответ")
 	}
 
@@ -334,9 +334,12 @@ func auditQuestion(text string, options []string, correct int) qualityReport {
 	auditPunctuation(&rep, stem, options, correct)
 
 	// 4. Gap tells: «деревя..ый» in three options, the key written out in full.
+	// Code questions are skipped: «my_var» is an identifier, not a gap.
 	gaps := make([]bool, 4)
-	for i, o := range options {
-		gaps[i] = reGap.MatchString(o)
+	if !isCodeQuestion(stem) {
+		for i, o := range options {
+			gaps[i] = reGap.MatchString(o)
+		}
 	}
 	if k := oddOneOut(gaps); k >= 0 {
 		if k == correct {
@@ -408,6 +411,31 @@ func auditQuestion(text string, options []string, correct int) qualityReport {
 	}
 	return rep
 }
+
+// reAnswerLeak: «… ? Ответ: B», «(ответ: 4)», «Ответ = 12» — a short answer
+// appended after the question itself ended (the part before «ответ» holds
+// a «?» or «.»). Instructions like «(ответ дайте в м/с)» or «Выберите
+// правильный ответ: столица Казахстана» are NOT leaks.
+var reAnswerLeak = regexp.MustCompile(`[?.!)]\s*\(?\s*(правильный\s+|верный\s+|correct\s+)?(ответ|answer|жауап)\s*[:=]\s*\S+(\s+\S+){0,2}\s*\)?\.?\s*$`)
+
+// stemLeaksAnswer reports an explicit hint/answer inside the question text.
+func stemLeaksAnswer(stem string) bool {
+	if hasKeyword(stem, "подсказка") || hasKeyword(stem, "hint:") || hasKeyword(stem, "кеңес:") {
+		return true
+	}
+	return reAnswerLeak.MatchString(stem)
+}
+
+// spellingKeywords mark spelling questions (слитно/раздельно/через дефис):
+// their options legitimately differ only by a hyphen or a space.
+var spellingKeywords = []string{"слитно", "раздельно", "через дефис", "пишется", "пишутся", "написан", "правописан", "орфограф", "бірге жазыл", "бөлек жазыл", "жазылады", "spelled", "spelling", "spelt"}
+
+func isSpellingQuestion(stem string) bool { return hasAnyKeyword(stem, spellingKeywords) }
+
+// codeKeywords mark programming questions where «_» is part of identifiers.
+var codeKeywords = []string{"python", "pascal", "java", "c++", "программ", "переменн", "идентификатор", "код ", "кода", "функци", "бағдарлама", "айнымалы", "variable", "identifier", "code"}
+
+func isCodeQuestion(stem string) bool { return hasAnyKeyword(stem, codeKeywords) }
 
 // isPunctuationQuestion reports whether the stem is about punctuation or a
 // specific orthographic mark.
