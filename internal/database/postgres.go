@@ -146,6 +146,11 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 			)
 		}
 
+		// Two files with the same number would silently skip one of them
+		// (only one version row is ever recorded) — refuse to start.
+		if prev, dup := files[version]; dup {
+			return fmt.Errorf("duplicate migration version %d: %q and %q", version, prev, name)
+		}
 		versions = append(versions, version)
 		files[version] = name
 	}

@@ -88,13 +88,22 @@ type TranslatorService struct {
 	repo *repositories.TranslationRepository
 
 	// inFlight serialises translation of the same test so two concurrent
-	// users never pay for the same translation twice.
+	// users never pay for the same translation twice. Entries are
+	// reference-counted and removed when the last holder/waiter releases,
+	// so the map holds only tests being translated right now.
 	mu       sync.Mutex
-	inFlight map[int64]*sync.Mutex
+	inFlight map[int64]*testLockEntry
+}
+
+// testLockEntry is a per-test mutex plus the number of goroutines that
+// currently hold or wait for it (guarded by TranslatorService.mu).
+type testLockEntry struct {
+	mu   sync.Mutex
+	refs int
 }
 
 func NewTranslatorService(ds *deepseek.Client, repo *repositories.TranslationRepository) *TranslatorService {
-	return &TranslatorService{ds: ds, repo: repo, inFlight: map[int64]*sync.Mutex{}}
+	return &TranslatorService{ds: ds, repo: repo, inFlight: map[int64]*testLockEntry{}}
 }
 
 // WithGroq wires the free Groq provider (Qwen primary, GPT-OSS secondary).
@@ -110,16 +119,36 @@ func (t *TranslatorService) Enabled() bool {
 	return t != nil && t.repo != nil && (t.ds != nil || t.gq != nil)
 }
 
-// testLock returns the per-test translation mutex.
-func (t *TranslatorService) testLock(testID int64) *sync.Mutex {
+// lockTest acquires the per-test translation mutex and returns its release
+// function. Release must be deferred: it unlocks and drops the map entry
+// once nobody else holds or waits for it — also on error and on panic.
+func (t *TranslatorService) lockTest(testID int64) (release func()) {
+	t.mu.Lock()
+	e, ok := t.inFlight[testID]
+	if !ok {
+		e = &testLockEntry{}
+		t.inFlight[testID] = e
+	}
+	e.refs++
+	t.mu.Unlock()
+
+	e.mu.Lock()
+	return func() {
+		e.mu.Unlock()
+		t.mu.Lock()
+		e.refs--
+		if e.refs == 0 {
+			delete(t.inFlight, testID)
+		}
+		t.mu.Unlock()
+	}
+}
+
+// inFlightLen reports the number of tracked per-test locks (for tests).
+func (t *TranslatorService) inFlightLen() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	m, ok := t.inFlight[testID]
-	if !ok {
-		m = &sync.Mutex{}
-		t.inFlight[testID] = m
-	}
-	return m
+	return len(t.inFlight)
 }
 
 // TranslateTest returns the Kazakh version of the given Russian questions of
@@ -136,9 +165,8 @@ func (t *TranslatorService) TranslateTest(ctx context.Context, testID int64, que
 
 	// Serialise per test: the second user to open the same untranslated test
 	// waits for the first run and then reads the cached rows.
-	lock := t.testLock(testID)
-	lock.Lock()
-	defer lock.Unlock()
+	release := t.lockTest(testID)
+	defer release()
 
 	cached, err := t.repo.TranslationsForTest(ctx, testID, models.TestLangKK)
 	if err != nil {

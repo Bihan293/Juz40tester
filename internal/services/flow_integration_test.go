@@ -521,3 +521,41 @@ func TestFlowConcurrentPersonalCreation(t *testing.T) {
 		}
 	}
 }
+
+// #37: a chain with holes in its numbering (1,2,3,7,8) must show tests 7
+// and 8 — the visible range is bounded by the max TestNumber.
+func TestSubjectScreenChainGaps(t *testing.T) {
+	e := newFlowEnv(t)
+	ctx := context.Background()
+	u := e.user(t, "Gap")
+	for _, n := range []int{1, 2, 3, 7, 8} {
+		if _, err := e.pool.Exec(ctx, `
+			INSERT INTO tests (subject_id, test_number, title, kind)
+			VALUES ($1, $2, $3, 'chain')`, e.sid, n, fmt.Sprintf("Тест %d", n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	scr, err := e.quiz.GetSubjectScreen(ctx, u, e.sid, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scr.MaxVisible != 8 {
+		t.Fatalf("MaxVisible = %d, want 8", scr.MaxVisible)
+	}
+	if len(scr.Slots) != 8 {
+		t.Fatalf("got %d slots, want 8", len(scr.Slots))
+	}
+	for _, n := range []int{1, 2, 3, 7, 8} {
+		if scr.Slots[n-1].Test == nil {
+			t.Fatalf("Тест %d is hidden", n)
+		}
+	}
+	for _, n := range []int{4, 5, 6} {
+		if scr.Slots[n-1].Test != nil {
+			t.Fatalf("slot %d must be empty (hole)", n)
+		}
+	}
+	if scr.Slots[6].Unlocked || scr.Slots[7].Unlocked {
+		t.Fatal("tests 7/8 must be visible but still locked for a new user")
+	}
+}
