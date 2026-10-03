@@ -35,6 +35,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -110,6 +111,58 @@ type Client struct {
 	// spend is observable without an external dashboard.
 	totalIn, totalOut int64
 	totalCost         float64
+
+	// budget enforces the daily spending cap (R-9). nil = no cap.
+	budget Budget
+	// offPeak tells which price applies at a moment (nil = always peak,
+	// the conservative choice for the cap).
+	offPeak func(time.Time) bool
+}
+
+// Budget is the daily spending cap of paid DeepSeek calls (R-9). It is fed
+// by the SAME estimate the client logs for every call (estimateCost):
+//   - Reserve books the WORST-CASE cost of a call before it is sent and
+//     fails (wrapping ErrBudgetExceeded) when that would exceed the cap —
+//     the HTTP request is then never made;
+//   - Settle replaces the reservation by the estimated real cost of the
+//     reply (or releases it, actual = 0, when the call failed without
+//     usage data).
+type Budget interface {
+	Reserve(ctx context.Context, amountUSD float64) error
+	Settle(ctx context.Context, reservedUSD, actualUSD float64)
+}
+
+// ErrBudgetExceeded: the daily DeepSeek spending cap is reached; the call
+// was NOT sent.
+var ErrBudgetExceeded = errors.New("deepseek: daily spending cap reached")
+
+// WithBudget installs the daily spending cap. offPeak (may be nil) selects
+// the off-peak/peak price of the settled cost.
+func (c *Client) WithBudget(b Budget, offPeak func(time.Time) bool) *Client {
+	c.budget = b
+	c.offPeak = offPeak
+	return c
+}
+
+// worstCaseCost bounds the price of one call before it is sent: every
+// input token priced as a cache miss (input tokens bounded by the request
+// size in BYTES — a BPE token is never shorter than one byte), the
+// whole max_tokens budget as output, at the PEAK rate. Unknown models are
+// priced like the most expensive known one.
+func worstCaseCost(model string, body []byte, maxTokens int) float64 {
+	p, ok := prices[model]
+	if !ok {
+		for _, q := range prices {
+			if q.out > p.out {
+				p = q
+			}
+		}
+	}
+	if maxTokens <= 0 {
+		maxTokens = 8192
+	}
+	in := float64(len(body))
+	return 2 * (in*p.inMiss + float64(maxTokens)*p.out)
 }
 
 // thinkingDisabled reports (under lock) whether thinking params must be
@@ -352,6 +405,27 @@ func (c *Client) call(ctx context.Context, model string, messages []Message, tem
 	if err != nil {
 		return "", err
 	}
+	// R-9: reserve the worst-case cost against the daily cap BEFORE the
+	// request — a capped call is never sent.
+	reserved := 0.0
+	settled := false
+	if c.budget != nil {
+		reserved = worstCaseCost(model, body, maxTokens)
+		if err := c.budget.Reserve(ctx, reserved); err != nil {
+			if errors.Is(err, ErrBudgetExceeded) {
+				return "", err
+			}
+			// Ledger unavailable: fail CLOSED — no uncontrolled paid call.
+			return "", fmt.Errorf("%w (ledger error: %v)", ErrBudgetExceeded, err)
+		}
+		defer func() {
+			if !settled {
+				// No usage data (transport error, API error): DeepSeek does
+				// not bill a request that produced no completion — release.
+				c.budget.Settle(context.WithoutCancel(ctx), reserved, 0)
+			}
+		}()
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.baseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
@@ -389,6 +463,17 @@ func (c *Client) call(ctx context.Context, model string, messages []Message, tem
 	// early-warning system against runaway spend.
 	if cr.Usage != nil {
 		off, peak := estimateCost(model, cr.Usage)
+		if c.budget != nil {
+			actual := peak
+			if c.offPeak != nil && c.offPeak(time.Now()) {
+				actual = off
+			}
+			if _, known := prices[model]; !known {
+				actual = reserved // unknown price: keep the worst case booked
+			}
+			c.budget.Settle(context.WithoutCancel(ctx), reserved, actual)
+			settled = true
+		}
 		total, totIn, totOut := c.addUsage(cr.Usage, off)
 		if off > 0 {
 			log.Printf("deepseek: %s effort=%q in=%d (cache hit %d) out=%d => ~$%.4f off-peak / $%.4f peak | session ~$%.4f (%d in / %d out)",

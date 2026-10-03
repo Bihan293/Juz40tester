@@ -135,3 +135,78 @@ func TestTransportErrorDoesNotLeakToken(t *testing.T) {
 		t.Fatalf("errors.Is(context.Canceled) lost: %v", err)
 	}
 }
+
+// TestCall429LongRetryAfterDoesNotBlockHandler (R-3): a 429 with a
+// retry_after longer than maxInlineRetryAfter is NOT slept in the calling
+// handler: sendMessage returns at once with a deferred RateLimitError and
+// the message is delivered by the background queue after retry_after.
+func TestCall429LongRetryAfterDoesNotBlockHandler(t *testing.T) {
+	c, calls := fakeTelegram(t, 1, 2) // first call: 429 retry_after=2s
+	start := time.Now()
+	_, err := c.SendMessage(context.Background(), 1, "hi", nil)
+	if !IsDeferred(err) {
+		t.Fatalf("want deferred RateLimitError, got %v", err)
+	}
+	if el := time.Since(start); el > 500*time.Millisecond {
+		t.Fatalf("handler blocked for %s on a 429", el)
+	}
+	if c.PendingDeferred() != 1 {
+		t.Fatalf("pending = %d, want 1", c.PendingDeferred())
+	}
+	// While the chat is banned, the next message to it is queued without an
+	// HTTP call (keeps order, does not provoke another 429).
+	if _, err := c.SendMessage(context.Background(), 1, "second", nil); !IsDeferred(err) {
+		t.Fatalf("second send during ban: %v", err)
+	}
+	if got := atomic.LoadInt32(calls); got != 1 {
+		t.Fatalf("calls during ban = %d, want 1", got)
+	}
+	// retry_after is honoured: nothing is re-sent before ~2s.
+	time.Sleep(1500 * time.Millisecond)
+	if got := atomic.LoadInt32(calls); got != 1 {
+		t.Fatalf("re-sent before retry_after: %d calls", got)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.Close(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if got := atomic.LoadInt32(calls); got != 3 || c.PendingDeferred() != 0 {
+		t.Fatalf("after flush calls=%d pending=%d, want 3 / 0", got, c.PendingDeferred())
+	}
+	if time.Since(start) < 1900*time.Millisecond {
+		t.Fatal("deferred send did not wait retry_after")
+	}
+}
+
+// TestCall429AnswerCallbackFailsFast: non-deferrable methods never sleep a
+// long retry_after in the handler — they fail fast.
+func TestCall429AnswerCallbackFailsFast(t *testing.T) {
+	c, _ := fakeTelegram(t, 100, 5)
+	start := time.Now()
+	err := c.AnswerCallbackQuery(context.Background(), "id", "")
+	var rl *RateLimitError
+	if !errors.As(err, &rl) || rl.Deferred {
+		t.Fatalf("want non-deferred RateLimitError, got %v", err)
+	}
+	if time.Since(start) > 500*time.Millisecond {
+		t.Fatal("answerCallbackQuery slept on a long retry_after")
+	}
+}
+
+// TestDeleteMessagesBatch: several deletions are ONE request.
+func TestDeleteMessagesBatch(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:])
+		_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	defer srv.Close()
+	c := NewClient("T").WithBaseURL(srv.URL)
+	if err := c.DeleteMessages(context.Background(), 1, []int64{5, 6, 7}); err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 1 || paths[0] != "deleteMessages" {
+		t.Fatalf("requests: %v, want one deleteMessages", paths)
+	}
+}

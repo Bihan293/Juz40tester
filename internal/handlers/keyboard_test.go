@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/Bihan293/Juz40tester/internal/bot"
+	"github.com/Bihan293/Juz40tester/internal/models"
 )
 
 // kbFake is a fake Bot API that numbers sent messages and records deletes.
@@ -20,6 +21,7 @@ type kbFake struct {
 	next    int64
 	sent    []string // texts of sendMessage, in order
 	deleted []int64
+	calls   int // every Bot API request
 }
 
 func (f *kbFake) server(t *testing.T) *httptest.Server {
@@ -29,11 +31,17 @@ func (f *kbFake) server(t *testing.T) *httptest.Server {
 		_ = json.Unmarshal(body, &p)
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		f.calls++
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/sendMessage"):
 			f.next++
 			f.sent = append(f.sent, p["text"].(string))
 			_, _ = io.WriteString(w, `{"ok":true,"result":{"message_id":`+strconv.FormatInt(f.next, 10)+`,"chat":{"id":1,"type":"private"}}}`)
+		case strings.HasSuffix(r.URL.Path, "/deleteMessages"):
+			for _, id := range p["message_ids"].([]any) {
+				f.deleted = append(f.deleted, int64(id.(float64)))
+			}
+			_, _ = io.WriteString(w, `{"ok":true,"result":true}`)
 		case strings.HasSuffix(r.URL.Path, "/deleteMessage"):
 			f.deleted = append(f.deleted, int64(p["message_id"].(float64)))
 			_, _ = io.WriteString(w, `{"ok":true,"result":true}`)
@@ -63,21 +71,45 @@ func TestReplyKeyboardNoteNoSpam(t *testing.T) {
 		t.Fatalf("deleted %v, want %v (only the latest note may remain)", f.deleted, want)
 	}
 
-	// Next test starts: msg 4 = removal vehicle (deleted), note 3 deleted.
+	// Next test starts: msg 4 = removal vehicle; it and note 3 are deleted
+	// with ONE deleteMessages request (R-2: was two deleteMessage calls).
+	before := f.calls
 	h.hideReplyKeyboard(ctx, chat)
 	if want := []int64{1, 2, 4, 3}; !equal(f.deleted, want) {
 		t.Fatalf("deleted %v, want %v", f.deleted, want)
 	}
-	// Hiding again with no note is a no-op beyond its own vehicle message.
+	if got := f.calls - before; got != 2 {
+		t.Fatalf("hide = %d Telegram calls, want 2 (send + deleteMessages)", got)
+	}
+	// Hiding again while the menu is already hidden: ZERO Telegram calls.
+	before = f.calls
 	h.hideReplyKeyboard(ctx, chat)
-	if want := []int64{1, 2, 4, 3, 5}; !equal(f.deleted, want) {
-		t.Fatalf("deleted %v, want %v", f.deleted, want)
+	if f.calls != before {
+		t.Fatalf("repeated hide made %d Telegram calls, want 0", f.calls-before)
+	}
+	// Restore after a hide: the old note is already gone — ONE call.
+	before = f.calls
+	h.restoreReplyKeyboard(ctx, chat) // 5
+	if f.calls-before != 1 {
+		t.Fatalf("restore after hide = %d calls, want 1", f.calls-before)
 	}
 	// Notes are tracked per chat.
-	h.restoreReplyKeyboard(ctx, chat)   // 6
-	h.restoreReplyKeyboard(ctx, chat+1) // 7 — other chat, nothing deleted
-	if want := []int64{1, 2, 4, 3, 5}; !equal(f.deleted, want) {
+	h.restoreReplyKeyboard(ctx, chat+1) // 6 — other chat, nothing deleted
+	if want := []int64{1, 2, 4, 3}; !equal(f.deleted, want) {
 		t.Fatalf("other chat must not touch this one: %v", f.deleted)
+	}
+	// After the menu was shown again, the next test hides it again.
+	before = f.calls
+	h.hideReplyKeyboard(ctx, chat) // 7, deletes 7 and 5
+	if want := []int64{1, 2, 4, 3, 7, 5}; !equal(f.deleted, want) || f.calls-before != 2 {
+		t.Fatalf("hide after restore: deleted %v calls %d", f.deleted, f.calls-before)
+	}
+	// The main menu (with the reply keyboard) also makes the menu visible.
+	h.sendMainMenu(ctx, chat, &models.User{FirstName: "A"}, false) // 8
+	before = f.calls
+	h.hideReplyKeyboard(ctx, chat) // 9: send + deleteMessage of the vehicle
+	if f.calls-before != 2 {
+		t.Fatalf("hide after main menu must hide again: %d calls, want 2", f.calls-before)
 	}
 	for _, s := range f.sent {
 		if strings.Contains(s, "Главное меню снова доступно") {

@@ -22,6 +22,9 @@ type Client struct {
 	token      string
 	httpClient *http.Client
 	baseURL    string
+
+	// flood keeps 429 back-off state and the deferred-retry queue (R-3).
+	flood *floodControl
 }
 
 // NewClient creates a client for the given bot token.
@@ -30,6 +33,7 @@ func NewClient(token string) *Client {
 		token:      token,
 		httpClient: httpx.NewClient(15 * time.Second),
 		baseURL:    "https://api.telegram.org",
+		flood:      newFloodControl(defaultMaxDeferred),
 	}
 }
 
@@ -165,34 +169,96 @@ type apiResponse struct {
 const maxRateLimitRetries = 2
 
 // maxRetryAfter caps how long one retry may wait: a longer flood-control
-// ban is not worth blocking an update handler for — the call fails instead.
+// ban is not worth retrying at all — the call fails instead.
 var maxRetryAfter = 30 * time.Second
+
+// maxInlineRetryAfter (R-3) is the longest 429 back-off that is waited out
+// INSIDE the calling goroutine (an update-handler slot). A longer
+// retry_after is never slept in the handler: deferrable calls (sending /
+// editing / deleting messages) are handed to the deferred-retry queue that
+// honours retry_after in its own goroutines, everything else fails fast
+// with *RateLimitError.
+var maxInlineRetryAfter = time.Second
 
 // RateLimitError is returned when Telegram keeps answering 429 after the
 // bounded retries (or asks for a wait longer than maxRetryAfter).
+// Deferred = true means the request was NOT dropped: it is queued and will
+// be re-sent automatically once retry_after has passed (the result, e.g. a
+// message id, is then not available to the caller).
 type RateLimitError struct {
 	Method     string
 	RetryAfter time.Duration
+	Deferred   bool
 }
 
 func (e *RateLimitError) Error() string {
+	if e.Deferred {
+		return fmt.Sprintf("telegram %s: rate limited, re-send deferred by %s", e.Method, e.RetryAfter)
+	}
 	return fmt.Sprintf("telegram %s: rate limited (retry after %s)", e.Method, e.RetryAfter)
 }
 
+// IsDeferred reports whether err means "rate limited, the request is queued
+// and will be delivered later".
+func IsDeferred(err error) bool {
+	var rl *RateLimitError
+	return errors.As(err, &rl) && rl.Deferred
+}
+
+// deferrable lists the methods whose delivery may be postponed: the caller
+// only logs their errors and does not depend on an immediate result.
+// answerCallbackQuery is excluded (a late answer is useless — the spinner
+// stops by itself) and so is setWebhook (it has its own retry loop).
+var deferrable = map[string]bool{
+	"sendMessage":     true,
+	"editMessageText": true,
+	"deleteMessage":   true,
+	"deleteMessages":  true,
+}
+
 // call performs one Bot API request. On HTTP 429 it honours
-// parameters.retry_after and retries at most maxRateLimitRetries times —
-// previously a rate-limited message was silently lost.
+// parameters.retry_after:
+//   - retry_after <= maxInlineRetryAfter: wait and retry in place (at most
+//     maxRateLimitRetries times);
+//   - longer, up to maxRetryAfter: a deferrable request is queued for a
+//     later re-send (RateLimitError{Deferred: true}); other requests fail
+//     fast — the handler slot is never blocked for seconds;
+//   - longer than maxRetryAfter: fail fast.
+//
+// While a chat is under a known flood-control ban, new deferrable requests
+// to it are queued straight away (no HTTP call that would only get another
+// 429), keeping their order behind the already queued ones.
 func (c *Client) call(ctx context.Context, method string, payload any, out any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
+	}
+	chatID := payloadChatID(payload)
+	if c.flood != nil && chatID != 0 && deferrable[method] {
+		if wait, queued := c.flood.blocked(chatID); wait > 0 || queued {
+			if c.flood.enqueue(c, chatID, method, body, wait) {
+				return &RateLimitError{Method: method, RetryAfter: wait, Deferred: true}
+			}
+			if wait > 0 {
+				return &RateLimitError{Method: method, RetryAfter: wait}
+			}
+		}
 	}
 	for attempt := 0; ; attempt++ {
 		retryAfter, err := c.callOnce(ctx, method, body, out)
 		if retryAfter <= 0 {
 			return err
 		}
-		if attempt >= maxRateLimitRetries || retryAfter > maxRetryAfter {
+		if c.flood != nil && chatID != 0 {
+			c.flood.block(chatID, retryAfter)
+		}
+		if retryAfter > maxRetryAfter {
+			return &RateLimitError{Method: method, RetryAfter: retryAfter}
+		}
+		if retryAfter > maxInlineRetryAfter || attempt >= maxRateLimitRetries {
+			if c.flood != nil && chatID != 0 && deferrable[method] && c.flood.enqueue(c, chatID, method, body, retryAfter) {
+				return &RateLimitError{Method: method, RetryAfter: retryAfter, Deferred: true}
+			}
 			return &RateLimitError{Method: method, RetryAfter: retryAfter}
 		}
 		t := time.NewTimer(retryAfter)
@@ -203,6 +269,21 @@ func (c *Client) call(ctx context.Context, method string, payload any, out any) 
 		case <-t.C:
 		}
 	}
+}
+
+// payloadChatID extracts chat_id from a request payload (0 when absent).
+func payloadChatID(payload any) int64 {
+	m, ok := payload.(map[string]any)
+	if !ok {
+		return 0
+	}
+	switch v := m["chat_id"].(type) {
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	}
+	return 0
 }
 
 // safeErr strips the request URL (https://api.telegram.org/bot<TOKEN>/...)
@@ -322,6 +403,32 @@ func (c *Client) DeleteMessage(ctx context.Context, chatID, messageID int64) err
 		"chat_id":    chatID,
 		"message_id": messageID,
 	}, nil)
+}
+
+// DeleteMessages removes several messages of one chat with ONE request
+// (Bot API deleteMessages). If the server does not know the method (an old
+// local Bot API server) it falls back to one deleteMessage per id.
+func (c *Client) DeleteMessages(ctx context.Context, chatID int64, ids []int64) error {
+	switch len(ids) {
+	case 0:
+		return nil
+	case 1:
+		return c.DeleteMessage(ctx, chatID, ids[0])
+	}
+	err := c.call(ctx, "deleteMessages", map[string]any{
+		"chat_id":     chatID,
+		"message_ids": ids,
+	}, nil)
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "not found") {
+		return err
+	}
+	var errs []error
+	for _, id := range ids {
+		if derr := c.DeleteMessage(ctx, chatID, id); derr != nil {
+			errs = append(errs, derr)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // AnswerCallbackQuery acknowledges a callback (stops the loading spinner).

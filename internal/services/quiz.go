@@ -34,11 +34,15 @@ type QuizService struct {
 	rngMu sync.Mutex
 	// boards caches the heavy per-subject leaderboards (P0-4).
 	boards *leaderboardCache
+	// metas caches TestViewMeta per attempt (R-2): the question count and
+	// the subject name never change during an attempt, so they are loaded
+	// once instead of on every question.
+	metas *viewMetaCache
 }
 
 func NewQuizService(subjects *repositories.SubjectRepository, attempts *repositories.AttemptRepository, state *repositories.StateRepository, gen *repositories.GenerationRepository, genSvc *GeneratorService, users ...*repositories.UserRepository) *QuizService {
 	s := &QuizService{subjects: subjects, attempts: attempts, state: state, gen: gen, genSvc: genSvc, rng: newSecureRand(),
-		boards: newLeaderboardCache(LeaderboardCacheTTL)}
+		boards: newLeaderboardCache(LeaderboardCacheTTL), metas: newViewMetaCache(viewMetaTTL, viewMetaMax)}
 	if len(users) > 0 {
 		s.users = users[0]
 	}
@@ -591,12 +595,22 @@ func (s *QuizService) RestartTest(ctx context.Context, userID, testID int64) (*m
 	return s.startTest(ctx, userID, testID, true)
 }
 
+// StartTestFor is StartTest for a test row the caller has already loaded
+// (openTest) — saves re-reading the same tests row (R-2).
+func (s *QuizService) StartTestFor(ctx context.Context, userID int64, test *models.Test) (*models.TestAttempt, error) {
+	return s.startTestRow(ctx, userID, test, false)
+}
+
 func (s *QuizService) startTest(ctx context.Context, userID, testID int64, replace bool) (*models.TestAttempt, error) {
 	test, err := s.subjects.GetTest(ctx, testID)
 	if err != nil {
 		return nil, err
 	}
-	if !test.IsActive {
+	return s.startTestRow(ctx, userID, test, replace)
+}
+
+func (s *QuizService) startTestRow(ctx context.Context, userID int64, test *models.Test, replace bool) (*models.TestAttempt, error) {
+	if test == nil || !test.IsActive {
 		return nil, repositories.ErrNotFound
 	}
 	questions, err := s.subjects.TestQuestions(ctx, test.ID)
@@ -642,43 +656,63 @@ type QuestionView struct {
 
 // CurrentQuestion loads the next unanswered question of the attempt.
 func (s *QuizService) CurrentQuestion(ctx context.Context, attemptID int64, user *models.User) (*QuestionView, error) {
-	attempt, err := s.attempts.GetAttemptForUser(ctx, attemptID, user.ID)
-	if err != nil {
-		return nil, err
-	}
-	aq, q, err := s.attempts.CurrentQuestion(ctx, attempt.ID)
-	if err != nil {
-		return nil, err
-	}
-	if aq == nil {
-		return nil, nil // nothing left to answer
-	}
-	return s.buildView(ctx, user, attempt, aq, q)
+	return s.loadView(ctx, attemptID, user, 0)
 }
 
 // QuestionAtPosition loads the question at a fixed position of the attempt.
 func (s *QuizService) QuestionAtPosition(ctx context.Context, attemptID int64, user *models.User, position int) (*QuestionView, error) {
-	attempt, err := s.attempts.GetAttemptForUser(ctx, attemptID, user.ID)
-	if err != nil {
-		return nil, err
+	if position <= 0 {
+		return nil, repositories.ErrNotFound
 	}
-	aq, q, err := s.attempts.QuestionAtPosition(ctx, attempt.ID, position)
-	if err != nil {
-		return nil, err
-	}
-	return s.buildView(ctx, user, attempt, aq, q)
+	return s.loadView(ctx, attemptID, user, position)
 }
 
-func (s *QuizService) buildView(ctx context.Context, user *models.User, attempt *models.TestAttempt, aq *models.AttemptQuestion, q *models.Question) (*QuestionView, error) {
-	// ONE query per question for everything the view needs besides the
-	// translation row itself: total question count, the subject name
-	// (language subjects are never translated) and how many of the test's
-	// questions already have a Kazakh translation. It replaces
-	// TestQuestionCount + GetByID(subject) + TestQuestions + TranslatedCount.
-	meta, err := s.subjects.TestViewMeta(ctx, attempt.TestID, models.TestLangKK)
+// loadView renders one question of an attempt with as few round trips as
+// possible (R-2). Before: GetAttemptForUser + attempt_questions + questions
+// + TestViewMeta + translation lookup = 5 queries per question. Now:
+//   - ONE query (LoadQuestionView) loads the attempt with the ownership
+//     check, the attempt question JOINed with its question row and, for
+//     Kazakh users, the cached translation of that question;
+//   - TestViewMeta is fetched in the same query only the first time for
+//     the attempt and then served from metas (it is immutable during the
+//     attempt — see viewMetaCache for the one exception, Translated).
+//
+// position 0 = first unanswered question; returns (nil, nil) when nothing
+// is left. A fixed position that does not exist is ErrNotFound.
+func (s *QuizService) loadView(ctx context.Context, attemptID int64, user *models.User, position int) (*QuestionView, error) {
+	if user == nil {
+		return nil, repositories.ErrNotFound
+	}
+	wantKK := user.TestLang == models.TestLangKK && s.translator != nil && s.translator.Enabled()
+	meta, cached := s.metas.get(attemptID)
+	// An incomplete Kazakh translation may complete while the attempt is
+	// running — for Kazakh users the meta is re-read until it is complete.
+	if cached && wantKK && !metaComplete(meta) && !models.IsLanguageSubject(meta.SubjectName) {
+		cached = false
+	}
+	lang := ""
+	if wantKK {
+		lang = models.TestLangKK
+	}
+	row, err := s.attempts.LoadQuestionView(ctx, attemptID, user.ID, position, !cached, lang)
 	if err != nil {
 		return nil, err
 	}
+	if !cached {
+		meta = row.Meta
+		s.metas.put(attemptID, row.Attempt.TestID, meta)
+	}
+	if row.AQ == nil {
+		if position > 0 {
+			return nil, repositories.ErrNotFound
+		}
+		return nil, nil // nothing left to answer
+	}
+	return s.renderView(user, row.Attempt, row.AQ, row.Question, meta, row.Translation), nil
+}
+
+// renderView builds the view from already-loaded rows (no DB access).
+func (s *QuizService) renderView(user *models.User, attempt *models.TestAttempt, aq *models.AttemptQuestion, q *models.Question, meta *repositories.TestViewMeta, tr *models.QuestionTranslation) *QuestionView {
 	total := meta.Total
 	// The Russian master row is the default; Kazakh users get the cached
 	// translation of THIS question (written once per question at test open).
@@ -687,16 +721,12 @@ func (s *QuizService) buildView(ctx context.Context, user *models.User, attempt 
 		"A": q.OptionA, "B": q.OptionB, "C": q.OptionC, "D": q.OptionD,
 	}
 	if user != nil && user.TestLang == models.TestLangKK && s.translator != nil && s.translator.Enabled() &&
-		!models.IsLanguageSubject(meta.SubjectName) && total > 0 && meta.Translated >= total {
+		!models.IsLanguageSubject(meta.SubjectName) && total > 0 && meta.Translated >= total && tr != nil {
 		// Only a COMPLETE translation is used — a partially translated test
 		// is shown entirely in Russian instead of a per-question mix.
-		if tr, terr := s.translator.TranslationFor(ctx, q.ID, models.TestLangKK); terr != nil {
-			log.Printf("translation lookup q%d: %v", q.ID, terr)
-		} else if tr != nil {
-			text = tr.Text
-			byLabel = map[string]string{
-				"A": tr.OptionA, "B": tr.OptionB, "C": tr.OptionC, "D": tr.OptionD,
-			}
+		text = tr.Text
+		byLabel = map[string]string{
+			"A": tr.OptionA, "B": tr.OptionB, "C": tr.OptionC, "D": tr.OptionD,
 		}
 	}
 	// Map original labels to texts, then apply the stored shuffle.
@@ -711,7 +741,7 @@ func (s *QuizService) buildView(ctx context.Context, user *models.User, attempt 
 		Text:         text,
 		Total:        total,
 		DisplayTexts: texts,
-	}, nil
+	}
 }
 
 // MapDisplayToOriginal converts the displayed letter (position in the
@@ -746,41 +776,21 @@ type AttemptSummary struct {
 // BuildSummary collects everything needed to render the final result. The
 // 🔴🟡🟢 counts reflect the user's CURRENT knowledge status of the test's
 // questions (after the run), not just the number of correct answers.
+// R-2: one query (LoadSummary) instead of five; the result is identical.
 func (s *QuizService) BuildSummary(ctx context.Context, attemptID, userID int64) (*AttemptSummary, error) {
-	attempt, err := s.attempts.GetAttemptForUser(ctx, attemptID, userID)
+	row, err := s.attempts.LoadSummary(ctx, attemptID, userID)
 	if err != nil {
 		return nil, err
 	}
-	test, err := s.subjects.GetTest(ctx, attempt.TestID)
-	if err != nil {
-		return nil, err
-	}
-	subject, err := s.subjects.GetByID(ctx, test.SubjectID)
-	if err != nil {
-		return nil, err
-	}
-	questions, err := s.subjects.TestQuestions(ctx, test.ID)
-	if err != nil {
-		return nil, err
-	}
-	ids := make([]int64, len(questions))
-	for i, q := range questions {
-		ids[i] = q.ID
-	}
-	statuses, err := s.subjects.QuestionStatuses(ctx, userID, ids)
-	if err != nil {
-		return nil, err
-	}
-	counts := map[int]int{models.StatusNone: 0, models.StatusPartial: 0, models.StatusMastered: 0}
-	for _, id := range ids {
-		counts[statuses[id]]++
+	if row.Attempt.Status != models.AttemptInProgress {
+		s.metas.drop(attemptID) // the attempt is over — its meta is not needed anymore
 	}
 	return &AttemptSummary{
-		Attempt:      attempt,
-		Test:         test,
-		Subject:      subject,
-		Total:        len(questions),
-		StatusCounts: counts,
+		Attempt:      row.Attempt,
+		Test:         row.Test,
+		Subject:      row.Subject,
+		Total:        row.Total,
+		StatusCounts: row.StatusCounts,
 	}, nil
 }
 
@@ -1064,6 +1074,15 @@ func (s *QuizService) wantsTranslation(ctx context.Context, user *models.User, t
 		return false
 	}
 	return s.testTranslatable(ctx, testID)
+}
+
+// TestNeedsTranslationFor is TestNeedsTranslation for an already loaded
+// test row: it skips re-reading the tests row (R-2, test open path).
+func (s *QuizService) TestNeedsTranslationFor(ctx context.Context, user *models.User, test *models.Test) bool {
+	if test == nil || user == nil || user.TestLang != models.TestLangKK || s.translator == nil || !s.translator.Enabled() {
+		return false
+	}
+	return s.subjectTranslatable(ctx, test.SubjectID)
 }
 
 // TestNeedsTranslation is the handler-facing check: true only when opening

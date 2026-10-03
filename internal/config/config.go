@@ -70,6 +70,21 @@ type Config struct {
 	// the default. GEN_OFFPEAK_START_HOUR / GEN_OFFPEAK_END_HOUR (server-local
 	// hours) override it with a custom daily window — used only when the API
 	// is proxied through a provider with a different discount schedule.
+	// R-9 abuse limits / spending cap.
+	//
+	// UserActionInterval (USER_ACTION_INTERVAL_MS, default 300ms, 0 = off):
+	// minimum gap between two actions (taps / messages) of one user; faster
+	// taps are acknowledged and ignored. In-memory, per instance.
+	UserActionInterval time.Duration
+	// PersonalGenPerUserDay (PERSONAL_GEN_PER_USER_DAY, default 3, 0 = no
+	// limit): how many NEW personal weak-topics generations one user may
+	// request per day (clones of an existing test are free and not counted).
+	PersonalGenPerUserDay int
+	// DeepSeekDailyCapUSD (DEEPSEEK_DAILY_CAP_USD, default 2.0, 0 = no cap):
+	// global daily spending cap of paid DeepSeek calls (UTC day). Enforced
+	// in PostgreSQL (ai_spend_daily), valid across instances.
+	DeepSeekDailyCapUSD float64
+
 	OffPeakStartHour int  // custom window start (inclusive); -1 = official schedule
 	OffPeakEndHour   int  // custom window end (exclusive)
 	OffPeakCustom    bool // true when a custom window is configured
@@ -96,6 +111,9 @@ func Load() (*Config, error) {
 		DBMaxConns:             defaultDBMaxConns,
 		GenWorkers:             DefaultGenWorkers,
 		GenDeepSeekConcurrency: DefaultGenDeepSeekConcurrency,
+		UserActionInterval:     DefaultUserActionInterval,
+		PersonalGenPerUserDay:  DefaultPersonalGenPerUserDay,
+		DeepSeekDailyCapUSD:    DefaultDeepSeekDailyCapUSD,
 	}
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV"))) {
 	case "development", "dev", "local", "test":
@@ -111,6 +129,17 @@ func Load() (*Config, error) {
 	}
 	if n, ok := envIntOpt("GEN_DEEPSEEK_CONCURRENCY"); ok && n > 0 {
 		cfg.GenDeepSeekConcurrency = n
+	}
+	if n, ok := envIntOpt("USER_ACTION_INTERVAL_MS"); ok && n >= 0 {
+		cfg.UserActionInterval = time.Duration(n) * time.Millisecond
+	}
+	if n, ok := envIntOpt("PERSONAL_GEN_PER_USER_DAY"); ok && n >= 0 {
+		cfg.PersonalGenPerUserDay = n
+	}
+	if v := strings.TrimSpace(os.Getenv("DEEPSEEK_DAILY_CAP_USD")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			cfg.DeepSeekDailyCapUSD = f
+		}
 	}
 	if start, ok := envIntOpt("GEN_OFFPEAK_START_HOUR"); ok {
 		if end, ok2 := envIntOpt("GEN_OFFPEAK_END_HOUR"); ok2 {
@@ -169,6 +198,13 @@ const (
 	MaxGenWorkers = 16
 	// DefaultGenDeepSeekConcurrency bounds parallel paid generations.
 	DefaultGenDeepSeekConcurrency = 2
+
+	// DefaultUserActionInterval: at most one action per user per 300ms.
+	DefaultUserActionInterval = 300 * time.Millisecond
+	// DefaultPersonalGenPerUserDay: new personal generations per user/day.
+	DefaultPersonalGenPerUserDay = 3
+	// DefaultDeepSeekDailyCapUSD: global daily DeepSeek spend cap (USD).
+	DefaultDeepSeekDailyCapUSD = 2.0
 )
 
 // envIntOpt reads an integer env var; ok is false when it is unset or

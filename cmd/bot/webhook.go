@@ -8,22 +8,28 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Bihan293/Juz40tester/internal/bot"
 )
 
 // updateDispatcher receives Telegram webhook requests and processes the
-// updates asynchronously, with two guarantees the old inline `go func()`
-// lacked:
+// updates asynchronously:
 //
-//   - bounded concurrency (audit #20): at most cap(sem) updates are processed
-//     at once, so a burst of updates cannot spawn thousands of goroutines all
-//     fighting for the (bounded) DB pool;
-//   - graceful shutdown (audit #19): every in-flight update is tracked by a
-//     WaitGroup; Shutdown stops accepting new updates and waits for the
-//     running ones (with a timeout) before main returns, so an answer that
-//     was already acknowledged to Telegram is not lost on deploy.
+//   - bounded concurrency (audit #20): exactly `workers` long-lived worker
+//     goroutines process updates, so a burst can never spawn thousands of
+//     goroutines fighting for the (bounded) DB pool;
+//   - bounded queue (R-3): accepted-but-not-yet-processed updates wait in a
+//     channel of `queueSize` slots. Before this fix every update got its own
+//     goroutine BEFORE acquiring the semaphore, so under a burst goroutines
+//     piled up without any limit. When the queue is full the webhook answers
+//     HTTP 503 immediately — Telegram keeps the update and re-delivers it
+//     later (any non-2xx is retried by Telegram), so nothing is lost and the
+//     request never blocks;
+//   - graceful shutdown (audit #19): Shutdown stops accepting updates (503),
+//     lets the workers drain everything already acknowledged with 200 and
+//     waits for them (with a timeout) before main returns.
 type updateDispatcher struct {
 	secret  string
 	handle  func(ctx context.Context, upd *bot.Update)
@@ -34,26 +40,40 @@ type updateDispatcher struct {
 	base       context.Context
 	cancelBase context.CancelFunc
 
-	sem chan struct{}
-	wg  sync.WaitGroup
+	queue chan *bot.Update
+	wg    sync.WaitGroup // workers
 
-	mu      sync.Mutex
+	mu      sync.Mutex // guards closing + sends on queue (never send on a closed channel)
 	closing bool
+
+	rejected atomic.Int64 // updates refused with 503 because the queue was full
+	lastWarn atomic.Int64 // unix seconds of the last overflow log line
 }
 
-func newUpdateDispatcher(secret string, maxConcurrent int, timeout time.Duration, handle func(context.Context, *bot.Update)) *updateDispatcher {
-	if maxConcurrent <= 0 {
-		maxConcurrent = 1
+// defaultUpdateQueueSize is the bounded webhook queue (R-3).
+const defaultUpdateQueueSize = 1000
+
+func newUpdateDispatcher(secret string, workers, queueSize int, timeout time.Duration, handle func(context.Context, *bot.Update)) *updateDispatcher {
+	if workers <= 0 {
+		workers = 1
+	}
+	if queueSize <= 0 {
+		queueSize = 1
 	}
 	base, cancel := context.WithCancel(context.Background())
-	return &updateDispatcher{
+	d := &updateDispatcher{
 		secret:     secret,
 		handle:     handle,
 		timeout:    timeout,
 		base:       base,
 		cancelBase: cancel,
-		sem:        make(chan struct{}, maxConcurrent),
+		queue:      make(chan *bot.Update, queueSize),
 	}
+	d.wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go d.worker()
+	}
+	return d
 }
 
 // ServeHTTP implements POST /telegram/webhook.
@@ -79,56 +99,87 @@ func (d *updateDispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	if !d.dispatch(&upd) {
-		// Shutting down: ask Telegram to re-deliver to the next instance
-		// instead of silently dropping the update.
+	switch d.enqueue(&upd) {
+	case enqueued:
+		// Respond to Telegram immediately; processing continues asynchronously.
+		w.WriteHeader(http.StatusOK)
+	case queueFull:
+		// Overloaded: ask Telegram to re-deliver later instead of piling up
+		// goroutines or blocking the request (R-3).
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "busy", http.StatusServiceUnavailable)
+	default: // shuttingDown
+		// Ask Telegram to re-deliver to the next instance instead of
+		// silently dropping the update.
 		http.Error(w, "shutting down", http.StatusServiceUnavailable)
-		return
 	}
-	// Respond to Telegram immediately; processing continues asynchronously.
-	w.WriteHeader(http.StatusOK)
 }
 
-// dispatch starts processing of one update. Returns false when the
-// dispatcher is shutting down (the update was not accepted).
-func (d *updateDispatcher) dispatch(upd *bot.Update) bool {
+type enqueueResult int
+
+const (
+	enqueued enqueueResult = iota
+	queueFull
+	shuttingDown
+)
+
+// enqueue puts one update into the bounded queue without blocking.
+func (d *updateDispatcher) enqueue(upd *bot.Update) enqueueResult {
 	d.mu.Lock()
+	defer d.mu.Unlock()
 	if d.closing {
-		d.mu.Unlock()
-		return false
+		return shuttingDown
 	}
-	d.wg.Add(1) // under mu: never races with Shutdown's Wait
-	d.mu.Unlock()
-
-	go func() {
-		defer d.wg.Done()
-		// Semaphore: wait for a free processing slot (or for a forced stop).
-		select {
-		case d.sem <- struct{}{}:
-		case <-d.base.Done():
-			return
+	select {
+	case d.queue <- upd:
+		return enqueued
+	default:
+		n := d.rejected.Add(1)
+		now := time.Now().Unix()
+		if last := d.lastWarn.Load(); now-last >= 10 && d.lastWarn.CompareAndSwap(last, now) {
+			log.Printf("webhook: update queue full (%d) — answering 503, Telegram will re-deliver (rejected so far: %d)", cap(d.queue), n)
 		}
-		defer func() { <-d.sem }()
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("webhook: update %d handler panicked: %v", upd.UpdateID, r)
-			}
-		}()
-		// Detached from the request context so processing survives the
-		// response; the timeout guards against a hung provider/DB call.
-		uctx, cancel := context.WithTimeout(d.base, d.timeout)
-		defer cancel()
-		d.handle(uctx, upd)
-	}()
-	return true
+		return queueFull
+	}
 }
 
-// Shutdown stops accepting updates and waits for the in-flight ones until
-// ctx expires. On timeout the remaining handlers are cancelled and given a
-// brief moment to unwind. Returns ctx.Err() when the graceful wait timed out.
+// worker processes queued updates until the queue is closed and drained.
+func (d *updateDispatcher) worker() {
+	defer d.wg.Done()
+	for upd := range d.queue {
+		if d.base.Err() != nil {
+			continue // forced stop: drop what is left, do not start new work
+		}
+		d.process(upd)
+	}
+}
+
+func (d *updateDispatcher) process(upd *bot.Update) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("webhook: update %d handler panicked: %v", upd.UpdateID, r)
+		}
+	}()
+	// Detached from the request context so processing survives the
+	// response; the timeout guards against a hung provider/DB call.
+	uctx, cancel := context.WithTimeout(d.base, d.timeout)
+	defer cancel()
+	d.handle(uctx, upd)
+}
+
+// QueueLen reports the number of updates waiting for a worker.
+func (d *updateDispatcher) QueueLen() int { return len(d.queue) }
+
+// Shutdown stops accepting updates and waits for the queued and in-flight
+// ones until ctx expires. On timeout the remaining handlers are cancelled
+// (queued updates are dropped) and given a brief moment to unwind. Returns
+// ctx.Err() when the graceful wait timed out.
 func (d *updateDispatcher) Shutdown(ctx context.Context) error {
 	d.mu.Lock()
-	d.closing = true
+	if !d.closing {
+		d.closing = true
+		close(d.queue) // workers drain the rest and exit
+	}
 	d.mu.Unlock()
 
 	done := make(chan struct{})

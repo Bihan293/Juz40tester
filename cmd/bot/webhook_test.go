@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,7 +30,7 @@ func post(d *updateDispatcher, body, secret string) int {
 // never reaches the handler.
 func TestWebhookMalformedJSONReturns200(t *testing.T) {
 	var handled int32
-	d := newUpdateDispatcher("", 4, time.Minute, func(context.Context, *bot.Update) { atomic.AddInt32(&handled, 1) })
+	d := newUpdateDispatcher("", 4, 100, time.Minute, func(context.Context, *bot.Update) { atomic.AddInt32(&handled, 1) })
 	if code := post(d, `{"update_id": 1, "message": {`, ""); code != http.StatusOK {
 		t.Fatalf("malformed update: got HTTP %d, want 200", code)
 	}
@@ -41,7 +42,7 @@ func TestWebhookMalformedJSONReturns200(t *testing.T) {
 
 // TestWebhookSecretEnforced: a wrong / missing secret is rejected with 403.
 func TestWebhookSecretEnforced(t *testing.T) {
-	d := newUpdateDispatcher("s3cret", 4, time.Minute, func(context.Context, *bot.Update) {})
+	d := newUpdateDispatcher("s3cret", 4, 100, time.Minute, func(context.Context, *bot.Update) {})
 	if code := post(d, `{"update_id":1}`, ""); code != http.StatusForbidden {
 		t.Fatalf("missing secret: HTTP %d", code)
 	}
@@ -61,7 +62,7 @@ func TestWebhookShutdownWaitsForUpdates(t *testing.T) {
 	release := make(chan struct{})
 	started := make(chan struct{})
 	var finished int32
-	d := newUpdateDispatcher("", 4, time.Minute, func(ctx context.Context, u *bot.Update) {
+	d := newUpdateDispatcher("", 4, 100, time.Minute, func(ctx context.Context, u *bot.Update) {
 		close(started)
 		<-release
 		atomic.StoreInt32(&finished, 1)
@@ -94,7 +95,7 @@ func TestWebhookShutdownWaitsForUpdates(t *testing.T) {
 // out, the handlers' context is cancelled (no hang on SIGTERM).
 func TestWebhookShutdownTimeoutCancelsHandlers(t *testing.T) {
 	cancelled := make(chan struct{})
-	d := newUpdateDispatcher("", 4, time.Hour, func(ctx context.Context, u *bot.Update) {
+	d := newUpdateDispatcher("", 4, 100, time.Hour, func(ctx context.Context, u *bot.Update) {
 		<-ctx.Done()
 		close(cancelled)
 	})
@@ -117,7 +118,7 @@ func TestWebhookConcurrencyBounded(t *testing.T) {
 	const limit, total = 3, 40
 	var cur, peak, done int32
 	var mu sync.Mutex
-	d := newUpdateDispatcher("", limit, time.Minute, func(ctx context.Context, u *bot.Update) {
+	d := newUpdateDispatcher("", limit, 100, time.Minute, func(ctx context.Context, u *bot.Update) {
 		n := atomic.AddInt32(&cur, 1)
 		mu.Lock()
 		if n > peak {
@@ -166,5 +167,107 @@ func TestSetWebhookStopsOnShutdown(t *testing.T) {
 	err := setWebhookWithRetry(ctx, func(context.Context) error { return errors.New("down") }, 5*time.Millisecond, 10*time.Millisecond)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("want context.Canceled, got %v", err)
+	}
+}
+
+// TestWebhookBurstBoundedGoroutines (R-3): a burst of updates far larger
+// than the worker pool never creates a goroutine per update — the number
+// of goroutines stays ~constant (workers only), all updates are processed.
+func TestWebhookBurstBoundedGoroutines(t *testing.T) {
+	const workers, queue, burst = 4, 1000, 900
+	release := make(chan struct{})
+	var done int32
+	d := newUpdateDispatcher("", workers, queue, time.Minute, func(ctx context.Context, u *bot.Update) {
+		<-release
+		atomic.AddInt32(&done, 1)
+	})
+	before := runtime.NumGoroutine()
+	for i := 0; i < burst; i++ {
+		if code := post(d, `{"update_id":1}`, ""); code != http.StatusOK {
+			t.Fatalf("update %d: HTTP %d", i, code)
+		}
+	}
+	// Before R-3 every update got its own goroutine BEFORE the semaphore:
+	// 900 updates = +900 goroutines. Now the queue holds them as data.
+	if grown := runtime.NumGoroutine() - before; grown > 10 {
+		t.Fatalf("goroutines grew by %d during a burst of %d updates", grown, burst)
+	}
+	if n := d.QueueLen(); n < burst-workers {
+		t.Fatalf("queue holds %d updates, want >= %d", n, burst-workers)
+	}
+	close(release)
+	if err := d.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if done != burst {
+		t.Fatalf("processed %d of %d acknowledged updates", done, burst)
+	}
+}
+
+// TestWebhookQueueOverflowReturns503 (R-3): once workers are busy and the
+// bounded queue is full, the webhook answers 503 FAST (Telegram re-delivers
+// later) instead of blocking or spawning goroutines; capacity frees up
+// again as soon as the backlog is processed.
+func TestWebhookQueueOverflowReturns503(t *testing.T) {
+	const workers, queue = 2, 5
+	release := make(chan struct{})
+	started := make(chan struct{}, workers)
+	var done int32
+	d := newUpdateDispatcher("", workers, queue, time.Minute, func(ctx context.Context, u *bot.Update) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-release
+		atomic.AddInt32(&done, 1)
+	})
+	// Occupy both workers, then fill the queue.
+	for i := 0; i < workers; i++ {
+		if code := post(d, `{"update_id":1}`, ""); code != http.StatusOK {
+			t.Fatalf("HTTP %d", code)
+		}
+	}
+	for i := 0; i < workers; i++ {
+		<-started
+	}
+	for i := 0; i < queue; i++ {
+		if code := post(d, `{"update_id":2}`, ""); code != http.StatusOK {
+			t.Fatalf("queued update %d: HTTP %d", i, code)
+		}
+	}
+	// Overflow: 503, quickly.
+	start := time.Now()
+	for i := 0; i < 20; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/telegram/webhook", strings.NewReader(`{"update_id":3}`))
+		rec := httptest.NewRecorder()
+		d.ServeHTTP(rec, req)
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("overflow update: HTTP %d, want 503", rec.Code)
+		}
+		if rec.Header().Get("Retry-After") == "" {
+			t.Fatal("503 must carry Retry-After")
+		}
+	}
+	if el := time.Since(start); el > time.Second {
+		t.Fatalf("overflow responses took %s — must not block", el)
+	}
+	if d.rejected.Load() != 20 {
+		t.Fatalf("rejected = %d, want 20", d.rejected.Load())
+	}
+	// Drain: everything acknowledged with 200 is processed, then new
+	// updates are accepted again.
+	close(release)
+	deadline := time.Now().Add(3 * time.Second)
+	for atomic.LoadInt32(&done) < workers+queue && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if code := post(d, `{"update_id":4}`, ""); code != http.StatusOK {
+		t.Fatalf("after drain: HTTP %d, want 200", code)
+	}
+	if err := d.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if done != workers+queue+1 {
+		t.Fatalf("processed %d, want %d (no acknowledged update may be lost)", done, workers+queue+1)
 	}
 }

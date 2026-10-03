@@ -29,6 +29,7 @@ import (
 	"github.com/Bihan293/Juz40tester/internal/deepseek"
 	"github.com/Bihan293/Juz40tester/internal/groq"
 	"github.com/Bihan293/Juz40tester/internal/handlers"
+	"github.com/Bihan293/Juz40tester/internal/ratelimit"
 	"github.com/Bihan293/Juz40tester/internal/repositories"
 	"github.com/Bihan293/Juz40tester/internal/services"
 )
@@ -75,9 +76,18 @@ func main() {
 
 	// DeepSeek AI test generation. Optional: without DEEPSEEK_API_KEY the bot
 	// still works with the seeded tests, AI generation is simply disabled.
+	// R-9: global daily DeepSeek spending cap, kept in PostgreSQL
+	// (ai_spend_daily) and fed by the client's per-call cost estimate.
+	budget := services.NewDailyBudget(repositories.NewSpendRepository(pool), cfg.DeepSeekDailyCapUSD)
 	var ds *deepseek.Client
 	if cfg.DeepSeekAPIKey != "" {
 		ds = deepseek.New(cfg.DeepSeekAPIKey, cfg.DeepSeekModel, cfg.DeepSeekReasonerModel, cfg.DeepSeekBaseURL)
+		if budget != nil {
+			ds.WithBudget(budget, cfg.IsOffPeak)
+			log.Printf("deepseek: daily spending cap $%.2f (UTC day)", cfg.DeepSeekDailyCapUSD)
+		} else {
+			log.Println("deepseek: DEEPSEEK_DAILY_CAP_USD=0 — NO daily spending cap")
+		}
 		offPeak := "official DeepSeek schedule (peak 01-04 & 06-10 UTC, Mon-Fri)"
 		if cfg.OffPeakCustom {
 			offPeak = fmt.Sprintf("custom window %02d:00-%02d:00 server-local", cfg.OffPeakStartHour, cfg.OffPeakEndHour)
@@ -103,7 +113,7 @@ func main() {
 	} else {
 		log.Println("groq: GROQ_API_KEY not set — all AI work goes to DeepSeek (paid)")
 	}
-	genSvc := services.NewGeneratorService(ds, cfg, genRepo, subjectRepo, stateRepo).WithGroq(gq)
+	genSvc := services.NewGeneratorService(ds, cfg, genRepo, subjectRepo, stateRepo).WithGroq(gq).WithBudget(budget)
 	// Kazakh test translations: reuse the same DeepSeek client (flash, low
 	// effort). A question is translated once, cached in the DB and shared by
 	// every user — no per-user API calls. The generator gets the translator
@@ -117,7 +127,7 @@ func main() {
 	quiz := services.NewQuizService(subjectRepo, attemptRepo, stateRepo, genRepo, genSvc, userRepo).
 		WithTranslator(translatorSvc)
 	tg := bot.NewClient(cfg.BotToken)
-	h := handlers.New(tg, userRepo, quiz)
+	h := handlers.New(tg, userRepo, quiz).WithActionLimiter(ratelimit.New(cfg.UserActionInterval))
 
 	// Background worker: processes the AI test-generation queue (thinking
 	// model with adaptive effort, off-peak deferral, cost logging). No-op
@@ -195,7 +205,10 @@ func main() {
 	go selfPing(workerCtx, cfg.WebhookURL+"/ping")
 
 	// Updates: bounded concurrency + tracked for graceful shutdown.
-	updates := newUpdateDispatcher(cfg.WebhookSecret, maxConcurrentUpdates, updateTimeout, h.HandleUpdate)
+	// R-3: a fixed pool of maxConcurrentUpdates workers + a bounded queue of
+	// defaultUpdateQueueSize; overflow is answered with 503 (Telegram
+	// re-delivers later).
+	updates := newUpdateDispatcher(cfg.WebhookSecret, maxConcurrentUpdates, defaultUpdateQueueSize, updateTimeout, h.HandleUpdate)
 	mux.Handle("POST /telegram/webhook", updates)
 
 	srv := &http.Server{
@@ -253,6 +266,10 @@ func main() {
 	// 3. Wait for acknowledged updates that are still being processed.
 	if err := updates.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown: some updates did not finish in time: %v", err)
+	}
+	// 3b. Flush Telegram requests deferred by a 429 (best effort).
+	if err := tg.Close(shutdownCtx); err != nil {
+		log.Printf("shutdown: %d deferred Telegram request(s) dropped: %v", tg.PendingDeferred(), err)
 	}
 	// 4. Wait for the background loops before the DB pool is closed.
 	waitTimeout(&bgWG, 5*time.Second)

@@ -32,6 +32,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -107,6 +108,34 @@ type GeneratorService struct {
 	// dsSem bounds paid DeepSeek generation calls in flight across all
 	// workers (cfg.GenDeepSeekConcurrency).
 	dsSem chan struct{}
+	// budget is the DeepSeek daily cap (nil = no cap); used to schedule the
+	// retry of a capped job. The hard guard itself is in the DeepSeek client.
+	budget *DailyBudget
+}
+
+// WithBudget wires the DeepSeek daily spending cap (R-9).
+func (g *GeneratorService) WithBudget(b *DailyBudget) *GeneratorService {
+	g.budget = b
+	return g
+}
+
+// ErrPersonalGenLimit: the user already requested PersonalGenPerUserDay new
+// personal weak-topics generations today (R-9).
+var ErrPersonalGenLimit = errors.New("daily personal generation limit reached")
+
+// personalGenLimit returns the configured per-user daily limit (0 = none).
+func (g *GeneratorService) personalGenLimit() int {
+	if g.cfg == nil {
+		return 0
+	}
+	return g.cfg.PersonalGenPerUserDay
+}
+
+// dayStart is the start of the current calendar day in the bot's calendar
+// (Kazakhstan, the same one the 🔥 streak uses).
+func dayStart(now time.Time) time.Time {
+	y, m, d := now.In(models.StreakLocation).Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, models.StreakLocation)
 }
 
 func NewGeneratorService(ds *deepseek.Client, cfg *config.Config, gen *repositories.GenerationRepository, subjects *repositories.SubjectRepository, state *repositories.StateRepository) *GeneratorService {
@@ -713,6 +742,26 @@ func (g *GeneratorService) EnsurePersonalTest(ctx context.Context, userID, subje
 		return cloned, false, topics, nil
 	}
 
+	// R-9: a NEW paid-capable generation (not a clone, not an already
+	// queued job) counts against the per-user daily limit. The count lives
+	// in the DB (generation_jobs), so it holds across instances/restarts.
+	if limit := g.personalGenLimit(); limit > 0 {
+		already, err := g.gen.HasPendingOrRunningPersonalJob(ctx, subjectID, userID)
+		if err != nil {
+			return nil, false, nil, err
+		}
+		if already {
+			return nil, true, topics, nil // the queued job is not a new request
+		}
+		n, err := g.gen.PersonalJobsSince(ctx, userID, dayStart(g.now()))
+		if err != nil {
+			return nil, false, nil, err
+		}
+		if n >= limit {
+			log.Printf("generator: user %d hit the daily personal generation limit (%d)", userID, limit)
+			return nil, false, topics, ErrPersonalGenLimit
+		}
+	}
 	if err := g.gen.EnqueuePersonalJob(ctx, subjectID, userID, fp); err != nil {
 		return nil, false, nil, err
 	}
@@ -981,6 +1030,23 @@ func (g *GeneratorService) executeJob(ctx context.Context, job *models.Generatio
 			log.Printf("generator: release job %d on shutdown: %v", job.ID, rerr)
 		} else {
 			log.Printf("generator: job %d interrupted by shutdown — returned to the queue", job.ID)
+		}
+		return
+	}
+	if runErr != nil && errors.Is(runErr, deepseek.ErrBudgetExceeded) {
+		// R-9: every free provider failed and the paid fallback is capped
+		// for today. Not a real failure — park the job (attempt not
+		// counted) and retry later: the free Groq quota may come back, and
+		// the DeepSeek budget resets at the next UTC day.
+		until := g.now().Add(retryDelay)
+		if g.budget != nil {
+			if next := g.budget.NextDay(); next.Before(until) || g.gq == nil {
+				until = next
+			}
+		}
+		log.Printf("generator: job %d deferred until %s — DeepSeek daily cap reached and no free provider succeeded", job.ID, until.Format(time.RFC3339))
+		if derr := g.gen.DeferJob(ctx, job.ID, until); derr != nil {
+			log.Printf("generator: defer job %d: %v", job.ID, derr)
 		}
 		return
 	}

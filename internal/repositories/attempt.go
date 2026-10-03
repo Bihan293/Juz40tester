@@ -110,14 +110,24 @@ func (r *AttemptRepository) createAttemptTx(ctx context.Context, userID, testID 
 		return nil, err
 	}
 
-	for i, qid := range questionIDs {
+	// R-2: ONE batch INSERT for all questions of the attempt (it used to be
+	// one INSERT per question — 20 round trips inside the transaction).
+	// unnest() zips the three arrays row by row; WITH ORDINALITY yields the
+	// 1-based position in the shuffled order.
+	orders := make([]string, len(questionIDs))
+	for i := range questionIDs {
 		orderJSON, err := json.Marshal(optionOrders[i])
 		if err != nil {
 			return nil, err
 		}
+		orders[i] = string(orderJSON)
+	}
+	if len(questionIDs) > 0 {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO attempt_questions (attempt_id, question_id, position, option_order)
-			VALUES ($1, $2, $3, $4)`, a.ID, qid, i+1, orderJSON); err != nil {
+			SELECT $1, u.qid, u.pos, u.ord::jsonb
+			FROM unnest($2::bigint[], $3::text[]) WITH ORDINALITY AS u(qid, ord, pos)`,
+			a.ID, questionIDs, orders); err != nil {
 			return nil, err
 		}
 	}
@@ -210,19 +220,45 @@ func (r *AttemptRepository) GetAttemptForUser(ctx context.Context, attemptID, us
 	return &a, nil
 }
 
-// CurrentQuestion returns the first unanswered question of the attempt.
+// CurrentQuestion returns the first unanswered question of the attempt
+// (nil, nil, nil when everything is answered). One JOIN query.
 func (r *AttemptRepository) CurrentQuestion(ctx context.Context, attemptID int64) (*models.AttemptQuestion, *models.Question, error) {
+	return r.questionJoin(ctx, attemptID, 0)
+}
+
+// QuestionAtPosition returns the attempt question at a fixed position
+// (ErrNotFound when there is none). One JOIN query.
+func (r *AttemptRepository) QuestionAtPosition(ctx context.Context, attemptID int64, position int) (*models.AttemptQuestion, *models.Question, error) {
+	if position <= 0 {
+		return nil, nil, ErrNotFound
+	}
+	aq, q, err := r.questionJoin(ctx, attemptID, position)
+	if err == nil && aq == nil {
+		return nil, nil, ErrNotFound
+	}
+	return aq, q, err
+}
+
+// questionJoin loads attempt_question + question in one round trip.
+// position 0 = the first unanswered question.
+func (r *AttemptRepository) questionJoin(ctx context.Context, attemptID int64, position int) (*models.AttemptQuestion, *models.Question, error) {
 	var aq models.AttemptQuestion
+	var q models.Question
 	var sel sql.NullString
 	var orderJSON []byte
 	err := r.pool.QueryRow(ctx, `
-		SELECT id, attempt_id, question_id, position, answered, selected_answer, is_correct, option_order
-		FROM attempt_questions
-		WHERE attempt_id = $1 AND NOT answered
-		ORDER BY position
-		LIMIT 1`, attemptID).
-		Scan(&aq.ID, &aq.AttemptID, &aq.QuestionID, &aq.Position, &aq.Answered,
-			&sel, &aq.IsCorrect, &orderJSON)
+		SELECT aq.id, aq.attempt_id, aq.question_id, aq.position, aq.answered, aq.selected_answer, aq.is_correct, aq.option_order,
+		       q.id, q.subject_id, q.question_text, q.option_a, q.option_b, q.option_c,
+		       q.option_d, q.correct_answer, q.topic, q.difficulty
+		FROM attempt_questions aq
+		JOIN questions q ON q.id = aq.question_id
+		WHERE aq.attempt_id = $1
+		  AND (CASE WHEN $2::int = 0 THEN NOT aq.answered ELSE aq.position = $2::int END)
+		ORDER BY aq.position
+		LIMIT 1`, attemptID, position).
+		Scan(&aq.ID, &aq.AttemptID, &aq.QuestionID, &aq.Position, &aq.Answered, &sel, &aq.IsCorrect, &orderJSON,
+			&q.ID, &q.SubjectID, &q.Text, &q.OptionA, &q.OptionB, &q.OptionC,
+			&q.OptionD, &q.CorrectAnswer, &q.Topic, &q.Difficulty)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil, nil
 	}
@@ -233,53 +269,172 @@ func (r *AttemptRepository) CurrentQuestion(ctx context.Context, attemptID int64
 	if err := json.Unmarshal(orderJSON, &aq.OptionOrder); err != nil {
 		return nil, nil, err
 	}
-
-	q := &models.Question{}
-	err = r.pool.QueryRow(ctx, `
-		SELECT id, subject_id, question_text, option_a, option_b, option_c,
-		       option_d, correct_answer, topic, difficulty
-		FROM questions WHERE id = $1`, aq.QuestionID).
-		Scan(&q.ID, &q.SubjectID, &q.Text, &q.OptionA, &q.OptionB, &q.OptionC,
-			&q.OptionD, &q.CorrectAnswer, &q.Topic, &q.Difficulty)
-	if err != nil {
-		return nil, nil, err
-	}
-	return &aq, q, nil
+	return &aq, &q, nil
 }
 
-// QuestionAtPosition returns the attempt question at a fixed position.
-func (r *AttemptRepository) QuestionAtPosition(ctx context.Context, attemptID int64, position int) (*models.AttemptQuestion, *models.Question, error) {
-	var aq models.AttemptQuestion
+// QuestionRow is everything rendering one question of an attempt needs,
+// loaded by LoadQuestionView in ONE query.
+type QuestionRow struct {
+	Attempt  *models.TestAttempt
+	AQ       *models.AttemptQuestion // nil when no question matched (all answered / bad position)
+	Question *models.Question
+	// Meta is filled only when requested (withMeta). It is immutable for
+	// the lifetime of an attempt (question count, subject name), except
+	// Translated, which can only grow while a translation completes.
+	Meta *TestViewMeta
+	// Translation is the cached translation of THIS question in the
+	// requested language (nil when lang is "" or there is none).
+	Translation *models.QuestionTranslation
+}
+
+// LoadQuestionView loads, in a single round trip:
+//   - the attempt, with the OWNERSHIP check (a.user_id = userID) — a foreign
+//     or missing attempt yields ErrNotFound, exactly like GetAttemptForUser;
+//   - the attempt question (position > 0: that position; position == 0: the
+//     first unanswered one) joined with its master question row;
+//   - optionally the TestViewMeta of the test (withMeta) — callers that
+//     already have it for this attempt pass false and reuse it;
+//   - optionally the cached translation of the question (lang != "").
+//
+// It replaces GetAttemptForUser + CurrentQuestion/QuestionAtPosition (2
+// queries) + TestViewMeta + TranslationForQuestion (R-2).
+func (r *AttemptRepository) LoadQuestionView(ctx context.Context, attemptID, userID int64, position int, withMeta bool, lang string) (*QuestionRow, error) {
+	var a models.TestAttempt
+	var aqID, aqAttempt, aqQID, qID, qSubject sql.NullInt64
+	var aqPos, qDiff sql.NullInt32
+	var aqAnswered sql.NullBool
 	var sel sql.NullString
 	var orderJSON []byte
-	err := r.pool.QueryRow(ctx, `
-		SELECT id, attempt_id, question_id, position, answered, selected_answer, is_correct, option_order
-		FROM attempt_questions
-		WHERE attempt_id = $1 AND position = $2`, attemptID, position).
-		Scan(&aq.ID, &aq.AttemptID, &aq.QuestionID, &aq.Position, &aq.Answered,
-			&sel, &aq.IsCorrect, &orderJSON)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, nil, err
-	}
-	aq.SelectedAnswer = sel.String
-	if err := json.Unmarshal(orderJSON, &aq.OptionOrder); err != nil {
-		return nil, nil, err
-	}
+	var isCorrect *bool
+	var qText, qA, qB, qC, qD, qCorrect, qTopic sql.NullString
+	var subjName string
+	var total, translated int
+	var trText, trA, trB, trC, trD, trTopic sql.NullString
 
-	q := &models.Question{}
-	err = r.pool.QueryRow(ctx, `
-		SELECT id, subject_id, question_text, option_a, option_b, option_c,
-		       option_d, correct_answer, topic, difficulty
-		FROM questions WHERE id = $1`, aq.QuestionID).
-		Scan(&q.ID, &q.SubjectID, &q.Text, &q.OptionA, &q.OptionB, &q.OptionC,
-			&q.OptionD, &q.CorrectAnswer, &q.Topic, &q.Difficulty)
-	if err != nil {
-		return nil, nil, err
+	err := r.pool.QueryRow(ctx, `
+		SELECT a.id, a.user_id, a.test_id, a.status, a.current_position, a.correct_count, a.wrong_count, a.started_at, a.completed_at,
+		       aq.id, aq.attempt_id, aq.question_id, aq.position, aq.answered, aq.selected_answer, aq.is_correct, aq.option_order,
+		       q.id, q.subject_id, q.question_text, q.option_a, q.option_b, q.option_c, q.option_d, q.correct_answer, q.topic, q.difficulty,
+		       CASE WHEN $4::bool THEN (SELECT s.name FROM tests t JOIN subjects s ON s.id = t.subject_id WHERE t.id = a.test_id) ELSE '' END,
+		       CASE WHEN $4::bool THEN (SELECT COUNT(*) FROM test_questions tq WHERE tq.test_id = a.test_id) ELSE 0 END,
+		       CASE WHEN $4::bool THEN (SELECT COUNT(DISTINCT tr2.question_id)
+		                                  FROM test_questions tq
+		                                  JOIN question_translations tr2
+		                                    ON tr2.question_id = tq.question_id AND tr2.lang = $6
+		                                 WHERE tq.test_id = a.test_id) ELSE 0 END,
+		       tr.question_text, tr.option_a, tr.option_b, tr.option_c, tr.option_d, tr.topic
+		FROM test_attempts a
+		LEFT JOIN LATERAL (
+			SELECT * FROM attempt_questions x
+			WHERE x.attempt_id = a.id
+			  AND (CASE WHEN $3::int = 0 THEN NOT x.answered ELSE x.position = $3::int END)
+			ORDER BY x.position
+			LIMIT 1
+		) aq ON TRUE
+		LEFT JOIN questions q ON q.id = aq.question_id
+		LEFT JOIN question_translations tr ON tr.question_id = q.id AND tr.lang = $5 AND $5 <> ''
+		WHERE a.id = $1 AND a.user_id = $2`,
+		attemptID, userID, position, withMeta, lang, models.TestLangKK).
+		Scan(&a.ID, &a.UserID, &a.TestID, &a.Status, &a.CurrentPosition, &a.CorrectCount, &a.WrongCount, &a.StartedAt, &a.CompletedAt,
+			&aqID, &aqAttempt, &aqQID, &aqPos, &aqAnswered, &sel, &isCorrect, &orderJSON,
+			&qID, &qSubject, &qText, &qA, &qB, &qC, &qD, &qCorrect, &qTopic, &qDiff,
+			&subjName, &total, &translated,
+			&trText, &trA, &trB, &trC, &trD, &trTopic)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
 	}
-	return &aq, q, nil
+	if err != nil {
+		return nil, err
+	}
+	row := &QuestionRow{Attempt: &a}
+	if withMeta {
+		row.Meta = &TestViewMeta{SubjectName: subjName, Total: total, Translated: translated}
+	}
+	if !aqID.Valid || !qID.Valid {
+		return row, nil
+	}
+	aq := &models.AttemptQuestion{
+		ID: aqID.Int64, AttemptID: aqAttempt.Int64, QuestionID: aqQID.Int64,
+		Position: int(aqPos.Int32), Answered: aqAnswered.Bool, SelectedAnswer: sel.String, IsCorrect: isCorrect,
+	}
+	if err := json.Unmarshal(orderJSON, &aq.OptionOrder); err != nil {
+		return nil, err
+	}
+	row.AQ = aq
+	row.Question = &models.Question{
+		ID: qID.Int64, SubjectID: qSubject.Int64, Text: qText.String,
+		OptionA: qA.String, OptionB: qB.String, OptionC: qC.String, OptionD: qD.String,
+		CorrectAnswer: qCorrect.String, Topic: qTopic.String, Difficulty: int(qDiff.Int32),
+	}
+	if trText.Valid {
+		row.Translation = &models.QuestionTranslation{
+			QuestionID: qID.Int64, Lang: lang, Text: trText.String,
+			OptionA: trA.String, OptionB: trB.String, OptionC: trC.String, OptionD: trD.String,
+			Topic: trTopic.String, CorrectAnswer: qCorrect.String,
+		}
+	}
+	return row, nil
+}
+
+// SummaryRow is everything the result screen needs (see LoadSummary).
+type SummaryRow struct {
+	Attempt      *models.TestAttempt
+	Test         *models.Test
+	Subject      *models.Subject
+	Total        int
+	StatusCounts map[int]int
+}
+
+// LoadSummary loads the attempt (ownership-checked), its test, the subject,
+// the question count and the user's CURRENT 🔴🟡🟢 counts over the test's
+// questions in ONE query (it used to be 5: attempt, test, subject, test
+// questions, statuses). A question without a progress row counts as 🔴,
+// exactly as before.
+func (r *AttemptRepository) LoadSummary(ctx context.Context, attemptID, userID int64) (*SummaryRow, error) {
+	var a models.TestAttempt
+	var t models.Test
+	var s models.Subject
+	var topicsJSON []byte
+	var owner sql.NullInt64
+	var total, red, yellow, green int
+	err := r.pool.QueryRow(ctx, `
+		SELECT a.id, a.user_id, a.test_id, a.status, a.current_position, a.correct_count, a.wrong_count, a.started_at, a.completed_at,
+		       t.id, t.subject_id, t.test_number, t.title, t.is_active, t.kind, t.topics, t.owner_user_id,
+		       s.id, s.name, s.position,
+		       st.total, st.red, st.yellow, st.green
+		FROM test_attempts a
+		JOIN tests t ON t.id = a.test_id
+		JOIN subjects s ON s.id = t.subject_id
+		CROSS JOIN LATERAL (
+			SELECT COUNT(*)::int                                                AS total,
+			       COUNT(*) FILTER (WHERE COALESCE(p.status, 0) = 0)::int      AS red,
+			       COUNT(*) FILTER (WHERE p.status = 1)::int                   AS yellow,
+			       COUNT(*) FILTER (WHERE p.status = 2)::int                   AS green
+			FROM test_questions tq
+			JOIN questions q ON q.id = tq.question_id
+			LEFT JOIN user_question_progress p
+			       ON p.user_id = a.user_id AND p.question_id = tq.question_id
+			WHERE tq.test_id = t.id
+		) st
+		WHERE a.id = $1 AND a.user_id = $2`, attemptID, userID).
+		Scan(&a.ID, &a.UserID, &a.TestID, &a.Status, &a.CurrentPosition, &a.CorrectCount, &a.WrongCount, &a.StartedAt, &a.CompletedAt,
+			&t.ID, &t.SubjectID, &t.TestNumber, &t.Title, &t.IsActive, &t.Kind, &topicsJSON, &owner,
+			&s.ID, &s.Name, &s.Position,
+			&total, &red, &yellow, &green)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(topicsJSON) > 0 {
+		_ = json.Unmarshal(topicsJSON, &t.Topics)
+	}
+	t.OwnerUserID = owner.Int64
+	return &SummaryRow{
+		Attempt: &a, Test: &t, Subject: &s, Total: total,
+		StatusCounts: map[int]int{models.StatusNone: red, models.StatusPartial: yellow, models.StatusMastered: green},
+	}, nil
 }
 
 // SubmitAnswer records the user's answer atomically:

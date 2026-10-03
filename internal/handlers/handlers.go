@@ -13,6 +13,7 @@ import (
 
 	"github.com/Bihan293/Juz40tester/internal/bot"
 	"github.com/Bihan293/Juz40tester/internal/models"
+	"github.com/Bihan293/Juz40tester/internal/ratelimit"
 	"github.com/Bihan293/Juz40tester/internal/repositories"
 	"github.com/Bihan293/Juz40tester/internal/services"
 )
@@ -74,11 +75,31 @@ type Handler struct {
 	// hidden for the next test, so at most one note exists per chat
 	// (before, every finished test left another «🏠 Главное меню…» line).
 	kbNotes sync.Map
+	// kbHidden remembers chats where THIS process hid the reply keyboard
+	// (chatID -> true) and nothing has shown it since — a repeated hide is
+	// then skipped without any Telegram call (R-2).
+	kbHidden sync.Map
+	// limiter throttles actions per Telegram user (R-9): at most one every
+	// cfg.UserActionInterval. In memory, per instance (see ratelimit).
+	limiter *ratelimit.Limiter
 }
 
 // New creates a Handler.
 func New(tg *bot.Client, users *repositories.UserRepository, quiz *services.QuizService) *Handler {
 	return &Handler{tg: tg, users: users, quiz: quiz}
+}
+
+// WithActionLimiter installs the per-user tap throttle (R-9). nil = off.
+func (h *Handler) WithActionLimiter(l *ratelimit.Limiter) *Handler {
+	h.limiter = l
+	return h
+}
+
+// throttled reports (and records) whether this action of the Telegram user
+// comes too fast after the previous one. It is checked BEFORE any DB work,
+// so tap-spam costs neither the user upsert nor any other query.
+func (h *Handler) throttled(tgUserID int64) bool {
+	return h.limiter != nil && !h.limiter.Allow(tgUserID)
 }
 
 // HandleUpdate processes a single webhook update. It never panics; errors are logged.
@@ -133,6 +154,10 @@ func (h *Handler) handleMessage(ctx context.Context, m *bot.Message) {
 	if m.Chat.Type != "" && m.Chat.Type != "private" {
 		return
 	}
+	// R-9: message spam (e.g. a held-down /start) is silently ignored.
+	if h.throttled(m.From.ID) {
+		return
+	}
 	user, err := h.ensureUser(ctx, m.From)
 	if err != nil {
 		log.Printf("upsert user %d: %v", m.From.ID, err)
@@ -177,19 +202,37 @@ func mainMenuKeyboard() *bot.ReplyKeyboardMarkup {
 // hideReplyKeyboard sends a tiny message with ReplyKeyboardRemove so the
 // bottom menu (Предметы / Слабые темы / Статистика / Настройки) disappears
 // while a test is in progress and cannot distract or break the flow.
+//
+// R-2: fewer Telegram calls.
+//   - When this process already hid the menu in this chat (and nothing has
+//     shown it again since), the call is a no-op — 0 requests instead of 3.
+//   - Otherwise the removal vehicle and the previous «menu is back» note
+//     are deleted with ONE deleteMessages call (was 2 deleteMessage calls).
+//
+// The hidden state is per process (in memory): after a restart the state is
+// unknown and the menu is hidden again the normal way, never skipped.
 func (h *Handler) hideReplyKeyboard(ctx context.Context, chatID int64) {
+	if v, ok := h.kbHidden.Load(chatID); ok && v.(bool) {
+		return
+	}
 	msgID, err := h.tg.SendMessage(ctx, chatID, "✍️ Идёт тест — меню скрыто до конца. Вопросы ниже 👇", bot.RemoveKeyboard)
 	if err != nil {
 		log.Printf("hide reply keyboard: %v", err)
 		return
 	}
+	h.kbHidden.Store(chatID, true)
 	// The message is only the keyboard-removal vehicle — delete it so the
-	// chat stays clean. The keyboard stays hidden after the deletion.
-	if err := h.tg.DeleteMessage(ctx, chatID, msgID); err != nil {
-		log.Printf("delete keyboard-removal note: %v", err)
+	// chat stays clean (the keyboard stays hidden after the deletion),
+	// together with the note that carried the menu: it is useless now.
+	ids := []int64{msgID}
+	if prev, ok := h.kbNotes.LoadAndDelete(chatID); ok {
+		if old, ok := prev.(int64); ok && old != msgID {
+			ids = append(ids, old)
+		}
 	}
-	// The menu is hidden now — the note that carried it is useless.
-	h.dropKeyboardNote(ctx, chatID)
+	if err := h.tg.DeleteMessages(ctx, chatID, ids); err != nil {
+		log.Printf("delete keyboard-removal note(s): %v", err)
+	}
 }
 
 // restoreReplyKeyboard brings the bottom main menu back once the test is
@@ -202,30 +245,20 @@ func (h *Handler) hideReplyKeyboard(ctx context.Context, chatID int64) {
 // kept: the previous one is deleted right after the new one is sent
 // (deleting an OLDER message does not affect the keyboard of the newer
 // one), and the current one is deleted when the next test hides the menu.
+// In the normal test cycle the previous note was already removed by
+// hideReplyKeyboard, so this is ONE Telegram call.
 func (h *Handler) restoreReplyKeyboard(ctx context.Context, chatID int64) {
 	msgID, err := h.tg.SendMessage(ctx, chatID, "🏠 Меню снова доступно 👇", mainMenuKeyboard())
 	if err != nil {
 		log.Printf("restore reply keyboard: %v", err)
 		return
 	}
+	h.kbHidden.Delete(chatID)
 	if prev, loaded := h.kbNotes.Swap(chatID, msgID); loaded {
 		if old, ok := prev.(int64); ok && old != msgID {
 			if err := h.tg.DeleteMessage(ctx, chatID, old); err != nil {
 				log.Printf("delete previous menu note: %v", err)
 			}
-		}
-	}
-}
-
-// dropKeyboardNote deletes the remembered menu-restore note of the chat.
-func (h *Handler) dropKeyboardNote(ctx context.Context, chatID int64) {
-	prev, ok := h.kbNotes.LoadAndDelete(chatID)
-	if !ok {
-		return
-	}
-	if old, ok := prev.(int64); ok {
-		if err := h.tg.DeleteMessage(ctx, chatID, old); err != nil {
-			log.Printf("delete menu note: %v", err)
 		}
 	}
 }
@@ -244,7 +277,10 @@ func (h *Handler) sendMainMenu(ctx context.Context, chatID int64, user *models.U
 	}
 	if _, err := h.tg.SendMessage(ctx, chatID, text, mainMenuKeyboard()); err != nil {
 		log.Printf("send main menu: %v", err)
+		return
 	}
+	h.kbHidden.Delete(chatID) // the menu keyboard is visible again
+
 }
 
 // streakBadge renders the daily-streak flame for the main menu: from the
@@ -581,6 +617,10 @@ func (h *Handler) editWeakMenu(ctx context.Context, cb *bot.CallbackQuery, user 
 // visit generates a fresh test. Nothing is generated until the user taps.
 func (h *Handler) openWeakSubject(ctx context.Context, cb *bot.CallbackQuery, user *models.User, subjectID int64) {
 	test, pending, topics, err := h.quiz.EnsurePersonalTest(ctx, user.ID, subjectID)
+	if errors.Is(err, services.ErrPersonalGenLimit) {
+		h.answerAlert(ctx, cb, "На сегодня лимит новых персональных тестов исчерпан 🙏 Пройди уже готовые тесты в «📚 Предметы» — завтра соберу новый тест по слабым темам.")
+		return
+	}
 	if err != nil {
 		log.Printf("personal test %d/%d: %v", user.ID, subjectID, err)
 		h.answerCallback(ctx, cb, "Ошибка загрузки теста")
@@ -660,7 +700,7 @@ func (h *Handler) openTest(ctx context.Context, cb *bot.CallbackQuery, user *mod
 	h.answerCallback(ctx, cb, "")
 	// Language subjects (Русский/Английский/Казахский язык, литература) are
 	// never translated — TestNeedsTranslation is false for them.
-	if h.quiz.TestNeedsTranslation(ctx, user, testID) {
+	if h.quiz.TestNeedsTranslationFor(ctx, user, test) {
 		h.ensureTranslatedWithNote(ctx, cb.Message.Chat.ID, user, testID)
 	}
 
@@ -679,7 +719,8 @@ func (h *Handler) openTest(ctx context.Context, cb *bot.CallbackQuery, user *mod
 		return
 	}
 
-	attempt, err := h.quiz.StartTest(ctx, user.ID, testID)
+	// The test row is already loaded above — no second GetTest (R-2).
+	attempt, err := h.quiz.StartTestFor(ctx, user.ID, test)
 	if errors.Is(err, repositories.ErrNotFound) {
 		h.failOpenTest(ctx, cb, "Тест не найден")
 		return
@@ -1388,6 +1429,16 @@ func (h *Handler) showSubjectLeaderboard(ctx context.Context, cb *bot.CallbackQu
 // --- Callbacks router -----------------------------------------------------------
 
 func (h *Handler) handleCallback(ctx context.Context, cb *bot.CallbackQuery) {
+	// R-9: a tap within UserActionInterval of the previous one is only
+	// acknowledged (stops the spinner) — no DB query, no other Telegram
+	// call. Duplicate answer taps are thus dropped before SubmitAnswer
+	// (which stays idempotent on its own anyway).
+	if h.throttled(cb.From.ID) {
+		if err := h.tg.AnswerCallbackQuery(ctx, cb.ID, ""); err != nil {
+			log.Printf("answer throttled callback: %v", err)
+		}
+		return
+	}
 	user, err := h.ensureUser(ctx, cb.From)
 	if err != nil {
 		log.Printf("upsert user %d: %v", cb.From.ID, err)
@@ -1537,6 +1588,11 @@ func (h *Handler) editMessage(ctx context.Context, cb *bot.CallbackQuery, text s
 		// chat (it happened on repeated taps). Everything else (message too
 		// old to edit, deleted message) falls back to a new message.
 		if strings.Contains(err.Error(), "message is not modified") {
+			return
+		}
+		// Rate limited: the edit is queued and will be applied later — a
+		// fallback send now would duplicate the message (R-3).
+		if bot.IsDeferred(err) {
 			return
 		}
 		if _, err2 := h.tg.SendMessage(ctx, cb.Message.Chat.ID, text, kb); err2 != nil {
@@ -1728,7 +1784,7 @@ func (h *Handler) watchGeneration(key string, chatID, msgID int64,
 // the message) the text is sent as a new message instead.
 func (h *Handler) editNote(ctx context.Context, chatID, msgID int64, text string, kb *bot.InlineKeyboardMarkup) {
 	if err := h.tg.EditMessageText(ctx, chatID, msgID, text, kb); err != nil {
-		if strings.Contains(err.Error(), "message is not modified") {
+		if strings.Contains(err.Error(), "message is not modified") || bot.IsDeferred(err) {
 			return
 		}
 		if _, err2 := h.tg.SendMessage(ctx, chatID, text, kb); err2 != nil {

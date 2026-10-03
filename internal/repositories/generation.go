@@ -400,6 +400,30 @@ func (r *GenerationRepository) EnqueuePersonalJob(ctx context.Context, subjectID
 	return err
 }
 
+// PersonalJobsSince counts the user's personal generation jobs created at
+// or after since (any status: every job is a generation request). Used for
+// the per-user daily limit (R-9); clones of an existing test never create
+// a job and therefore never count.
+func (r *GenerationRepository) PersonalJobsSince(ctx context.Context, userID int64, since time.Time) (int, error) {
+	var n int
+	err := r.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM generation_jobs
+		WHERE kind = 'personal' AND owner_user_id = $1 AND created_at >= $2`, userID, since).Scan(&n)
+	return n, err
+}
+
+// DeferJob hands a 'running' job back to the queue until `until` without
+// counting the run as an attempt (R-9: the daily DeepSeek cap is reached —
+// retrying before the next day would only fail again and burn attempts).
+func (r *GenerationRepository) DeferJob(ctx context.Context, jobID int64, until time.Time) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE generation_jobs
+		SET status = 'pending', not_before = $2,
+		    attempts = GREATEST(attempts - 1, 0), updated_at = now()
+		WHERE id = $1 AND status = 'running'`, jobID, until)
+	return err
+}
+
 // ReviveChainJob re-queues a FAILED chain job (a generation that exhausted
 // its retries) as a fresh urgent pending job. Triggered when the user taps
 // the ⏳ button of a test that never appeared: without this path a failed
