@@ -335,6 +335,14 @@ func (r *GenerationRepository) DeletePersonalTest(ctx context.Context, userID, t
 		return err
 	}
 	if len(qids) > 0 {
+		// R-8b: questions may be shared with other clones and survive the
+		// delete below — drop THIS user's progress on them explicitly (it
+		// used to vanish via the cascade of the question row).
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM user_question_progress
+			WHERE user_id = $1 AND question_id = ANY($2::bigint[])`, userID, qids); err != nil {
+			return err
+		}
 		// Questions of the deleted test that no other test references go
 		// away; their progress / attempt rows cascade. Questions still linked
 		// to another test are left untouched.
@@ -762,6 +770,13 @@ func (r *GenerationRepository) FailJob(ctx context.Context, jobID int64, jobErr 
 const personalLockNS int32 = 40_001
 
 func (r *GenerationRepository) CreateGeneratedTest(ctx context.Context, test *models.Test, questions []models.SeedQuestion) (*models.Test, error) {
+	return r.createTest(ctx, test, questions, 0)
+}
+
+// createTest inserts the test row and its questions. linkFromTestID > 0
+// (R-8b shared clone) links the SAME question rows of that test instead of
+// inserting new questions.
+func (r *GenerationRepository) createTest(ctx context.Context, test *models.Test, questions []models.SeedQuestion, linkFromTestID int64) (*models.Test, error) {
 	if len(questions) == 0 {
 		return nil, errors.New("generated test has no questions")
 	}
@@ -853,6 +868,20 @@ func (r *GenerationRepository) CreateGeneratedTest(ctx context.Context, test *mo
 		return nil, err
 	}
 
+	if linkFromTestID > 0 {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO test_questions (test_id, question_id, position)
+			SELECT $1, question_id, position FROM test_questions WHERE test_id = $2`,
+			testID, linkFromTestID); err != nil {
+			return nil, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		test.ID = testID
+		return test, nil
+	}
+
 	labels := []string{"A", "B", "C", "D"}
 	for i, sq := range questions {
 		if sq.Correct < 0 || sq.Correct > 3 {
@@ -884,8 +913,14 @@ func (r *GenerationRepository) CreateGeneratedTest(ctx context.Context, test *mo
 
 // ClonePersonalTest creates a copy of an existing personal test for another
 // owner (same subject, same questions payload incl. the quality_checked_at
-// state — see PersonalTestQuestions —, fresh question rows so the
-// clone has no shared progress). This is how users with IDENTICAL weak-topic
+// state — see PersonalTestQuestions).
+//
+// R-8b: when EVERY question of the source has passed the quality audit, the
+// clone links the SAME question rows (no new questions; progress is per
+// (user_id, question_id) anyway, translations live on the question). Checked
+// questions are never picked by the quality sweep, so ReplaceQuestionContent
+// can not reset progress of other owners. A source with unchecked questions
+// is copied into fresh rows as before. This is how users with IDENTICAL weak-topic
 // fingerprints get the SAME test content without a paid AI generation.
 // Returns the new test, or the already-existing one when the owner already
 // has a personal test (unique index race).
@@ -906,6 +941,16 @@ func (r *GenerationRepository) ClonePersonalTest(ctx context.Context, src *model
 	if err := r.pool.QueryRow(ctx, `
 		SELECT COALESCE(origin_test_id, id) FROM tests WHERE id = $1`, src.ID).Scan(&clone.OriginTestID); err != nil {
 		return nil, err
+	}
+	allChecked := true
+	for _, sq := range questions {
+		if !sq.QualityChecked {
+			allChecked = false
+			break
+		}
+	}
+	if allChecked {
+		return r.createTest(ctx, clone, questions, src.ID)
 	}
 	return r.CreateGeneratedTest(ctx, clone, questions)
 }
@@ -992,6 +1037,10 @@ func (r *GenerationRepository) PostponeQualityCheck(ctx context.Context, id int6
 // student who is looking at it. The sweep retries later.
 var ErrQuestionBusy = errors.New("question is in an active attempt")
 
+// ErrQuestionShared: the question is linked to more than one test (R-8b
+// shared clone); rewriting it would change other owners' tests.
+var ErrQuestionShared = errors.New("question is shared by several tests")
+
 // ReplaceQuestionContent rewrites a flagged question in place (same id, so
 // tests, attempts history and the user's 🔴🟡🟢 progress stay intact) and
 // drops its cached translations (they described the old text and are
@@ -1014,6 +1063,16 @@ func (r *GenerationRepository) ReplaceQuestionContent(ctx context.Context, id in
 	}
 	if busy {
 		return ErrQuestionBusy
+	}
+	// R-8b guard: a question shared by several tests (checked clone) must
+	// not be rewritten — that would reset other owners' progress.
+	var shared bool
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*) > 1 FROM test_questions WHERE question_id = $1`, id).Scan(&shared); err != nil {
+		return err
+	}
+	if shared {
+		return ErrQuestionShared
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE questions

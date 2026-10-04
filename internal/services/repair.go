@@ -381,6 +381,14 @@ func (g *GeneratorService) RunQualitySweep(ctx context.Context) (int, error) {
 					log.Printf("quality sweep: question %d became busy during rewrite — postponed", q.ID)
 					continue
 				}
+				if errors.Is(err, repositories.ErrQuestionShared) {
+					// R-8b: shared by several clones — never rewrite in place.
+					if err := g.gen.MarkQuestionsChecked(ctx, []int64{q.ID}); err != nil {
+						return repaired, err
+					}
+					log.Printf("quality sweep: question %d is shared by several tests — left as is", q.ID)
+					continue
+				}
 				if err != nil {
 					return repaired, err
 				}
