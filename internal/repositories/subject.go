@@ -61,8 +61,17 @@ func (r *SubjectRepository) GetByID(ctx context.Context, id int64) (*models.Subj
 
 // ListChainTests returns only the chain tests of a subject (the main linear
 // sequence), ordered by test number. 'weak' tests are excluded.
+// Served from the in-memory chain cache when enabled (R-10a).
 func (r *SubjectRepository) ListChainTests(ctx context.Context, subjectID int64) ([]models.Test, error) {
-	return r.listTests(ctx, subjectID, models.TestKindChain)
+	if tests, ok := chainCache.get(subjectID); ok {
+		return tests, nil
+	}
+	tests, err := r.listTests(ctx, subjectID, models.TestKindChain)
+	if err != nil {
+		return nil, err
+	}
+	chainCache.put(subjectID, tests)
+	return tests, nil
 }
 
 func (r *SubjectRepository) listTests(ctx context.Context, subjectID int64, kind string) ([]models.Test, error) {

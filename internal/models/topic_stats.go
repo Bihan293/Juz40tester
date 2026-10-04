@@ -130,3 +130,19 @@ func WeakTopicStats(stats []TopicStat, limit int) []TopicStat {
 	}
 	return out
 }
+
+// WeakTopicStatsBySubject groups stats of many subjects and applies
+// WeakTopicStats to each group (subjects without weak topics are absent).
+func WeakTopicStatsBySubject(stats []TopicStat, limit int) map[int64][]TopicStat {
+	groups := map[int64][]TopicStat{}
+	for _, s := range stats {
+		groups[s.SubjectID] = append(groups[s.SubjectID], s)
+	}
+	out := make(map[int64][]TopicStat, len(groups))
+	for id, g := range groups {
+		if w := WeakTopicStats(g, limit); len(w) > 0 {
+			out[id] = w
+		}
+	}
+	return out
+}

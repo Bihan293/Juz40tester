@@ -907,6 +907,9 @@ func (r *GenerationRepository) createTest(ctx context.Context, test *models.Test
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
+	if test.Kind == models.TestKindChain {
+		InvalidateChainCache(test.SubjectID)
+	}
 	test.ID = testID
 	return test, nil
 }

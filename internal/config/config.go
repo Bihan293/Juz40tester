@@ -33,8 +33,21 @@ type Config struct {
 	// a Neon "-pooler" host rewritten to the direct host.
 	MigrationDatabaseURL string
 
-	// DBMaxConns (DB_MAX_CONNS, default 15): upper bound of the pgx pool.
+	// DBMaxConns (DB_MAX_CONNS, default 20): upper bound of the pgx pool.
+	// The LISTEN listener, the quality-sweep advisory lock and the migration
+	// connection are DEDICATED connections outside the pool (+3 at most).
 	DBMaxConns int
+	// DBMinConns (DB_MIN_CONNS, default 5): connections kept open when idle
+	// (pgxpool has no "max idle": idle conns above this are closed after
+	// DBConnMaxIdleTime).
+	DBMinConns int
+	// DBConnMaxLifetime (DB_CONN_MAX_LIFETIME_SEC, default 30 min).
+	DBConnMaxLifetime time.Duration
+	// DBConnMaxIdleTime (DB_CONN_MAX_IDLE_SEC, default 5 min).
+	DBConnMaxIdleTime time.Duration
+	// ChainCacheTTL (CHAIN_CACHE_TTL_SEC, default 45, 0 = off): TTL of the
+	// in-memory chain-structure cache (R-10a).
+	ChainCacheTTL time.Duration
 
 	// GenWorkers (GEN_WORKERS, default 4, max 16): number of concurrent
 	// generation-queue workers. Each claims jobs with FOR UPDATE SKIP LOCKED,
@@ -124,6 +137,9 @@ func Load() (*Config, error) {
 		OffPeakEndHour:         -1,
 		MigrationDatabaseURL:   strings.TrimSpace(os.Getenv("MIGRATION_DATABASE_URL")),
 		DBMaxConns:             defaultDBMaxConns,
+		DBMinConns:             DefaultDBMinConns,
+		DBConnMaxLifetime:      DefaultDBConnMaxLifetime,
+		DBConnMaxIdleTime:      DefaultDBConnMaxIdleTime,
 		GenWorkers:             DefaultGenWorkers,
 		GenDeepSeekConcurrency: DefaultGenDeepSeekConcurrency,
 		UserActionInterval:     DefaultUserActionInterval,
@@ -133,6 +149,7 @@ func Load() (*Config, error) {
 		HealthCacheTTL:         DefaultHealthCacheTTL,
 		CleanupAttemptDays:     DefaultCleanupAttemptDays,
 		CleanupJobDays:         DefaultCleanupJobDays,
+		ChainCacheTTL:          DefaultChainCacheTTL,
 	}
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV"))) {
 	case "development", "dev", "local", "test":
@@ -142,6 +159,19 @@ func Load() (*Config, error) {
 	}
 	if n, ok := envIntOpt("DB_MAX_CONNS"); ok && n > 0 {
 		cfg.DBMaxConns = n
+	}
+	if n, ok := envIntOpt("DB_MIN_CONNS"); ok && n >= 0 {
+		cfg.DBMinConns = n
+	}
+	cfg.DBMinConns = min(cfg.DBMinConns, cfg.DBMaxConns)
+	if n, ok := envIntOpt("DB_CONN_MAX_LIFETIME_SEC"); ok && n > 0 {
+		cfg.DBConnMaxLifetime = time.Duration(n) * time.Second
+	}
+	if n, ok := envIntOpt("DB_CONN_MAX_IDLE_SEC"); ok && n > 0 {
+		cfg.DBConnMaxIdleTime = time.Duration(n) * time.Second
+	}
+	if n, ok := envIntOpt("CHAIN_CACHE_TTL_SEC"); ok && n >= 0 {
+		cfg.ChainCacheTTL = time.Duration(n) * time.Second
 	}
 	if n, ok := envIntOpt("GEN_WORKERS"); ok && n > 0 {
 		cfg.GenWorkers = min(n, MaxGenWorkers)
@@ -219,7 +249,7 @@ func Load() (*Config, error) {
 // defaultDBMaxConns bounds the pgx pool (the pgx default is max(4, NumCPU),
 // too small for concurrent updates + worker + reapers on a 1-CPU instance,
 // and unbounded concurrency would exhaust a Neon free-tier connection cap).
-const defaultDBMaxConns = 15
+const defaultDBMaxConns = 20
 
 const (
 	// DefaultGenWorkers is the default size of the generation worker pool.
@@ -244,6 +274,12 @@ const (
 	// R-8a cleanup retention defaults (days).
 	DefaultCleanupAttemptDays = 45
 	DefaultCleanupJobDays     = 14
+	// R-10a pool defaults.
+	DefaultDBMinConns        = 5
+	DefaultDBConnMaxLifetime = 30 * time.Minute
+	DefaultDBConnMaxIdleTime = 5 * time.Minute
+	// DefaultChainCacheTTL: in-memory cache of a subject's chain structure.
+	DefaultChainCacheTTL = 45 * time.Second
 )
 
 // envIntOpt reads an integer env var; ok is false when it is unset or

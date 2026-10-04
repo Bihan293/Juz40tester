@@ -47,7 +47,12 @@ func main() {
 	// Bounded pool (audit #20): the pgx default is max(4, NumCPU); together
 	// with the bounded update concurrency below this keeps the instance
 	// inside the Neon connection cap.
-	pool, err := database.ConnectPool(ctx, cfg.DatabaseURL, int32(cfg.DBMaxConns))
+	pool, err := database.ConnectPoolOpts(ctx, cfg.DatabaseURL, database.PoolOptions{
+		MaxConns:        int32(cfg.DBMaxConns),
+		MinConns:        int32(cfg.DBMinConns),
+		MaxConnLifetime: cfg.DBConnMaxLifetime,
+		MaxConnIdleTime: cfg.DBConnMaxIdleTime,
+	})
 	if err != nil {
 		log.Fatalf("database: %v", err)
 	}
@@ -69,6 +74,7 @@ func main() {
 	// Wire dependencies.
 	userRepo := repositories.NewUserRepository(pool)
 	subjectRepo := repositories.NewSubjectRepository(pool)
+	repositories.SetChainCacheTTL(cfg.ChainCacheTTL)
 	attemptRepo := repositories.NewAttemptRepository(pool)
 	stateRepo := repositories.NewStateRepository(pool)
 	genRepo := repositories.NewGenerationRepository(pool).WithLockURL(migURL)

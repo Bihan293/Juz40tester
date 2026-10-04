@@ -485,6 +485,28 @@ func (s *QuizService) SubjectsWithWeakTopics(ctx context.Context, userID int64) 
 	return out, nil
 }
 
+// WeakMenu returns, in ONE topic-stats query (+ the subject list), the
+// subjects with weak topics and their weak topics (worst first, at most
+// limit each) for the «🎯 Слабые темы» picker (R-10a: no N+1).
+func (s *QuizService) WeakMenu(ctx context.Context, userID int64, limit int) ([]models.Subject, map[int64][]models.TopicStat, error) {
+	all, err := s.subjects.List(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	stats, err := s.gen.AllTopicStats(ctx, userID)
+	if err != nil {
+		return nil, nil, err
+	}
+	weak := models.WeakTopicStatsBySubject(stats, limit)
+	out := make([]models.Subject, 0, len(weak))
+	for _, subj := range all {
+		if len(weak[subj.ID]) > 0 {
+			out = append(out, subj)
+		}
+	}
+	return out, weak, nil
+}
+
 // WeakTopicStats returns the user's weak topics of the subject with their
 // statistics (worst first) for the «🎯 Слабые темы» screen.
 func (s *QuizService) WeakTopicStats(ctx context.Context, userID, subjectID int64, limit int) ([]models.TopicStat, error) {

@@ -1150,6 +1150,7 @@ func (g *GeneratorService) executeJob(ctx context.Context, job *models.Generatio
 	if err := g.gen.CompleteJob(ctx, job.ID, testID); err != nil {
 		log.Printf("generator: complete job %d: %v", job.ID, err)
 	}
+	repositories.InvalidateChainCache(job.SubjectID)
 	g.jobFinished(job)
 	log.Printf("generator: job %d done -> test %d", job.ID, testID)
 	g.queueChainTranslation(ctx, job, testID)
