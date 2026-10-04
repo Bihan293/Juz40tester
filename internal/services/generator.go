@@ -823,6 +823,11 @@ func (g *GeneratorService) RunWorker(ctx context.Context) {
 		defer wg.Done()
 		g.superviseLoop(ctx, "quality sweep", g.runSweepLoop)
 	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		g.superviseLoop(ctx, "stuck-job reaper", g.runReaperLoop)
+	}()
 	wg.Wait()
 	log.Println("generator: all workers stopped")
 }
@@ -891,13 +896,12 @@ func (g *GeneratorService) runWorkerLoop(ctx context.Context, id int) (panicked 
 	}
 }
 
-// drainQueue reaps dead jobs, then claims and executes due jobs one after
+// drainQueue claims and executes due jobs one after
 // another until the queue has nothing due (or ctx is cancelled). After a
 // successful claim it passes the wake signal on, so another idle worker
 // also looks at the queue — a burst of N jobs is spread over the pool
 // within milliseconds instead of one job per fallback tick.
 func (g *GeneratorService) drainQueue(ctx context.Context) {
-	g.reapStuckJobs(ctx)
 	for ctx.Err() == nil {
 		job, err := g.claimDue(ctx)
 		if err != nil || job == nil {
@@ -985,6 +989,37 @@ func (g *GeneratorService) runQualitySweepExclusive(ctx context.Context) (ran bo
 		return serr
 	})
 	return ran, n, err
+}
+
+// reaperInterval is how often reapStuckJobs runs (cfg.ReaperInterval).
+func (g *GeneratorService) reaperInterval() time.Duration {
+	if g.cfg != nil && g.cfg.ReaperInterval > 0 {
+		return g.cfg.ReaperInterval
+	}
+	return config.DefaultReaperInterval
+}
+
+// runReaperLoop runs the stuck-job reaper once at start and then on its own
+// ticker (R-5c), not on every worker wake-up: an idle queue costs one cheap
+// UPDATE (served by the partial index on running jobs) per interval.
+func (g *GeneratorService) runReaperLoop(ctx context.Context) (panicked bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("stuck-job reaper: PANIC recovered: %v", r)
+			panicked = true
+		}
+	}()
+	g.reapStuckJobs(ctx)
+	t := time.NewTicker(g.reaperInterval())
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-t.C:
+			g.reapStuckJobs(ctx)
+		}
+	}
 }
 
 // reapStuckJobs returns 'running' jobs whose worker died (deploy/restart/OOM)

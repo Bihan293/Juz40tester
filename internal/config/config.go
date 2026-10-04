@@ -85,6 +85,14 @@ type Config struct {
 	// in PostgreSQL (ai_spend_daily), valid across instances.
 	DeepSeekDailyCapUSD float64
 
+	// R-5c idle-load knobs (fewer DB queries so Neon can scale to zero).
+	// ReaperInterval (REAPER_INTERVAL_SEC, default 300): how often stuck
+	// 'running' generation jobs are returned to the queue.
+	// HealthCacheTTL (HEALTH_CACHE_SEC, default 45, 0 = no cache): how long
+	// /health reuses the last database ping result.
+	ReaperInterval time.Duration
+	HealthCacheTTL time.Duration
+
 	OffPeakStartHour int  // custom window start (inclusive); -1 = official schedule
 	OffPeakEndHour   int  // custom window end (exclusive)
 	OffPeakCustom    bool // true when a custom window is configured
@@ -114,6 +122,8 @@ func Load() (*Config, error) {
 		UserActionInterval:     DefaultUserActionInterval,
 		PersonalGenPerUserDay:  DefaultPersonalGenPerUserDay,
 		DeepSeekDailyCapUSD:    DefaultDeepSeekDailyCapUSD,
+		ReaperInterval:         DefaultReaperInterval,
+		HealthCacheTTL:         DefaultHealthCacheTTL,
 	}
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV"))) {
 	case "development", "dev", "local", "test":
@@ -132,6 +142,12 @@ func Load() (*Config, error) {
 	}
 	if n, ok := envIntOpt("USER_ACTION_INTERVAL_MS"); ok && n >= 0 {
 		cfg.UserActionInterval = time.Duration(n) * time.Millisecond
+	}
+	if n, ok := envIntOpt("REAPER_INTERVAL_SEC"); ok && n > 0 {
+		cfg.ReaperInterval = time.Duration(n) * time.Second
+	}
+	if n, ok := envIntOpt("HEALTH_CACHE_SEC"); ok && n >= 0 {
+		cfg.HealthCacheTTL = time.Duration(n) * time.Second
 	}
 	if n, ok := envIntOpt("PERSONAL_GEN_PER_USER_DAY"); ok && n >= 0 {
 		cfg.PersonalGenPerUserDay = n
@@ -205,6 +221,11 @@ const (
 	DefaultPersonalGenPerUserDay = 3
 	// DefaultDeepSeekDailyCapUSD: global daily DeepSeek spend cap (USD).
 	DefaultDeepSeekDailyCapUSD = 2.0
+
+	// DefaultReaperInterval: stuck generation jobs are reaped every 5 min.
+	DefaultReaperInterval = 5 * time.Minute
+	// DefaultHealthCacheTTL: /health pings the database at most every 45s.
+	DefaultHealthCacheTTL = 45 * time.Second
 )
 
 // envIntOpt reads an integer env var; ok is false when it is unset or

@@ -204,14 +204,8 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		if err := pool.Ping(r.Context()); err != nil {
-			http.Error(w, `{"status":"unhealthy"}`, http.StatusServiceUnavailable)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
-	})
+	// R-5c: the DB ping result is cached for HEALTH_CACHE_SEC (default 45s).
+	mux.Handle("GET /health", newHealthCache(pool.Ping, cfg.HealthCacheTTL))
 	// Hidden keep-alive endpoint: used only by external uptime monitors and
 	// by the internal self-pinger below. Deliberately absent from the bot UI.
 	mux.HandleFunc("GET /ping", func(w http.ResponseWriter, r *http.Request) {
