@@ -116,11 +116,11 @@ func (r *AttemptRepository) createAttemptTx(ctx context.Context, userID, testID 
 	// 1-based position in the shuffled order.
 	orders := make([]string, len(questionIDs))
 	for i := range questionIDs {
-		orderJSON, err := json.Marshal(optionOrders[i])
+		enc, err := encodeOptionOrder(optionOrders[i])
 		if err != nil {
 			return nil, err
 		}
-		orders[i] = string(orderJSON)
+		orders[i] = enc
 	}
 	if len(questionIDs) > 0 {
 		if _, err := tx.Exec(ctx, `
@@ -266,7 +266,7 @@ func (r *AttemptRepository) questionJoin(ctx context.Context, attemptID int64, p
 		return nil, nil, err
 	}
 	aq.SelectedAnswer = sel.String
-	if err := json.Unmarshal(orderJSON, &aq.OptionOrder); err != nil {
+	if aq.OptionOrder, err = decodeOptionOrder(orderJSON); err != nil {
 		return nil, nil, err
 	}
 	return &aq, &q, nil
@@ -357,7 +357,7 @@ func (r *AttemptRepository) LoadQuestionView(ctx context.Context, attemptID, use
 		ID: aqID.Int64, AttemptID: aqAttempt.Int64, QuestionID: aqQID.Int64,
 		Position: int(aqPos.Int32), Answered: aqAnswered.Bool, SelectedAnswer: sel.String, IsCorrect: isCorrect,
 	}
-	if err := json.Unmarshal(orderJSON, &aq.OptionOrder); err != nil {
+	if aq.OptionOrder, err = decodeOptionOrder(orderJSON); err != nil {
 		return nil, err
 	}
 	row.AQ = aq
