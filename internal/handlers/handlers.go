@@ -58,9 +58,8 @@ type Handler struct {
 	tg    *bot.Client
 	users *repositories.UserRepository
 	quiz  *services.QuizService
-	// watchers tracks the active «wait until the test is generated»
-	// goroutines (key -> struct{}), so repeated taps on the same ⏳ button
-	// never spawn duplicate watchers or flood the chat with notes.
+	// watchers tracks the active translation waiters (key -> struct{}), so
+	// repeated taps never spawn duplicate waiters or flood the chat.
 	watchers sync.Map
 	// answered tracks callback_query IDs that have already been answered
 	// during the current update. Telegram accepts exactly ONE answer per
@@ -82,11 +81,13 @@ type Handler struct {
 	// limiter throttles actions per Telegram user (R-9): at most one every
 	// cfg.UserActionInterval. In memory, per instance (see ratelimit).
 	limiter *ratelimit.Limiter
+	// gen is the registry of shared generation watchers (R-7).
+	gen *genWatchers
 }
 
 // New creates a Handler.
 func New(tg *bot.Client, users *repositories.UserRepository, quiz *services.QuizService) *Handler {
-	return &Handler{tg: tg, users: users, quiz: quiz}
+	return &Handler{tg: tg, users: users, quiz: quiz, gen: newGenWatchers()}
 }
 
 // WithActionLimiter installs the per-user tap throttle (R-9). nil = off.
@@ -508,7 +509,7 @@ func (h *Handler) handlePendingTest(ctx context.Context, cb *bot.CallbackQuery, 
 		return
 	}
 
-	key := fmt.Sprintf("chain:%d:%d:%d", user.ID, subjectID, testNumber)
+	key := chainWatchKey(subjectID, testNumber)
 	check := func(ctx context.Context) (*models.Test, bool, error) {
 		return h.quiz.ChainTestStatus(ctx, subjectID, testNumber)
 	}
@@ -638,9 +639,25 @@ func (h *Handler) openWeakSubject(ctx context.Context, cb *bot.CallbackQuery, us
 			h.answerAlert(ctx, cb, "Генерация тестов сейчас недоступна 😔 Попробуй чуть позже.")
 			return
 		}
+		// R-7: personal watchers are keyed by the job (job:<id>); the
+		// per-user fallback key covers the tiny window where the job has
+		// already finished.
 		key := fmt.Sprintf("weak:%d:%d", user.ID, subjectID)
 		check := func(ctx context.Context) (*models.Test, bool, error) {
 			return h.quiz.PersonalTestStatus(ctx, user.ID, subjectID)
+		}
+		if jobID, jerr := h.quiz.ActivePersonalJobID(ctx, user.ID, subjectID); jerr != nil {
+			log.Printf("personal job of %d/%d: %v", user.ID, subjectID, jerr)
+		} else if jobID > 0 {
+			key = jobWatchKey(jobID)
+			check = func(ctx context.Context) (*models.Test, bool, error) {
+				testID, pending, err := h.quiz.JobState(ctx, jobID)
+				if err != nil || testID == 0 {
+					return nil, pending, err
+				}
+				test, err := h.quiz.GetTest(ctx, testID)
+				return test, false, err
+			}
 		}
 		note := "⏳ Генерирую персональный тест по твоим слабым темам…\n\nНикуда не уходи, подожди минуточку — как только тест будет готов, я сразу пришлю сюда кнопку, чтобы его начать 👇"
 		h.startGenerationWatch(ctx, cb, key, note, check, cbWeakSubject+strconv.FormatInt(subjectID, 10))
@@ -1664,15 +1681,6 @@ func (h *Handler) fallbackText(ctx context.Context, cb *bot.CallbackQuery, text 
 
 // --- «Please wait» notices ---------------------------------------------------
 
-const (
-	// genWatchInterval is how often the watcher checks whether the awaited
-	// test has been generated.
-	genWatchInterval = 5 * time.Second
-	// genWatchTimeout caps the wait (a real generation takes ~1–3 minutes,
-	// the worker's per-job timeout is 8 minutes).
-	genWatchTimeout = 10 * time.Minute
-)
-
 // translationNote is shown while the first-ever Kazakh translation of a
 // test is produced in the background (R-4).
 const translationNote = "⏳ Перевод готовится… 🇰🇿\n\nТест переводится на казахский язык. Никуда не уходи — перевод делается один раз, дальше этот тест будет открываться мгновенно. Первый вопрос появится сам 👇"
@@ -1761,85 +1769,25 @@ func (h *Handler) awaitTranslation(key string, chatID, noteID, testID int64, wai
 }
 
 // startGenerationWatch acknowledges the tap, posts a clearly visible chat
-// message «⏳ тест генерируется, никуда не уходи…» and starts a background
-// watcher that edits that very message into «✅ Тест готов» with a start
-// button once the test exists — or into an honest error with a retry button
-// when the generation failed / takes too long. One watcher per key: repeated
-// taps never spam the chat.
+// message «⏳ тест генерируется, никуда не уходи…» and subscribes it to the
+// shared generation watcher of the key (R-7: one poller per key for all
+// users). The note is edited into «✅ Тест готов» with a start button once
+// the test exists — or into an honest error / «🔄 Обновить» on failure or
+// timeout. Repeated taps of the same chat never spam it.
 func (h *Handler) startGenerationWatch(ctx context.Context, cb *bot.CallbackQuery, key, note string,
-	check func(context.Context) (*models.Test, bool, error), retryData string) {
-	if _, busy := h.watchers.LoadOrStore(key, struct{}{}); busy {
+	check genCheck, retryData string) {
+	chatID := cb.Message.Chat.ID
+	if h.gen.isSubscribed(key, chatID) {
 		h.answerAlert(ctx, cb, "⏳ Тест ещё генерируется. Никуда не уходи — как только он будет готов, я пришлю в чат кнопку, чтобы его начать.")
 		return
 	}
 	h.answerCallback(ctx, cb, "")
-	chatID := cb.Message.Chat.ID
 	msgID, err := h.tg.SendMessage(ctx, chatID, note, nil)
 	if err != nil {
 		log.Printf("send generation note: %v", err)
-		h.watchers.Delete(key)
 		return
 	}
-	go h.watchGeneration(key, chatID, msgID, check, retryData)
-}
-
-// watchGeneration polls until the awaited test appears, then edits the
-// «please wait» note into a ready/failed/timeout message.
-func (h *Handler) watchGeneration(key string, chatID, msgID int64,
-	check func(context.Context) (*models.Test, bool, error), retryData string) {
-	defer h.watchers.Delete(key)
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("generation watcher %s panicked: %v", key, r)
-		}
-	}()
-	ctx, cancel := context.WithTimeout(context.Background(), genWatchTimeout+30*time.Second)
-	defer cancel()
-
-	retryKb := &bot.InlineKeyboardMarkup{InlineKeyboard: [][]bot.InlineKeyboardButton{
-		bot.Row(bot.Btn("🔄 Попробовать ещё раз", retryData)),
-		bot.Row(bot.Btn("⬅️ Главное меню", cbMainMenu)),
-	}}
-	deadline := time.Now().Add(genWatchTimeout)
-	misses := 0 // consecutive checks with neither a test nor an active job
-	ticker := time.NewTicker(genWatchInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-		test, pending, err := check(ctx)
-		if err != nil {
-			log.Printf("generation watcher %s: %v", key, err)
-		} else if test != nil {
-			ready := fmt.Sprintf("✅ Готово! «Тест %d» сгенерирован.", test.TestNumber)
-			if test.Kind == models.TestKindPersonal {
-				ready = "✅ Готово! Персональный тест по твоим слабым темам собран."
-			}
-			h.editNote(ctx, chatID, msgID, ready+"\n\nНажми кнопку ниже, чтобы начать 👇",
-				&bot.InlineKeyboardMarkup{InlineKeyboard: [][]bot.InlineKeyboardButton{
-					bot.Row(bot.Btn("▶️ Начать тест", cbOpenTest+strconv.FormatInt(test.ID, 10))),
-				}})
-			return
-		} else if !pending {
-			// No test and no active job: the generation failed for good. Two
-			// consecutive misses guard against the short window between the
-			// job being marked done and the test becoming visible.
-			misses++
-			if misses >= 2 {
-				h.editNote(ctx, chatID, msgID, "😔 Не получилось сгенерировать тест. Нажми «🔄 Попробовать ещё раз» — я перезапущу генерацию.", retryKb)
-				return
-			}
-		} else {
-			misses = 0
-		}
-		if time.Now().After(deadline) {
-			h.editNote(ctx, chatID, msgID, "⏳ Генерация идёт дольше обычного. Нажми «🔄 Попробовать ещё раз» чуть позже — если тест уже готов, он сразу откроется.", retryKb)
-			return
-		}
-	}
+	h.subscribeGeneration(key, chatID, msgID, check, retryData)
 }
 
 // editNote edits a bot-sent note; when editing fails (e.g. the user deleted

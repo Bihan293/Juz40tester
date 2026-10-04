@@ -1036,3 +1036,51 @@ func (r *GenerationRepository) ReplaceQuestionContent(ctx context.Context, id in
 	}
 	return tx.Commit(ctx)
 }
+
+// ChainTestID returns the id of the active chain test #testNumber of the
+// subject, or 0 when it does not exist yet. A light point query used by the
+// generation watchers (R-7) instead of listing the whole chain.
+func (r *GenerationRepository) ChainTestID(ctx context.Context, subjectID int64, testNumber int) (int64, error) {
+	var id int64
+	err := r.pool.QueryRow(ctx, `
+		SELECT id FROM tests
+		WHERE subject_id = $1 AND kind = 'chain' AND test_number = $2 AND is_active
+		LIMIT 1`, subjectID, testNumber).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, nil
+	}
+	return id, err
+}
+
+// ActivePersonalJobID returns the id of the pending/running personal job of
+// (subject, user), or 0 when there is none (R-7).
+func (r *GenerationRepository) ActivePersonalJobID(ctx context.Context, subjectID, userID int64) (int64, error) {
+	var id int64
+	err := r.pool.QueryRow(ctx, `
+		SELECT id FROM generation_jobs
+		WHERE kind = 'personal' AND subject_id = $1 AND owner_user_id = $2
+		  AND status IN ('pending','running')
+		ORDER BY id DESC LIMIT 1`, subjectID, userID).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, nil
+	}
+	return id, err
+}
+
+// JobState reports the produced test (testID > 0 once done) and whether the
+// job is still pending/running. A missing job is neither (R-7).
+func (r *GenerationRepository) JobState(ctx context.Context, jobID int64) (testID int64, pending bool, err error) {
+	var status string
+	err = r.pool.QueryRow(ctx, `
+		SELECT status, COALESCE(test_id, 0) FROM generation_jobs WHERE id = $1`, jobID).Scan(&status, &testID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	if status != "done" {
+		testID = 0
+	}
+	return testID, status == "pending" || status == "running", nil
+}

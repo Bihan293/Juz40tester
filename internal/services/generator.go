@@ -112,6 +112,29 @@ type GeneratorService struct {
 	// budget is the DeepSeek daily cap (nil = no cap); used to schedule the
 	// retry of a capped job. The hard guard itself is in the DeepSeek client.
 	budget *DailyBudget
+	// onJobFinished is called in-process after a job was completed or
+	// failed (R-7): the bot's generation watchers deliver the result to
+	// the waiting users at once instead of waiting for their next poll.
+	onJobFinished func(job *models.GenerationJob)
+}
+
+// WithJobFinishedHook installs the in-process «job finished» callback (R-7).
+func (g *GeneratorService) WithJobFinishedHook(fn func(job *models.GenerationJob)) *GeneratorService {
+	g.onJobFinished = fn
+	return g
+}
+
+// jobFinished runs the hook (never panics the worker).
+func (g *GeneratorService) jobFinished(job *models.GenerationJob) {
+	if g.onJobFinished == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("generator: job-finished hook panicked: %v", r)
+		}
+	}()
+	g.onJobFinished(job)
 }
 
 // WithBudget wires the DeepSeek daily spending cap (R-9).
@@ -1121,11 +1144,13 @@ func (g *GeneratorService) executeJob(ctx context.Context, job *models.Generatio
 		if ferr := g.gen.FailJob(ctx, job.ID, runErr, retryDelay, maxJobAttempts); ferr != nil {
 			log.Printf("generator: fail job %d: %v", job.ID, ferr)
 		}
+		g.jobFinished(job)
 		return
 	}
 	if err := g.gen.CompleteJob(ctx, job.ID, testID); err != nil {
 		log.Printf("generator: complete job %d: %v", job.ID, err)
 	}
+	g.jobFinished(job)
 	log.Printf("generator: job %d done -> test %d", job.ID, testID)
 	g.queueChainTranslation(ctx, job, testID)
 }
