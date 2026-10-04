@@ -587,6 +587,9 @@ func (gt *generatedTest) toSeed() []models.SeedQuestion {
 		out = append(out, models.SeedQuestion{
 			Text: q.Text, Options: opts, Correct: q.Correct,
 			Topic: q.Topic, Difficulty: q.Difficulty,
+			// toSeed is only called after repairFlagged + validateTest in
+			// runJob: every question has passed the quality audit.
+			QualityChecked: true,
 		})
 	}
 	return out
@@ -935,8 +938,8 @@ func (g *GeneratorService) runSweepLoop(ctx context.Context) (panicked bool) {
 		case <-ctx.Done():
 			return false
 		case <-sweep.C:
-			if g.urgentWorkPending(ctx) {
-				log.Printf("quality sweep: postponed — urgent user generations in the queue")
+			if g.generationQueueBusy(ctx) {
+				log.Printf("quality sweep: postponed — the generation queue is not empty")
 				continue
 			}
 			g.qualitySweepTick(ctx)
@@ -953,6 +956,21 @@ func (g *GeneratorService) urgentWorkPending(ctx context.Context) bool {
 	busy, err := g.gen.HasUrgentWork(ctx)
 	if err != nil {
 		log.Printf("quality sweep: check urgent work: %v", err)
+		return true
+	}
+	return busy
+}
+
+// generationQueueBusy reports whether any generation job is due or
+// running: the sweep starts only when the queue is empty. A database error
+// counts as "busy" (skip this tick).
+func (g *GeneratorService) generationQueueBusy(ctx context.Context) bool {
+	if g == nil || g.gen == nil {
+		return false
+	}
+	busy, err := g.gen.HasActiveJobs(ctx)
+	if err != nil {
+		log.Printf("quality sweep: check generation queue: %v", err)
 		return true
 	}
 	return busy

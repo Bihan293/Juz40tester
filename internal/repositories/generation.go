@@ -18,6 +18,17 @@ import (
 // creation of generated tests.
 type GenerationRepository struct {
 	pool *pgxpool.Pool
+	// lockURL: DIRECT connection string for session-level advisory locks
+	// (TryExclusive). Empty = a connection hijacked from the pool (fine when
+	// DATABASE_URL itself is direct, e.g. tests).
+	lockURL string
+}
+
+// WithLockURL sets the DIRECT (non-pooler) connection string used for
+// session-level advisory locks.
+func (r *GenerationRepository) WithLockURL(url string) *GenerationRepository {
+	r.lockURL = url
+	return r
 }
 
 func NewGenerationRepository(pool *pgxpool.Pool) *GenerationRepository {
@@ -184,7 +195,7 @@ func (r *GenerationRepository) FindPersonalTestByFingerprint(ctx context.Context
 func (r *GenerationRepository) PersonalTestQuestions(ctx context.Context, testID int64) ([]models.SeedQuestion, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT q.question_text, q.option_a, q.option_b, q.option_c, q.option_d,
-		       q.correct_answer, q.topic, q.difficulty
+		       q.correct_answer, q.topic, q.difficulty, q.quality_checked_at IS NOT NULL
 		FROM test_questions tq
 		JOIN questions q ON q.id = tq.question_id
 		WHERE tq.test_id = $1
@@ -200,7 +211,7 @@ func (r *GenerationRepository) PersonalTestQuestions(ctx context.Context, testID
 		var sq models.SeedQuestion
 		var correct string
 		if err := rows.Scan(&sq.Text, &sq.Options[0], &sq.Options[1], &sq.Options[2], &sq.Options[3],
-			&correct, &sq.Topic, &sq.Difficulty); err != nil {
+			&correct, &sq.Topic, &sq.Difficulty, &sq.QualityChecked); err != nil {
 			return nil, err
 		}
 		idx, ok := labels[correct]
@@ -574,25 +585,45 @@ const qualitySweepLockKey int64 = 0x6a757a3430737770 // "juz40swp"
 
 // TryExclusive runs fn only when the cluster-wide advisory lock `key` is
 // free; otherwise it returns ran = false immediately (another instance holds
-// it). A transaction-level lock (pg_try_advisory_xact_lock) is used, so it
-// is also correct behind a transaction-mode pooler (Neon -pooler /
-// PgBouncer): the lock lives exactly as long as the transaction that pins
-// one server connection. The transaction does no other work, so it holds no
-// snapshot between statements.
+// it). A SESSION-level lock (pg_try_advisory_lock) is taken on a DEDICATED
+// connection (a direct one when lockURL is set — session locks are not
+// reliable behind a transaction-mode pooler), with pg_advisory_unlock in a
+// defer. No transaction is open while fn runs (fn makes slow AI calls), so
+// there is no idle-in-transaction session. The connection is closed at the
+// end; if the process dies, the server drops the session and the lock with it.
 func (r *GenerationRepository) TryExclusive(ctx context.Context, key int64, fn func(context.Context) error) (ran bool, err error) {
-	tx, err := r.pool.Begin(ctx)
+	conn, err := r.dedicatedConn(ctx)
 	if err != nil {
 		return false, err
 	}
-	defer func() { _ = tx.Rollback(context.Background()) }()
+	defer func() { _ = conn.Close(context.Background()) }()
 	var got bool
-	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock($1)`, key).Scan(&got); err != nil {
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, key).Scan(&got); err != nil {
 		return false, err
 	}
 	if !got {
 		return false, nil
 	}
+	defer func() {
+		uctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _ = conn.Exec(uctx, `SELECT pg_advisory_unlock($1)`, key)
+	}()
 	return true, fn(ctx)
+}
+
+// dedicatedConn opens a connection that is not shared with the pool: a new
+// direct connection to lockURL, or one hijacked from the pool (it never
+// goes back, so a held session lock cannot leak to other callers).
+func (r *GenerationRepository) dedicatedConn(ctx context.Context) (*pgx.Conn, error) {
+	if r.lockURL != "" {
+		return pgx.Connect(ctx, r.lockURL)
+	}
+	pc, err := r.pool.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return pc.Hijack(), nil
 }
 
 // TryQualitySweepLock is TryExclusive with the quality-sweep key.
@@ -632,6 +663,18 @@ func (r *GenerationRepository) HasUrgentWork(ctx context.Context) (bool, error) 
 		SELECT EXISTS(SELECT 1 FROM generation_jobs
 		              WHERE urgent AND (status = 'running'
 		                    OR (status = 'pending' AND not_before <= now())))`).Scan(&exists)
+	return exists, err
+}
+
+// HasActiveJobs reports whether ANY generation job is running or due in
+// the queue (deferred jobs whose not_before is in the future do not count).
+// The quality sweep starts only when this is false.
+func (r *GenerationRepository) HasActiveJobs(ctx context.Context) (bool, error) {
+	var exists bool
+	err := r.pool.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM generation_jobs
+		              WHERE status = 'running'
+		                 OR (status = 'pending' AND not_before <= now()))`).Scan(&exists)
 	return exists, err
 }
 
@@ -818,11 +861,11 @@ func (r *GenerationRepository) CreateGeneratedTest(ctx context.Context, test *mo
 		var qid int64
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO questions (subject_id, question_text, option_a, option_b, option_c, option_d,
-			                       correct_answer, topic, difficulty)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			                       correct_answer, topic, difficulty, quality_checked_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CASE WHEN $10 THEN now() END)
 			RETURNING id`,
 			test.SubjectID, sq.Text, sq.Options[0], sq.Options[1], sq.Options[2], sq.Options[3],
-			labels[sq.Correct], sq.Topic, sq.Difficulty).Scan(&qid); err != nil {
+			labels[sq.Correct], sq.Topic, sq.Difficulty, sq.QualityChecked).Scan(&qid); err != nil {
 			return nil, err
 		}
 		if _, err := tx.Exec(ctx, `
@@ -840,7 +883,8 @@ func (r *GenerationRepository) CreateGeneratedTest(ctx context.Context, test *mo
 }
 
 // ClonePersonalTest creates a copy of an existing personal test for another
-// owner (same subject, same questions payload, fresh question rows so the
+// owner (same subject, same questions payload incl. the quality_checked_at
+// state — see PersonalTestQuestions —, fresh question rows so the
 // clone has no shared progress). This is how users with IDENTICAL weak-topic
 // fingerprints get the SAME test content without a paid AI generation.
 // Returns the new test, or the already-existing one when the owner already

@@ -71,7 +71,7 @@ func main() {
 	subjectRepo := repositories.NewSubjectRepository(pool)
 	attemptRepo := repositories.NewAttemptRepository(pool)
 	stateRepo := repositories.NewStateRepository(pool)
-	genRepo := repositories.NewGenerationRepository(pool)
+	genRepo := repositories.NewGenerationRepository(pool).WithLockURL(migURL)
 	translationRepo := repositories.NewTranslationRepository(pool)
 
 	// DeepSeek AI test generation. Optional: without DEEPSEEK_API_KEY the bot

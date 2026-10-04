@@ -356,3 +356,13 @@ func TestDeepSeekSemaphoreBoundsParallelCalls(t *testing.T) {
 	r2()
 	r3()
 }
+
+// R-6: questions handed to CreateGeneratedTest by runJob passed the audit.
+func TestToSeedMarksQualityChecked(t *testing.T) {
+	gt := &generatedTest{Questions: validQuestions()}
+	for i, sq := range gt.toSeed() {
+		if !sq.QualityChecked {
+			t.Fatalf("question %d not marked as quality-checked", i)
+		}
+	}
+}
