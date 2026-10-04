@@ -166,6 +166,8 @@ INSERT INTO subjects (name, position) VALUES ('Биология', 1) ON CONFLICT
 | `MIGRATION_DATABASE_URL` | (опционально) прямое (не pooler) подключение для миграций; по умолчанию — `DATABASE_URL` без `-pooler` у хоста Neon |
 | `DB_MAX_CONNS` | (опционально) размер пула pgx, по умолчанию 15 |
 | `GEN_WORKERS` | (опционально) число воркеров генерации, по умолчанию 4, максимум 16. Больше — не значит быстрее: бесплатный Groq отдаёт ~1 тест/мин на модель, лишние воркеры уходят в платный DeepSeek. Держите `GEN_WORKERS` + ~5 ≤ `DB_MAX_CONNS` |
+| `REAPER_INTERVAL_SEC` | (опционально) как часто зависшие задачи генерации возвращаются в очередь, по умолчанию 300 |
+| `HEALTH_CACHE_SEC` | (опционально) на сколько секунд `/health` кэширует пинг БД, по умолчанию 45 (0 — без кэша) |
 | `GEN_DEEPSEEK_CONCURRENCY` | (опционально) максимум одновременных платных генераций DeepSeek на инстанс, по умолчанию 2 |
 | `GROQ_API_KEY` | (рекомендуется) ключ Groq — бесплатные перевод (Qwen 3.8 27B) и генерация (GPT-OSS 120B), см. [docs/GROQ_LIMITS.md](docs/GROQ_LIMITS.md) |
 | `GROQ_BASE_URL` | (опционально) по умолчанию `https://api.groq.com/openai/v1` |
