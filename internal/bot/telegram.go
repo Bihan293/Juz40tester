@@ -198,6 +198,33 @@ func (e *RateLimitError) Error() string {
 	return fmt.Sprintf("telegram %s: rate limited (retry after %s)", e.Method, e.RetryAfter)
 }
 
+// APIError is a non-429 error answer of the Telegram Bot API (code and
+// description as returned by Telegram).
+type APIError struct {
+	Method      string
+	Code        int
+	Description string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("telegram %s: %s", e.Method, e.Description)
+}
+
+// IsNotModified reports Telegram's 400 "message is not modified" (the
+// content on screen is already up to date).
+func IsNotModified(err error) bool {
+	var ae *APIError
+	return errors.As(err, &ae) && ae.Code == http.StatusBadRequest &&
+		strings.Contains(ae.Description, "message is not modified")
+}
+
+// IsForbidden reports Telegram 403 (bot blocked by the user, kicked from
+// the chat, user deactivated).
+func IsForbidden(err error) bool {
+	var ae *APIError
+	return errors.As(err, &ae) && ae.Code == http.StatusForbidden
+}
+
 // IsDeferred reports whether err means "rate limited, the request is queued
 // and will be delivered later".
 func IsDeferred(err error) bool {
@@ -336,7 +363,7 @@ func (c *Client) callOnce(ctx context.Context, method string, body []byte, out a
 			}
 			return wait, fmt.Errorf("telegram %s: %s", method, ar.Description)
 		}
-		return 0, fmt.Errorf("telegram %s: %s", method, ar.Description)
+		return 0, &APIError{Method: method, Code: ar.ErrorCode, Description: ar.Description}
 	}
 	if out != nil && len(ar.Result) > 0 {
 		if err := json.Unmarshal(ar.Result, out); err != nil {

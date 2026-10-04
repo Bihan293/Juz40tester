@@ -163,24 +163,6 @@ func (r *SubjectRepository) TestQuestions(ctx context.Context, testID int64) ([]
 	return out, rows.Err()
 }
 
-// GetQuestion returns a single question by id.
-func (r *SubjectRepository) GetQuestion(ctx context.Context, id int64) (*models.Question, error) {
-	var q models.Question
-	err := r.pool.QueryRow(ctx, `
-		SELECT id, subject_id, question_text, option_a, option_b, option_c,
-		       option_d, correct_answer, topic, difficulty
-		FROM questions WHERE id = $1`, id).
-		Scan(&q.ID, &q.SubjectID, &q.Text, &q.OptionA, &q.OptionB, &q.OptionC,
-			&q.OptionD, &q.CorrectAnswer, &q.Topic, &q.Difficulty)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &q, nil
-}
-
 // QuestionStatuses returns knowledge statuses of the user for given questions.
 func (r *SubjectRepository) QuestionStatuses(ctx context.Context, userID int64, questionIDs []int64) (map[int64]int, error) {
 	rows, err := r.pool.Query(ctx, `

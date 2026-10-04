@@ -143,6 +143,13 @@ func TestTranslationQueuedNotSynchronous(t *testing.T) {
 		t.Fatalf("translation jobs = %d (%s), want exactly 1 pending", n, st)
 	}
 
+	// Isolation: the shared test DB may hold pending translation jobs left
+	// by other tests — the worker would translate them too and inflate the
+	// model-call count (flaky "model calls = 7").
+	if _, err := e.pool.Exec(ctx, `
+		DELETE FROM translation_jobs WHERE test_id <> $1 AND status IN ('pending','running')`, test.ID); err != nil {
+		t.Fatal(err)
+	}
 	// The background worker translates once; every waiter is notified.
 	wctx, stop := context.WithCancel(ctx)
 	defer stop()

@@ -372,10 +372,10 @@ func (r *GenerationRepository) DeletePersonalTest(ctx context.Context, userID, t
 // off-peak window in ⏳ «Минуточку...» — hours for a test they can already
 // open. A 'done' row is never touched: the conflict update's WHERE clause
 // excludes it, so the unique index keeps blocking a paid regeneration.
-func (r *GenerationRepository) EnqueueChainJob(ctx context.Context, subjectID int64, testNumber int, notBefore time.Time, urgent bool, ownerUserID ...int64) (bool, error) {
+func (r *GenerationRepository) EnqueueChainJob(ctx context.Context, subjectID int64, testNumber int, notBefore time.Time, urgent bool, ownerUserID int64) (bool, error) {
 	var owner any
-	if len(ownerUserID) > 0 && ownerUserID[0] > 0 {
-		owner = ownerUserID[0]
+	if ownerUserID > 0 {
+		owner = ownerUserID
 	}
 	tag, err := r.pool.Exec(ctx, `
 		INSERT INTO generation_jobs (kind, subject_id, test_number, not_before, urgent, owner_user_id)

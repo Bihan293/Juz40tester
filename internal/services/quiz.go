@@ -40,12 +40,9 @@ type QuizService struct {
 	metas *viewMetaCache
 }
 
-func NewQuizService(subjects *repositories.SubjectRepository, attempts *repositories.AttemptRepository, state *repositories.StateRepository, gen *repositories.GenerationRepository, genSvc *GeneratorService, users ...*repositories.UserRepository) *QuizService {
+func NewQuizService(subjects *repositories.SubjectRepository, attempts *repositories.AttemptRepository, state *repositories.StateRepository, gen *repositories.GenerationRepository, genSvc *GeneratorService, users *repositories.UserRepository) *QuizService {
 	s := &QuizService{subjects: subjects, attempts: attempts, state: state, gen: gen, genSvc: genSvc, rng: newSecureRand(),
-		boards: newLeaderboardCache(LeaderboardCacheTTL), metas: newViewMetaCache(viewMetaTTL, viewMetaMax)}
-	if len(users) > 0 {
-		s.users = users[0]
-	}
+		boards: newLeaderboardCache(LeaderboardCacheTTL), metas: newViewMetaCache(viewMetaTTL, viewMetaMax), users: users}
 	return s
 }
 

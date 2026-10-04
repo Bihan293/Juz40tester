@@ -210,8 +210,10 @@ func TestQualitySweepRepository(t *testing.T) {
 	if err := gen.ReplaceQuestionContent(ctx, bad.ID, fixed); err != nil {
 		t.Fatalf("replace: %v", err)
 	}
-	q, err := subjects.GetQuestion(ctx, bad.ID)
-	if err != nil {
+	var q models.Question
+	if err := pool.QueryRow(ctx, `
+		SELECT option_a, correct_answer, topic FROM questions WHERE id = $1`, bad.ID).
+		Scan(&q.OptionA, &q.CorrectAnswer, &q.Topic); err != nil {
 		t.Fatal(err)
 	}
 	if q.CorrectAnswer != "A" || q.OptionA != fixed.Options[0] || q.Topic != "Тире" {

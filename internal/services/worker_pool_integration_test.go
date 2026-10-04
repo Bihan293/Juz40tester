@@ -124,7 +124,7 @@ func TestRunWorkerProcessesBurstImmediately(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond) // workers are idle, waiting
 	for n := 1; n <= 4; n++ {
-		if _, err := svc.EnsureChainTest(ctx, e.sid, n, true); err != nil {
+		if _, err := svc.EnsureChainTest(ctx, e.sid, n, true, 0); err != nil {
 			t.Fatal(err)
 		}
 	}
