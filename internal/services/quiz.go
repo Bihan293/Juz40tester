@@ -495,17 +495,29 @@ func (s *QuizService) WeakTopicStats(ctx context.Context, userID, subjectID int6
 // exists (test != nil) or is still being generated (pending). Used by the
 // «wait for the test» notifier: when both are empty the generation failed.
 func (s *QuizService) ChainTestStatus(ctx context.Context, subjectID int64, number int) (test *models.Test, pending bool, err error) {
-	chain, err := s.subjects.ListChainTests(ctx, subjectID)
+	// R-7: a point query instead of listing the whole chain — this runs in
+	// the generation watchers' poll loop.
+	id, err := s.gen.ChainTestID(ctx, subjectID, number)
 	if err != nil {
 		return nil, false, err
 	}
-	for i := range chain {
-		if chain[i].TestNumber == number {
-			return &chain[i], false, nil
-		}
+	if id > 0 {
+		return &models.Test{ID: id, SubjectID: subjectID, TestNumber: number, Kind: models.TestKindChain, IsActive: true}, false, nil
 	}
 	pending, err = s.gen.HasPendingOrRunningChainJob(ctx, subjectID, number)
 	return nil, pending, err
+}
+
+// ActivePersonalJobID returns the pending/running personal generation job
+// of (subject, user), 0 when none (R-7: the watcher key is job:<id>).
+func (s *QuizService) ActivePersonalJobID(ctx context.Context, userID, subjectID int64) (int64, error) {
+	return s.gen.ActivePersonalJobID(ctx, subjectID, userID)
+}
+
+// JobState reports the test produced by a generation job (0 until done)
+// and whether the job is still pending/running (R-7).
+func (s *QuizService) JobState(ctx context.Context, jobID int64) (testID int64, pending bool, err error) {
+	return s.gen.JobState(ctx, jobID)
 }
 
 // PersonalTestStatus reports whether the user's personal weak-topics test of

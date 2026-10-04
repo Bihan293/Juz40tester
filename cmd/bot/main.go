@@ -128,6 +128,9 @@ func main() {
 		WithTranslator(translatorSvc)
 	tg := bot.NewClient(cfg.BotToken)
 	h := handlers.New(tg, userRepo, quiz).WithActionLimiter(ratelimit.New(cfg.UserActionInterval))
+	// R-7: the worker delivers a finished generation to the waiting users
+	// at once (shared watcher per key) instead of waiting for their poll.
+	genSvc.WithJobFinishedHook(h.NotifyJobFinished)
 
 	// Background worker: processes the AI test-generation queue (thinking
 	// model with adaptive effort, off-peak deferral, cost logging). No-op
@@ -281,6 +284,9 @@ func main() {
 	if err := updates.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown: some updates did not finish in time: %v", err)
 	}
+	// 3a. Stop the generation watchers (their notes keep the ⏳ text; the
+	//     user taps the ⏳ button again after the restart).
+	h.Close(2 * time.Second)
 	// 3b. Flush Telegram requests deferred by a 429 (best effort).
 	if err := tg.Close(shutdownCtx); err != nil {
 		log.Printf("shutdown: %d deferred Telegram request(s) dropped: %v", tg.PendingDeferred(), err)
