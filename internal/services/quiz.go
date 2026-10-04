@@ -905,91 +905,9 @@ func (s *QuizService) AllSubjectsProgress(ctx context.Context, userID int64, sub
 // Test content language (🇷🇺/🇰🇿 — the interface itself always stays Russian)
 // ---------------------------------------------------------------------------
 
-// ResolvedQuestion is a question rendered in the user's test language:
-// either the Russian master row or its cached Kazakh translation. The
-// correct-answer letter is always consistent with the shown options.
-type ResolvedQuestion struct {
-	QuestionID    int64
-	Text          string
-	Options       [4]string // A, B, C, D in the user's language
-	CorrectAnswer string    // letter matching Options
-	Topic         string
-}
-
-// ResolveTestForUser returns the questions of a test in the user's test
-// language. For Russian users this is a plain pass-through. For Kazakh
-// users the cached translation is used; missing translations are produced
-// ONCE for the whole test (a single DeepSeek Flash call) and stored, so the
-// next user — of any test containing the same questions — reuses them.
-//
-// (translated=true, err=nil) means every question has a Kazakh version;
-// translated=false means the Russian master must be used as a fallback
-// (translation unavailable or failed — the test must still open).
-func (s *QuizService) ResolveTestForUser(ctx context.Context, user *models.User, testID int64) ([]ResolvedQuestion, bool, error) {
-	questions, err := s.subjects.TestQuestions(ctx, testID)
-	if err != nil {
-		return nil, false, err
-	}
-	resolved := make([]ResolvedQuestion, 0, len(questions))
-	if !s.wantsTranslation(ctx, user, testID) {
-		for _, q := range questions {
-			resolved = append(resolved, russianQuestion(&q))
-		}
-		return resolved, false, nil
-	}
-
-	tr, err := s.translator.TranslateTest(ctx, testID, questions)
-	if err != nil {
-		// Translation failed (API down, invalid reply) — the user must still
-		// be able to take the test, in the Russian master version.
-		log.Printf("translator fallback for test %d: %v", testID, err)
-		for _, q := range questions {
-			resolved = append(resolved, russianQuestion(&q))
-		}
-		return resolved, false, nil
-	}
-	// A partially translated test must never be served half Russian, half
-	// Kazakh: when any question lacks a translation the WHOLE test falls
-	// back to the Russian master and translated=false is reported.
-	for _, q := range questions {
-		if tr[q.ID] == nil {
-			log.Printf("translator: test %d only partially translated (q%d missing) — Russian fallback", testID, q.ID)
-			resolved = resolved[:0]
-			for _, rq := range questions {
-				resolved = append(resolved, russianQuestion(&rq))
-			}
-			return resolved, false, nil
-		}
-	}
-	for _, q := range questions {
-		t := tr[q.ID]
-		resolved = append(resolved, ResolvedQuestion{
-			QuestionID:    q.ID,
-			Text:          t.Text,
-			Options:       [4]string{t.OptionA, t.OptionB, t.OptionC, t.OptionD},
-			CorrectAnswer: q.CorrectAnswer, // letter matches the translated options 1:1
-			Topic:         t.Topic,
-		})
-	}
-	return resolved, true, nil
-}
-
-// russianQuestion wraps the master (Russian) question row.
-func russianQuestion(q *models.Question) ResolvedQuestion {
-	return ResolvedQuestion{
-		QuestionID:    q.ID,
-		Text:          q.Text,
-		Options:       [4]string{q.OptionA, q.OptionB, q.OptionC, q.OptionD},
-		CorrectAnswer: q.CorrectAnswer,
-		Topic:         q.Topic,
-	}
-}
-
 // TestFullyTranslated reports whether the Kazakh version of the test is
-// already COMPLETE in the cache. Pure DB lookup, zero API cost — the
-// handler uses it to show the "⏳ Перевожу тест…" toast only when the
-// first-ever translation of this test is actually about to run (every
-// later Kazakh user opens the cached version instantly, no toast).
+// already COMPLETE in the cache. Pure DB lookup, zero API cost — only an
+// incomplete translation queues a background job (PrepareTranslation).
 func (s *QuizService) TestFullyTranslated(ctx context.Context, testID int64) (bool, error) {
 	questions, err := s.subjects.TestQuestions(ctx, testID)
 	if err != nil {
@@ -1012,25 +930,39 @@ func (s *QuizService) TestFullyTranslated(ctx context.Context, testID int64) (bo
 	return n >= len(questions), nil
 }
 
-// EnsureTestTranslated makes sure a Kazakh version of the test exists when
-// the user's test language is kk: the cached translation is used when it is
-// already in the DB (ZERO DeepSeek calls — this is why the same test opened
-// by the second, third, ... Kazakh user is completely free), otherwise the
-// Russian master test is translated ONCE (a single DeepSeek Flash call) and
-// stored for everyone. ready=true means the test was (or now is) fully
-// available in the user's test language; ready=false means the Russian
-// master is served (Russian users, translator disabled, or a translation
-// failure — a missing translation must never block a test from opening).
-func (s *QuizService) EnsureTestTranslated(ctx context.Context, user *models.User, testID int64) (ready bool, err error) {
-	if !s.wantsTranslation(ctx, user, testID) {
-		return false, nil
+// PrepareTranslation makes sure the Kazakh version of the test exists or is
+// being produced — WITHOUT translating anything in the caller's goroutine
+// (R-4: an update handler must never wait for a model call).
+//
+//   - ready = true: the cached translation is complete — open the test now
+//     (ZERO API calls; every later Kazakh user of a test is free);
+//   - wait != nil: a background translation job has been queued (or was
+//     already queued/running — UNIQUE per test and language, so a test is
+//     never translated twice) and the channel delivers its outcome exactly
+//     once; the caller shows «⏳ Перевод готовится…» and returns at once;
+//   - ready = false, wait = nil: no translation is wanted (Russian user,
+//     language subject, translator disabled) or the request failed (err;
+//     ErrTranslationUnavailable when the translation failed recently) —
+//     the test opens in the Russian master version.
+func (s *QuizService) PrepareTranslation(ctx context.Context, user *models.User, test *models.Test) (ready bool, wait <-chan TranslationOutcome, err error) {
+	if !s.TestNeedsTranslationFor(ctx, user, test) {
+		return false, nil, nil
 	}
-	_, ok, err := s.ResolveTestForUser(ctx, user, testID)
+	done, err := s.TestFullyTranslated(ctx, test.ID)
 	if err != nil {
-		log.Printf("ensure test %d translated: %v", testID, err)
-		return false, err
+		return false, nil, err
 	}
-	return ok, nil
+	if done {
+		return true, nil, nil
+	}
+	// Subscribe BEFORE enqueuing: a local worker may finish the job between
+	// the two calls, and its publish must not be missed.
+	wait = s.translator.AwaitTranslation(test.ID)
+	if err := s.translator.RequestTranslation(ctx, test.ID); err != nil {
+		s.translator.CancelAwait(test.ID, wait)
+		return false, nil, err
+	}
+	return false, wait, nil
 }
 
 // ---------------------------------------------------------------------------

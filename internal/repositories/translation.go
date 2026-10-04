@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -173,4 +174,193 @@ func (r *TranslationRepository) CopyTranslationsToTest(ctx context.Context, srcT
 		return 0, err
 	}
 	return tag.RowsAffected(), nil
+}
+
+// ---------------------------------------------------------------------------
+// Background translation queue (R-4)
+// ---------------------------------------------------------------------------
+
+// TranslationJob is one row of translation_jobs: "translate test X into
+// language L". UNIQUE (test_id, lang) makes a translation a single job row
+// across every instance — the cross-instance replacement of the old
+// in-memory per-test mutex.
+type TranslationJob struct {
+	ID        int64
+	TestID    int64
+	Lang      string
+	Status    string // pending | running | done | failed
+	Attempts  int
+	LastError string
+}
+
+// translationRearmAfterFail: a job that exhausted its retries is re-armed by
+// a new request only after this pause, so a provider outage is not hammered
+// by every tap of every student.
+const translationRearmAfterFail = 10 * time.Minute
+
+// EnqueueTranslationJob queues the translation of a test (idempotent). A new
+// row is inserted as 'pending'; an existing 'pending'/'running' row is left
+// untouched (that very job will do the work — never translate twice); a
+// 'done' row is re-armed (the caller only enqueues when the cached
+// translation is INCOMPLETE, e.g. a question was rewritten by the quality
+// sweep); a 'failed' row is re-armed once translationRearmAfterFail has
+// passed. queued reports whether a job is now pending (newly inserted or
+// re-armed).
+func (r *TranslationRepository) EnqueueTranslationJob(ctx context.Context, testID int64, lang string) (queued bool, err error) {
+	tag, err := r.pool.Exec(ctx, `
+		INSERT INTO translation_jobs (test_id, lang)
+		VALUES ($1, $2)
+		ON CONFLICT (test_id, lang) DO UPDATE
+		SET status = 'pending', attempts = 0, last_error = '',
+		    not_before = now(), updated_at = now()
+		WHERE translation_jobs.status = 'done'
+		   OR (translation_jobs.status = 'failed'
+		       AND translation_jobs.updated_at < now() - make_interval(secs => $3))`,
+		testID, lang, durationSecs(translationRearmAfterFail))
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// ClaimNextTranslationJob atomically picks the oldest due pending job and
+// marks it running (FOR UPDATE SKIP LOCKED: concurrent workers on any
+// instance never claim the same row). Returns nil when nothing is due.
+func (r *TranslationRepository) ClaimNextTranslationJob(ctx context.Context) (*TranslationJob, error) {
+	var j TranslationJob
+	err := r.pool.QueryRow(ctx, `
+		UPDATE translation_jobs
+		SET status = 'running', attempts = attempts + 1, updated_at = now()
+		WHERE id = (
+			SELECT id FROM translation_jobs
+			WHERE status = 'pending' AND not_before <= now()
+			ORDER BY not_before, id
+			LIMIT 1
+			FOR UPDATE SKIP LOCKED)
+		RETURNING id, test_id, lang, status, attempts, last_error`).
+		Scan(&j.ID, &j.TestID, &j.Lang, &j.Status, &j.Attempts, &j.LastError)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &j, nil
+}
+
+// TouchTranslationJob refreshes the heartbeat of a running job, so the
+// reaper never mistakes a slow-but-alive translation for a dead one.
+func (r *TranslationRepository) TouchTranslationJob(ctx context.Context, jobID int64) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE translation_jobs SET updated_at = now()
+		WHERE id = $1 AND status = 'running'`, jobID)
+	return err
+}
+
+// CompleteTranslationJob marks the job done.
+func (r *TranslationRepository) CompleteTranslationJob(ctx context.Context, jobID int64) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE translation_jobs
+		SET status = 'done', last_error = '', updated_at = now()
+		WHERE id = $1`, jobID)
+	return err
+}
+
+// FailTranslationJob records a failed run: retried after retryDelay, parked
+// as 'failed' once maxAttempts runs were spent.
+func (r *TranslationRepository) FailTranslationJob(ctx context.Context, jobID int64, jobErr error, retryDelay time.Duration, maxAttempts int) error {
+	msg := "translation failed"
+	if jobErr != nil {
+		msg = jobErr.Error()
+	}
+	_, err := r.pool.Exec(ctx, `
+		UPDATE translation_jobs
+		SET status = CASE WHEN attempts >= $2 THEN 'failed' ELSE 'pending' END,
+		    last_error = $3,
+		    not_before = CASE WHEN attempts >= $2 THEN not_before ELSE now() + make_interval(secs => $4) END,
+		    updated_at = now()
+		WHERE id = $1`, jobID, maxAttempts, msg, durationSecs(retryDelay))
+	return err
+}
+
+// ReleaseTranslationJob hands a running job back to the queue without
+// counting the interrupted run (shutdown / deploy — the job did not fail).
+func (r *TranslationRepository) ReleaseTranslationJob(ctx context.Context, jobID int64) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE translation_jobs
+		SET status = 'pending', not_before = now(),
+		    attempts = GREATEST(attempts - 1, 0), updated_at = now()
+		WHERE id = $1 AND status = 'running'`, jobID)
+	return err
+}
+
+// ResetStuckTranslationJobs returns running jobs whose heartbeat stopped for
+// stuckFor (the worker died: deploy, OOM, restart) to 'pending'; a job that
+// already used maxAttempts is parked as 'failed' (a job that kills the
+// process must not crash-loop it).
+func (r *TranslationRepository) ResetStuckTranslationJobs(ctx context.Context, stuckFor time.Duration, maxAttempts int) (int64, error) {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE translation_jobs
+		SET status     = CASE WHEN attempts >= $2 THEN 'failed' ELSE 'pending' END,
+		    last_error = CASE WHEN attempts >= $2 THEN 'stuck in running: attempts exhausted' ELSE last_error END,
+		    not_before = now(),
+		    updated_at = now()
+		WHERE status = 'running' AND updated_at < now() - make_interval(secs => $1)`,
+		durationSecs(stuckFor), maxAttempts)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// TranslationJobState returns the status and the last error of the job of
+// (test, lang); ("", "", nil) when no job exists. One indexed lookup — the
+// shared per-test waiter uses it as its cheap fallback check.
+func (r *TranslationRepository) TranslationJobState(ctx context.Context, testID int64, lang string) (status, lastError string, err error) {
+	err = r.pool.QueryRow(ctx, `
+		SELECT status, last_error FROM translation_jobs
+		WHERE test_id = $1 AND lang = $2`, testID, lang).Scan(&status, &lastError)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", nil
+	}
+	return status, lastError, err
+}
+
+// MasterQuestionsForTest returns the Russian master questions of a test in
+// their canonical order — the input of a background translation job.
+func (r *TranslationRepository) MasterQuestionsForTest(ctx context.Context, testID int64) ([]models.Question, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT q.id, q.subject_id, q.question_text, q.option_a, q.option_b,
+		       q.option_c, q.option_d, q.correct_answer, q.topic, q.difficulty
+		FROM test_questions tq
+		JOIN questions q ON q.id = tq.question_id
+		WHERE tq.test_id = $1
+		ORDER BY tq.position`, testID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []models.Question
+	for rows.Next() {
+		var q models.Question
+		if err := rows.Scan(&q.ID, &q.SubjectID, &q.Text, &q.OptionA, &q.OptionB,
+			&q.OptionC, &q.OptionD, &q.CorrectAnswer, &q.Topic, &q.Difficulty); err != nil {
+			return nil, err
+		}
+		out = append(out, q)
+	}
+	return out, rows.Err()
+}
+
+// SubjectNameForTest returns the name of the subject a test belongs to (the
+// worker re-checks that a language subject is never translated).
+func (r *TranslationRepository) SubjectNameForTest(ctx context.Context, testID int64) (string, error) {
+	var name string
+	err := r.pool.QueryRow(ctx, `
+		SELECT s.name FROM tests t JOIN subjects s ON s.id = t.subject_id
+		WHERE t.id = $1`, testID).Scan(&name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return name, err
 }

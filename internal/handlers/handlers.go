@@ -689,21 +689,30 @@ func (h *Handler) openTest(ctx context.Context, cb *bot.CallbackQuery, user *mod
 		return
 	}
 
-	// Kazakh users: make sure the test content has a Kazakh version BEFORE
-	// the attempt starts. The cached translation is reused when it exists
-	// (ZERO DeepSeek calls — every later Kazakh user of the same test is
-	// completely free); otherwise the Russian master test is translated once
-	// (one DeepSeek Flash call) and stored for everyone. A translation
-	// failure never blocks the test — it opens in the Russian master version.
-	// The callback is acknowledged right away (a silent ack stops the spinner);
-	// every further notice goes to the chat as a normal, readable message.
+	// The callback is acknowledged right away (a silent ack stops the
+	// spinner); every further notice goes to the chat as a normal message.
 	h.answerCallback(ctx, cb, "")
-	// Language subjects (Русский/Английский/Казахский язык, литература) are
-	// never translated — TestNeedsTranslation is false for them.
-	if h.quiz.TestNeedsTranslationFor(ctx, user, test) {
-		h.ensureTranslatedWithNote(ctx, cb.Message.Chat.ID, user, testID)
-	}
 
+	// Kazakh users: the test content must have a Kazakh version. A cached
+	// translation is used right away (ZERO API calls). Otherwise (R-4) a
+	// background translation job is queued and the user gets «⏳ Перевод
+	// готовится…» — the handler returns immediately and frees its webhook
+	// slot; the first question is shown by the waiter as soon as the
+	// translation is ready (or in Russian if it failed — a missing
+	// translation never blocks a test). Language subjects are never
+	// translated (PrepareTranslation reports nothing to wait for).
+	if h.deferUntilTranslated(ctx, cb, user, test, func(ctx context.Context) {
+		h.startOrResume(ctx, cb, user, test)
+	}) {
+		return
+	}
+	h.startOrResume(ctx, cb, user, test)
+}
+
+// startOrResume continues the saved attempt of the test or starts a new one
+// and shows its current question. The callback is already answered.
+func (h *Handler) startOrResume(ctx context.Context, cb *bot.CallbackQuery, user *models.User, test *models.Test) {
+	testID := test.ID
 	resume, err := h.quiz.ResumeOrNil(ctx, user.ID, testID)
 	if err != nil {
 		log.Printf("resume lookup %d: %v", testID, err)
@@ -1034,16 +1043,26 @@ func (h *Handler) retryTest(ctx context.Context, cb *bot.CallbackQuery, user *mo
 		return
 	}
 	// The user may have switched the test language to Kazakh since this test
-	// was created — make sure the Kazakh version exists before the new run
-	// (the cached translation is reused when it already exists, zero API
-	// calls; otherwise the test is translated once, for everyone). A failure
-	// falls back to the Russian master version, never blocks the retry.
-	if h.quiz.TestNeedsTranslation(ctx, user, sum.Test.ID) {
-		h.ensureTranslatedWithNote(ctx, cb.Message.Chat.ID, user, sum.Test.ID)
+	// was created — the Kazakh version must exist before the new run. A
+	// cached translation is reused at once (zero API calls); otherwise a
+	// background job is queued and the run starts when it is ready (R-4 —
+	// the handler never waits). A failure falls back to the Russian master
+	// version, never blocks the retry.
+	testID := sum.Test.ID
+	if h.deferUntilTranslated(ctx, cb, user, sum.Test, func(ctx context.Context) {
+		h.restartRun(ctx, cb, user, testID)
+	}) {
+		return
 	}
+	h.restartRun(ctx, cb, user, testID)
+}
+
+// restartRun starts a brand-new attempt of the test and shows its first
+// question (retry flow; the callback is already answered).
+func (h *Handler) restartRun(ctx context.Context, cb *bot.CallbackQuery, user *models.User, testID int64) {
 	// Every retry is a brand-new attempt with fresh shuffled question and
 	// option orders.
-	newAttempt, err := h.quiz.RestartTest(ctx, user.ID, sum.Test.ID)
+	newAttempt, err := h.quiz.RestartTest(ctx, user.ID, testID)
 	if err != nil {
 		log.Printf("retry test: %v", err)
 		h.sendText(ctx, cb.Message.Chat.ID, "Не удалось начать тест 😔")
@@ -1654,48 +1673,91 @@ const (
 	genWatchTimeout = 10 * time.Minute
 )
 
-// ensureTranslatedWithNote makes sure the Kazakh version of the test exists.
-// When the first-ever translation is about to run (it takes up to a
-// minute), the user gets a clear CHAT MESSAGE instead of an unreadable
-// 5-second toast; the note is removed as soon as the test is ready.
-func (h *Handler) ensureTranslatedWithNote(ctx context.Context, chatID int64, user *models.User, testID int64) {
-	done, err := h.quiz.TestFullyTranslated(ctx, testID)
+// translationNote is shown while the first-ever Kazakh translation of a
+// test is produced in the background (R-4).
+const translationNote = "⏳ Перевод готовится… 🇰🇿\n\nТест переводится на казахский язык. Никуда не уходи — перевод делается один раз, дальше этот тест будет открываться мгновенно. Первый вопрос появится сам 👇"
+
+// translationFailedNote: the translation failed or took too long — the
+// test opens in the Russian master version instead.
+const translationFailedNote = "😔 Не получилось перевести тест на казахский — пока открываю его на русском. Попробуй позже ещё раз."
+
+// translationContinueTimeout bounds the continuation (start the attempt and
+// show the question) that runs after the translation wait.
+const translationContinueTimeout = 30 * time.Second
+
+// deferUntilTranslated decides whether the test can be opened right now.
+// It returns false when nothing has to be waited for (Russian user,
+// language subject, complete cached translation, or a failed request — then
+// the test opens in Russian at once and the caller continues synchronously).
+// It returns true when a background translation was queued (R-4): the user
+// gets «⏳ Перевод готовится…», the handler returns at once, and `then`
+// runs in a background goroutine once the shared per-test waiter reports
+// the outcome. That goroutine only blocks on a channel — the DB is checked
+// by ONE shared waiter per test, never per user. Repeated taps of the same
+// user on the same test never stack waiters or notes.
+func (h *Handler) deferUntilTranslated(ctx context.Context, cb *bot.CallbackQuery, user *models.User, test *models.Test, then func(context.Context)) bool {
+	_, wait, err := h.quiz.PrepareTranslation(ctx, user, test)
 	if err != nil {
-		log.Printf("translation status %d: %v", testID, err)
-		done = true // unknown — do not promise a wait we cannot judge
-	}
-	var noteID int64
-	if !done {
-		id, serr := h.tg.SendMessage(ctx, chatID,
-			"⏳ Тест переводится на казахский язык 🇰🇿\n\nНикуда не уходи, подожди минуточку — перевод делается один раз, дальше этот тест будет открываться мгновенно. Первый вопрос появится сам 👆", nil)
-		if serr != nil {
-			log.Printf("send translation note: %v", serr)
-		} else {
-			noteID = id
+		if !errors.Is(err, services.ErrTranslationUnavailable) {
+			log.Printf("prepare translation of test %d: %v", test.ID, err)
 		}
+		h.sendText(ctx, cb.Message.Chat.ID, translationFailedNote)
+		return false
 	}
-	ready, terr := h.quiz.EnsureTestTranslated(ctx, user, testID)
-	if terr != nil || !ready {
-		// A translation failure never blocks the test: the Russian master
-		// version is served instead. ready=false here (this helper is only
-		// called when a translation IS wanted) means the translation failed
-		// or is incomplete — tell the user honestly.
-		log.Printf("translate test %d: ready=%v err=%v", testID, ready, terr)
-		if noteID == 0 {
-			h.sendText(ctx, chatID, "😔 Не получилось перевести тест на казахский — пока открываю его на русском. Попробуй позже ещё раз.")
-		} else {
-			if eerr := h.tg.EditMessageText(ctx, chatID, noteID,
-				"😔 Не получилось перевести тест на казахский — пока открываю его на русском. Попробуй позже ещё раз.", nil); eerr != nil {
-				log.Printf("edit translation note: %v", eerr)
+	if wait == nil {
+		return false
+	}
+	key := fmt.Sprintf("tr:%d:%d", user.ID, test.ID)
+	if _, busy := h.watchers.LoadOrStore(key, struct{}{}); busy {
+		// The waiter of the first tap will show the question — no second note.
+		return true
+	}
+	chatID := cb.Message.Chat.ID
+	noteID, serr := h.tg.SendMessage(ctx, chatID, translationNote, nil)
+	if serr != nil {
+		log.Printf("send translation note: %v", serr)
+	}
+	// The continuation runs after this update finished: mark the callback
+	// as answered for its duration, so any error notice goes to the chat
+	// (the callback query itself was already answered above).
+	cont := func(ctx context.Context) {
+		h.answered.Store(cb.ID, struct{}{})
+		defer h.answered.Delete(cb.ID)
+		then(ctx)
+	}
+	go h.awaitTranslation(key, chatID, noteID, test.ID, wait, cont)
+	return true
+}
+
+// awaitTranslation waits for the outcome of a background translation and
+// then removes the note (or turns it into an honest failure notice) and
+// runs the continuation — the question is shown in Kazakh when the
+// translation is ready, in Russian otherwise.
+func (h *Handler) awaitTranslation(key string, chatID, noteID, testID int64, wait <-chan services.TranslationOutcome, then func(context.Context)) {
+	defer h.watchers.Delete(key)
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("translation waiter %s panicked: %v", key, r)
+		}
+	}()
+	out := <-wait // always delivered (at the latest after the wait timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), translationContinueTimeout)
+	defer cancel()
+	if out.Ready {
+		if noteID != 0 {
+			if err := h.tg.DeleteMessage(ctx, chatID, noteID); err != nil {
+				log.Printf("delete translation note: %v", err)
 			}
 		}
-		return
-	}
-	if noteID != 0 {
-		if derr := h.tg.DeleteMessage(ctx, chatID, noteID); derr != nil {
-			log.Printf("delete translation note: %v", derr)
+	} else {
+		log.Printf("translation of test %d not ready (timeout=%v err=%q) — opening the Russian master", testID, out.TimedOut, out.Err)
+		if noteID != 0 {
+			h.editNote(ctx, chatID, noteID, translationFailedNote, nil)
+		} else {
+			h.sendText(ctx, chatID, translationFailedNote)
 		}
 	}
+	then(ctx)
 }
 
 // startGenerationWatch acknowledges the tap, posts a clearly visible chat

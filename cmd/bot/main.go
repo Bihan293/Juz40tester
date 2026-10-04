@@ -138,8 +138,13 @@ func main() {
 	workerCtx, stopWorker := context.WithCancel(context.Background())
 	defer stopWorker()
 	var bgWG sync.WaitGroup
-	bgWG.Add(2)
+	bgWG.Add(3)
 	go func() { defer bgWG.Done(); genSvc.RunWorker(workerCtx) }()
+	// R-4: background Kazakh translation queue (translation_jobs). Update
+	// handlers only enqueue a job and answer «⏳ Перевод готовится…»; the
+	// worker translates and notifies the waiting users. No-op when no AI
+	// provider is configured.
+	go func() { defer bgWG.Done(); translatorSvc.RunWorker(workerCtx) }()
 	// Stale-attempt reaper: attempts left unfinished for staleAttemptAge
 	// are closed as abandoned (they would otherwise keep their questions
 	// "busy" for the quality sweep forever).
