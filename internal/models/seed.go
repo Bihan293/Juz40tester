@@ -10,4 +10,8 @@ type SeedQuestion struct {
 	Correct    int       // 0=A, 1=B, 2=C, 3=D
 	Topic      string
 	Difficulty int
+	// QualityChecked: the question already passed the quality audit (a
+	// generated test after repairFlagged, or a clone of a checked question),
+	// so it is stored with quality_checked_at = now() and the sweep skips it.
+	QualityChecked bool
 }
