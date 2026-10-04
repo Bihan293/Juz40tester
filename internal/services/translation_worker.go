@@ -42,7 +42,7 @@ const (
 	translationRetryDelay = 2 * time.Minute
 	// translationPollEvery is the FALLBACK poll of an idle worker: jobs
 	// enqueued in this instance wake a worker immediately.
-	translationPollEvery = time.Minute
+	translationPollEvery = 3 * time.Minute
 	// translationReapEvery: how often the stuck-job reaper runs.
 	translationReapEvery = 5 * time.Minute
 
@@ -292,6 +292,9 @@ func (t *TranslatorService) CancelAwait(testID int64, ch <-chan TranslationOutco
 	t.hub.unsubscribe(testID, ch)
 }
 
+// Wake wakes an idle worker; called by the LISTEN tr_jobs listener (R-5b).
+func (t *TranslatorService) Wake() { t.notifyWorkers() }
+
 func (t *TranslatorService) notifyWorkers() {
 	if t == nil || t.wake == nil {
 		return
@@ -344,8 +347,14 @@ func (t *TranslatorService) runWorkerLoop(ctx context.Context, id int) (panicked
 			panicked = true
 		}
 	}()
-	poll := time.NewTicker(translationPollEvery)
-	defer poll.Stop()
+	// Only worker 1 runs the fallback timer (one idle poll per
+	// translationPollEvery for the whole pool).
+	var tick <-chan time.Time
+	if id == 1 {
+		poll := time.NewTicker(translationPollEvery)
+		defer poll.Stop()
+		tick = poll.C
+	}
 	var lastReap time.Time
 	for {
 		if id == 1 && time.Since(lastReap) >= translationReapEvery {
@@ -363,7 +372,7 @@ func (t *TranslatorService) runWorkerLoop(ctx context.Context, id int) (panicked
 		case <-ctx.Done():
 			return false
 		case <-t.wake:
-		case <-poll.C:
+		case <-tick:
 		}
 	}
 }

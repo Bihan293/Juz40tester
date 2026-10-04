@@ -138,7 +138,22 @@ func main() {
 	workerCtx, stopWorker := context.WithCancel(context.Background())
 	defer stopWorker()
 	var bgWG sync.WaitGroup
-	bgWG.Add(3)
+	bgWG.Add(4)
+	// R-5b: one dedicated DIRECT connection (same URL as the migrations;
+	// LISTEN does not work behind a transaction-mode pooler) listens on the
+	// queue channels and wakes the workers the moment a job is enqueued by
+	// any instance. Workers fall back to a 3-minute poll.
+	go func() {
+		defer bgWG.Done()
+		database.Listen(workerCtx, migURL, []string{repositories.ChannelGenJobs, repositories.ChannelTrJobs}, func(ch string) {
+			switch ch {
+			case repositories.ChannelGenJobs:
+				genSvc.Wake()
+			case repositories.ChannelTrJobs:
+				translatorSvc.Wake()
+			}
+		})
+	}()
 	go func() { defer bgWG.Done(); genSvc.RunWorker(workerCtx) }()
 	// R-4: background Kazakh translation queue (translation_jobs). Update
 	// handlers only enqueue a job and answer «⏳ Перевод готовится…»; the
