@@ -546,7 +546,7 @@ func (h *Handler) flipSubjectPage(ctx context.Context, cb *bot.CallbackQuery, us
 // a weak topic, and offering it led to an endless «generating…» state. No
 // generation is triggered here — a test is created only on an explicit tap.
 func (h *Handler) renderWeakMenu(ctx context.Context, user *models.User) (string, *bot.InlineKeyboardMarkup, error) {
-	subjects, err := h.quiz.SubjectsWithWeakTopics(ctx, user.ID)
+	subjects, weak, err := h.quiz.WeakMenu(ctx, user.ID, weakMenuTopics)
 	if err != nil {
 		return "", nil, err
 	}
@@ -562,12 +562,8 @@ func (h *Handler) renderWeakMenu(ctx context.Context, user *models.User) (string
 	buttons := make([]bot.InlineKeyboardButton, 0, len(subjects))
 	for _, s := range subjects {
 		buttons = append(buttons, bot.Btn(subjectEmoji(s.Name)+" "+s.Name, cbWeakSubject+strconv.FormatInt(s.ID, 10)))
-		stats, err := h.quiz.WeakTopicStats(ctx, user.ID, s.ID, weakMenuTopics)
-		if err != nil {
-			return "", nil, err
-		}
 		fmt.Fprintf(&b, "\n%s %s\n", subjectEmoji(s.Name), s.Name)
-		for _, st := range stats {
+		for _, st := range weak[s.ID] {
 			n, c := st.WindowCounts()
 			fmt.Fprintf(&b, "%s %s — верно %d из %d\n", models.TopicLevelEmoji(st.Level()), st.Topic, c, n)
 		}

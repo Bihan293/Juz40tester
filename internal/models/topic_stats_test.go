@@ -58,3 +58,30 @@ func TestNormalizeTopic(t *testing.T) {
 		t.Fatal("normalisation must lower-case and collapse spaces")
 	}
 }
+
+// R-10a: one AllTopicStats result grouped per subject gives the same lists
+// as the old per-subject WeakTopicStats calls.
+func TestWeakTopicStatsBySubject(t *testing.T) {
+	stats := []TopicStat{
+		{SubjectID: 1, Key: "a", Recent: "0000"},
+		{SubjectID: 1, Key: "b", Recent: "1111111111"},
+		{SubjectID: 2, Key: "c", Recent: "0101"},
+		{SubjectID: 3, Key: "d", Recent: "1111111111"},
+	}
+	got := WeakTopicStatsBySubject(stats, 5)
+	for _, sid := range []int64{1, 2} {
+		var sub []TopicStat
+		for _, s := range stats {
+			if s.SubjectID == sid {
+				sub = append(sub, s)
+			}
+		}
+		want := WeakTopicStats(sub, 5)
+		if len(got[sid]) != len(want) || len(want) == 0 || got[sid][0].Key != want[0].Key {
+			t.Fatalf("subject %d: got %+v want %+v", sid, got[sid], want)
+		}
+	}
+	if _, ok := got[3]; ok {
+		t.Fatal("subject without weak topics must be absent")
+	}
+}

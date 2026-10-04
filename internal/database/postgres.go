@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -21,28 +22,53 @@ func Connect(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 	return ConnectPool(ctx, databaseURL, 0)
 }
 
-// ConnectPool creates a pgx connection pool bounded by maxConns (0 = keep
-// the URL's pool_max_conns / the pgx default) and verifies connectivity.
-// An explicit pool_max_conns in the URL always wins over maxConns.
-func ConnectPool(ctx context.Context, databaseURL string, maxConns int32) (*pgxpool.Pool, error) {
+// PoolOptions tunes the pgx pool (R-10a). Zero fields keep the URL / pgx
+// defaults; explicit pool_* parameters in the URL always win.
+type PoolOptions struct {
+	MaxConns        int32
+	MinConns        int32
+	MaxConnLifetime time.Duration
+	MaxConnIdleTime time.Duration
+}
+
+// ConnectPoolOpts is ConnectPool with the full set of pool options.
+func ConnectPoolOpts(ctx context.Context, databaseURL string, o PoolOptions) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse database url: %w", err)
 	}
-	if maxConns > 0 && !strings.Contains(databaseURL, "pool_max_conns") {
-		cfg.MaxConns = maxConns
-	}
+	applyPoolOptions(cfg, databaseURL, o)
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create pool: %w", err)
 	}
-
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("ping database: %w", err)
 	}
-
 	return pool, nil
+}
+
+func applyPoolOptions(cfg *pgxpool.Config, databaseURL string, o PoolOptions) {
+	if o.MaxConns > 0 && !strings.Contains(databaseURL, "pool_max_conns") {
+		cfg.MaxConns = o.MaxConns
+	}
+	if o.MinConns > 0 && !strings.Contains(databaseURL, "pool_min_conns") {
+		cfg.MinConns = min(o.MinConns, cfg.MaxConns)
+	}
+	if o.MaxConnLifetime > 0 && !strings.Contains(databaseURL, "pool_max_conn_lifetime") {
+		cfg.MaxConnLifetime = o.MaxConnLifetime
+	}
+	if o.MaxConnIdleTime > 0 && !strings.Contains(databaseURL, "pool_max_conn_idle_time") {
+		cfg.MaxConnIdleTime = o.MaxConnIdleTime
+	}
+}
+
+// ConnectPool creates a pgx connection pool bounded by maxConns (0 = keep
+// the URL's pool_max_conns / the pgx default) and verifies connectivity.
+// An explicit pool_max_conns in the URL always wins over maxConns.
+func ConnectPool(ctx context.Context, databaseURL string, maxConns int32) (*pgxpool.Pool, error) {
+	return ConnectPoolOpts(ctx, databaseURL, PoolOptions{MaxConns: maxConns})
 }
 
 // DirectURL returns a connection string that bypasses a Neon connection
