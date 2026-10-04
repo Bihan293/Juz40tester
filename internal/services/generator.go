@@ -664,7 +664,7 @@ func (g *GeneratorService) deferredUntil() time.Time {
 // off-peak window kept the user waiting for hours in ⏳ «Минуточку...».
 // Locked tests (urgent = false) are pre-generated only in the off-peak
 // window. Returns the job status if it is already queued/running.
-func (g *GeneratorService) EnsureChainTest(ctx context.Context, subjectID int64, testNumber int, urgent bool, ownerUserID ...int64) (queued bool, err error) {
+func (g *GeneratorService) EnsureChainTest(ctx context.Context, subjectID int64, testNumber int, urgent bool, ownerUserID int64) (queued bool, err error) {
 	if !g.Enabled() {
 		return false, nil
 	}
@@ -672,7 +672,7 @@ func (g *GeneratorService) EnsureChainTest(ctx context.Context, subjectID int64,
 	if !urgent {
 		notBefore = g.deferredUntil()
 	}
-	inserted, err := g.gen.EnqueueChainJob(ctx, subjectID, testNumber, notBefore, urgent, ownerUserID...)
+	inserted, err := g.gen.EnqueueChainJob(ctx, subjectID, testNumber, notBefore, urgent, ownerUserID)
 	if err != nil {
 		return false, err
 	}

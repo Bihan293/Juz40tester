@@ -38,3 +38,17 @@ func TestThrottledTapNoWork(t *testing.T) {
 		}
 	}
 }
+
+// R-10b: callbacks from a group chat are ignored (no Telegram call, no DB:
+// the handler has no repositories and would panic on any DB access).
+func TestGroupCallbackIgnored(t *testing.T) {
+	f := &kbFake{}
+	srv := f.server(t)
+	h := New(bot.NewClient("T").WithBaseURL(srv.URL), nil, nil)
+	cb := &bot.CallbackQuery{ID: "g", From: &bot.TgUser{ID: 8}, Data: "menu",
+		Message: &bot.Message{MessageID: 1, Chat: bot.Chat{ID: -100, Type: "supergroup"}}}
+	h.HandleUpdate(context.Background(), &bot.Update{CallbackQuery: cb})
+	if f.calls != 0 {
+		t.Fatalf("%d Telegram calls for a group callback, want 0", f.calls)
+	}
+}

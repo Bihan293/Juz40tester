@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -107,7 +106,7 @@ func (h *Handler) throttled(tgUserID int64) bool {
 func (h *Handler) HandleUpdate(ctx context.Context, upd *bot.Update) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("panic in update %d: %v", upd.UpdateID, r)
+			logf("panic in update %d: %v", upd.UpdateID, r)
 		}
 	}()
 	switch {
@@ -161,7 +160,7 @@ func (h *Handler) handleMessage(ctx context.Context, m *bot.Message) {
 	}
 	user, err := h.ensureUser(ctx, m.From)
 	if err != nil {
-		log.Printf("upsert user %d: %v", m.From.ID, err)
+		logf("upsert user %d: %v", m.From.ID, err)
 		return
 	}
 
@@ -218,7 +217,7 @@ func (h *Handler) hideReplyKeyboard(ctx context.Context, chatID int64) {
 	}
 	msgID, err := h.tg.SendMessage(ctx, chatID, "✍️ Идёт тест — меню скрыто до конца. Вопросы ниже 👇", bot.RemoveKeyboard)
 	if err != nil {
-		log.Printf("hide reply keyboard: %v", err)
+		logf("hide reply keyboard: %v", err)
 		return
 	}
 	h.kbHidden.Store(chatID, true)
@@ -232,7 +231,7 @@ func (h *Handler) hideReplyKeyboard(ctx context.Context, chatID int64) {
 		}
 	}
 	if err := h.tg.DeleteMessages(ctx, chatID, ids); err != nil {
-		log.Printf("delete keyboard-removal note(s): %v", err)
+		logf("delete keyboard-removal note(s): %v", err)
 	}
 }
 
@@ -251,14 +250,14 @@ func (h *Handler) hideReplyKeyboard(ctx context.Context, chatID int64) {
 func (h *Handler) restoreReplyKeyboard(ctx context.Context, chatID int64) {
 	msgID, err := h.tg.SendMessage(ctx, chatID, "🏠 Меню снова доступно 👇", mainMenuKeyboard())
 	if err != nil {
-		log.Printf("restore reply keyboard: %v", err)
+		logf("restore reply keyboard: %v", err)
 		return
 	}
 	h.kbHidden.Delete(chatID)
 	if prev, loaded := h.kbNotes.Swap(chatID, msgID); loaded {
 		if old, ok := prev.(int64); ok && old != msgID {
 			if err := h.tg.DeleteMessage(ctx, chatID, old); err != nil {
-				log.Printf("delete previous menu note: %v", err)
+				logf("delete previous menu note: %v", err)
 			}
 		}
 	}
@@ -277,7 +276,7 @@ func (h *Handler) sendMainMenu(ctx context.Context, chatID int64, user *models.U
 		text = fmt.Sprintf("👋 Привет, %s! %s\n\nДобро пожаловать в JUZ40 Tester — бот для подготовки к ЕНТ.\nВыберите раздел кнопками ниже 👇", name, streakBadge(user))
 	}
 	if _, err := h.tg.SendMessage(ctx, chatID, text, mainMenuKeyboard()); err != nil {
-		log.Printf("send main menu: %v", err)
+		logf("send main menu: %v", err)
 		return
 	}
 	h.kbHidden.Delete(chatID) // the menu keyboard is visible again
@@ -376,14 +375,14 @@ func subjectEmoji(name string) string {
 func (h *Handler) showSubjects(ctx context.Context, chatID int64) {
 	text, kb, err := h.renderSubjects(ctx, chatID)
 	if err != nil {
-		log.Printf("list subjects: %v", err)
+		logf("list subjects: %v", err)
 		if _, err := h.tg.SendMessage(ctx, chatID, "Ошибка загрузки предметов 😔", nil); err != nil {
-			log.Printf("send subjects error: %v", err)
+			logf("send subjects error: %v", err)
 		}
 		return
 	}
 	if _, err := h.tg.SendMessage(ctx, chatID, text, kb); err != nil {
-		log.Printf("send subjects: %v", err)
+		logf("send subjects: %v", err)
 	}
 }
 
@@ -391,7 +390,7 @@ func (h *Handler) showSubjects(ctx context.Context, chatID int64) {
 func (h *Handler) editSubjects(ctx context.Context, cb *bot.CallbackQuery) {
 	text, kb, err := h.renderSubjects(ctx, cb.Message.Chat.ID)
 	if err != nil {
-		log.Printf("list subjects: %v", err)
+		logf("list subjects: %v", err)
 		h.answerCallback(ctx, cb, "Ошибка загрузки предметов")
 		return
 	}
@@ -467,7 +466,7 @@ func (h *Handler) openSubject(ctx context.Context, cb *bot.CallbackQuery, user *
 	// Restore the page where the user stopped last time.
 	page, err := h.quiz.SavedTestsPage(ctx, user.ID, subjectID)
 	if err != nil {
-		log.Printf("saved page %d/%d: %v", user.ID, subjectID, err)
+		logf("saved page %d/%d: %v", user.ID, subjectID, err)
 		page = 0
 	}
 	text, kb, err := h.renderSubject(ctx, user, subjectID, page, false)
@@ -476,7 +475,7 @@ func (h *Handler) openSubject(ctx context.Context, cb *bot.CallbackQuery, user *
 		return
 	}
 	if err != nil {
-		log.Printf("subject info %d: %v", subjectID, err)
+		logf("subject info %d: %v", subjectID, err)
 		h.answerCallback(ctx, cb, "Ошибка загрузки предмета")
 		return
 	}
@@ -531,7 +530,7 @@ func (h *Handler) flipSubjectPage(ctx context.Context, cb *bot.CallbackQuery, us
 	}
 	text, kb, err := h.renderSubject(ctx, user, subjectID, page, true)
 	if err != nil {
-		log.Printf("subject page %d/%d: %v", subjectID, page, err)
+		logf("subject page %d/%d: %v", subjectID, page, err)
 		h.answerCallback(ctx, cb, "Ошибка загрузки предмета")
 		return
 	}
@@ -586,14 +585,14 @@ const weakMenuTopics = 5
 func (h *Handler) showWeakMenu(ctx context.Context, chatID int64, user *models.User) {
 	text, kb, err := h.renderWeakMenu(ctx, user)
 	if err != nil {
-		log.Printf("weak menu: %v", err)
+		logf("weak menu: %v", err)
 		if _, err := h.tg.SendMessage(ctx, chatID, "Ошибка загрузки 😔", nil); err != nil {
-			log.Printf("send weak menu error: %v", err)
+			logf("send weak menu error: %v", err)
 		}
 		return
 	}
 	if _, err := h.tg.SendMessage(ctx, chatID, text, kb); err != nil {
-		log.Printf("send weak menu: %v", err)
+		logf("send weak menu: %v", err)
 	}
 }
 
@@ -601,7 +600,7 @@ func (h *Handler) showWeakMenu(ctx context.Context, chatID int64, user *models.U
 func (h *Handler) editWeakMenu(ctx context.Context, cb *bot.CallbackQuery, user *models.User) {
 	text, kb, err := h.renderWeakMenu(ctx, user)
 	if err != nil {
-		log.Printf("weak menu: %v", err)
+		logf("weak menu: %v", err)
 		h.answerCallback(ctx, cb, "Ошибка загрузки")
 		return
 	}
@@ -619,7 +618,7 @@ func (h *Handler) openWeakSubject(ctx context.Context, cb *bot.CallbackQuery, us
 		return
 	}
 	if err != nil {
-		log.Printf("personal test %d/%d: %v", user.ID, subjectID, err)
+		logf("personal test %d/%d: %v", user.ID, subjectID, err)
 		h.answerCallback(ctx, cb, "Ошибка загрузки теста")
 		return
 	}
@@ -643,7 +642,7 @@ func (h *Handler) openWeakSubject(ctx context.Context, cb *bot.CallbackQuery, us
 			return h.quiz.PersonalTestStatus(ctx, user.ID, subjectID)
 		}
 		if jobID, jerr := h.quiz.ActivePersonalJobID(ctx, user.ID, subjectID); jerr != nil {
-			log.Printf("personal job of %d/%d: %v", user.ID, subjectID, jerr)
+			logf("personal job of %d/%d: %v", user.ID, subjectID, jerr)
 		} else if jobID > 0 {
 			key = jobWatchKey(jobID)
 			check = func(ctx context.Context) (*models.Test, bool, error) {
@@ -676,7 +675,7 @@ func (h *Handler) openTest(ctx context.Context, cb *bot.CallbackQuery, user *mod
 		h.answerCallback(ctx, cb, "Тест не найден")
 		return
 	} else if err != nil {
-		log.Printf("get test %d: %v", testID, err)
+		logf("get test %d: %v", testID, err)
 		h.answerCallback(ctx, cb, "Ошибка загрузки теста")
 		return
 	}
@@ -691,7 +690,7 @@ func (h *Handler) openTest(ctx context.Context, cb *bot.CallbackQuery, user *mod
 	// 15🟢 + 5🟡. Tapping a 🔒 button shows what is missing.
 	allowed, reason, err := h.quiz.CanOpenTest(ctx, user.ID, test)
 	if err != nil {
-		log.Printf("can open test %d: %v", testID, err)
+		logf("can open test %d: %v", testID, err)
 		h.answerCallback(ctx, cb, "Ошибка загрузки теста")
 		return
 	}
@@ -728,7 +727,7 @@ func (h *Handler) startOrResume(ctx context.Context, cb *bot.CallbackQuery, user
 	testID := test.ID
 	resume, err := h.quiz.ResumeOrNil(ctx, user.ID, testID)
 	if err != nil {
-		log.Printf("resume lookup %d: %v", testID, err)
+		logf("resume lookup %d: %v", testID, err)
 		h.failOpenTest(ctx, cb, "Ошибка загрузки теста")
 		return
 	}
@@ -748,7 +747,7 @@ func (h *Handler) startOrResume(ctx context.Context, cb *bot.CallbackQuery, user
 		return
 	}
 	if err != nil {
-		log.Printf("start test %d: %v", testID, err)
+		logf("start test %d: %v", testID, err)
 		h.failOpenTest(ctx, cb, "Не удалось начать тест")
 		return
 	}
@@ -763,7 +762,7 @@ func (h *Handler) startOrResume(ctx context.Context, cb *bot.CallbackQuery, user
 // callback_query), so the error always goes as a plain chat message.
 func (h *Handler) failOpenTest(ctx context.Context, cb *bot.CallbackQuery, text string) {
 	if _, err := h.tg.SendMessage(ctx, cb.Message.Chat.ID, text, nil); err != nil {
-		log.Printf("send open-test failure: %v", err)
+		logf("send open-test failure: %v", err)
 	}
 }
 
@@ -772,7 +771,7 @@ func (h *Handler) failOpenTest(ctx context.Context, cb *bot.CallbackQuery, text 
 func (h *Handler) loadCurrentQuestion(ctx context.Context, cb *bot.CallbackQuery, user *models.User, attemptID int64) *services.QuestionView {
 	view, err := h.quiz.CurrentQuestion(ctx, attemptID, user)
 	if err != nil {
-		log.Printf("current question: %v", err)
+		logf("current question: %v", err)
 		if cb != nil {
 			h.answerCallback(ctx, cb, "Ошибка загрузки вопроса")
 		}
@@ -804,7 +803,7 @@ func (h *Handler) sendCurrentQuestion(ctx context.Context, chatID int64, user *m
 		return
 	}
 	if _, err := h.tg.SendMessage(ctx, chatID, renderQuestion(view), questionKeyboard(view)); err != nil {
-		log.Printf("send question: %v", err)
+		logf("send question: %v", err)
 	}
 }
 
@@ -853,7 +852,7 @@ func (h *Handler) handleAnswer(ctx context.Context, cb *bot.CallbackQuery, user 
 		return
 	}
 	if err != nil {
-		log.Printf("load attempt question: %v", err)
+		logf("load attempt question: %v", err)
 		h.answerCallback(ctx, cb, "Ошибка")
 		return
 	}
@@ -874,7 +873,7 @@ func (h *Handler) handleAnswer(ctx context.Context, cb *bot.CallbackQuery, user 
 		return
 	}
 	if err != nil {
-		log.Printf("submit answer: %v", err)
+		logf("submit answer: %v", err)
 		h.answerCallback(ctx, cb, "Не удалось сохранить ответ")
 		return
 	}
@@ -901,7 +900,7 @@ func (h *Handler) handleAnswer(ctx context.Context, cb *bot.CallbackQuery, user 
 		// then send the result as a new message below.
 		sum, err := h.quiz.BuildSummary(ctx, attemptID, user.ID)
 		if err != nil {
-			log.Printf("summary: %v", err)
+			logf("summary: %v", err)
 			h.sendText(ctx, chatID, "Ошибка загрузки результата 😔")
 			return
 		}
@@ -957,7 +956,7 @@ func renderAnswered(v *services.QuestionView, res *repositories.AnswerResult) st
 func (h *Handler) showResult(ctx context.Context, cb *bot.CallbackQuery, user *models.User, attemptID int64, chatID ...int64) {
 	sum, err := h.quiz.BuildSummary(ctx, attemptID, user.ID)
 	if err != nil {
-		log.Printf("summary: %v", err)
+		logf("summary: %v", err)
 		if cb != nil {
 			h.answerCallback(ctx, cb, "Ошибка загрузки результата")
 		}
@@ -1022,7 +1021,7 @@ func (h *Handler) renderSummary(ctx context.Context, sum *services.AttemptSummar
 	kb := &bot.InlineKeyboardMarkup{InlineKeyboard: rows}
 	// Send as a new message so the answered question stays visible above.
 	if _, err := h.tg.SendMessage(ctx, target, b.String(), kb); err != nil {
-		log.Printf("send result: %v", err)
+		logf("send result: %v", err)
 	}
 	// The run is over — the bottom menu (hidden at the start) comes back.
 	h.restoreReplyKeyboard(ctx, target)
@@ -1032,7 +1031,7 @@ func (h *Handler) renderSummary(ctx context.Context, sum *services.AttemptSummar
 // test is deleted, so the next weak-topics visit generates a fresh one.
 func (h *Handler) finishPersonalTest(ctx context.Context, cb *bot.CallbackQuery, user *models.User, testID int64) {
 	if err := h.quiz.FinishPersonalTest(ctx, user.ID, testID); err != nil {
-		log.Printf("finish personal test %d/%d: %v", user.ID, testID, err)
+		logf("finish personal test %d/%d: %v", user.ID, testID, err)
 		h.answerCallback(ctx, cb, "Не удалось закончить тест")
 		return
 	}
@@ -1051,7 +1050,7 @@ func (h *Handler) retryTest(ctx context.Context, cb *bot.CallbackQuery, user *mo
 	// is allowed) — errors are reported as chat messages.
 	sum, err := h.quiz.BuildSummary(ctx, attemptID, user.ID)
 	if err != nil {
-		log.Printf("retry summary %d: %v", attemptID, err)
+		logf("retry summary %d: %v", attemptID, err)
 		h.sendText(ctx, cb.Message.Chat.ID, "Ошибка 😔 Попробуй ещё раз.")
 		return
 	}
@@ -1077,7 +1076,7 @@ func (h *Handler) restartRun(ctx context.Context, cb *bot.CallbackQuery, user *m
 	// option orders.
 	newAttempt, err := h.quiz.RestartTest(ctx, user.ID, testID)
 	if err != nil {
-		log.Printf("retry test: %v", err)
+		logf("retry test: %v", err)
 		h.sendText(ctx, cb.Message.Chat.ID, "Не удалось начать тест 😔")
 		return
 	}
@@ -1091,7 +1090,7 @@ func (h *Handler) restartRun(ctx context.Context, cb *bot.CallbackQuery, user *m
 // exiting right away — an accidental tap on 🚪 must not lose the flow.
 func (h *Handler) confirmExit(ctx context.Context, cb *bot.CallbackQuery, user *models.User, attemptID int64) {
 	if err := h.quiz.Exit(ctx, attemptID, user.ID); err != nil {
-		log.Printf("exit confirm attempt %d: %v", attemptID, err)
+		logf("exit confirm attempt %d: %v", attemptID, err)
 		h.sendText(ctx, cb.Message.Chat.ID, "Попытка не найдена")
 		return
 	}
@@ -1108,7 +1107,7 @@ func (h *Handler) confirmExit(ctx context.Context, cb *bot.CallbackQuery, user *
 // exitTest performs the actual exit after the user confirmed it.
 func (h *Handler) exitTest(ctx context.Context, cb *bot.CallbackQuery, user *models.User, attemptID int64) {
 	if err := h.quiz.Exit(ctx, attemptID, user.ID); err != nil {
-		log.Printf("exit attempt %d: %v", attemptID, err)
+		logf("exit attempt %d: %v", attemptID, err)
 		h.answerCallback(ctx, cb, "Не удалось выйти")
 		return
 	}
@@ -1152,7 +1151,7 @@ func (h *Handler) renderProgress(ctx context.Context, user *models.User) (string
 	}
 	all, err := h.quiz.AllSubjectsProgress(ctx, user.ID, ids)
 	if err != nil {
-		log.Printf("progress summary: %v", err)
+		logf("progress summary: %v", err)
 		all = nil // keep the subject picker usable, just without summaries
 	}
 	for _, s := range subjects {
@@ -1231,7 +1230,7 @@ func (h *Handler) showSubjectProgress(ctx context.Context, cb *bot.CallbackQuery
 		return
 	}
 	if err != nil {
-		log.Printf("subject progress %d: %v", subjectID, err)
+		logf("subject progress %d: %v", subjectID, err)
 		h.answerCallback(ctx, cb, "Ошибка загрузки прогресса")
 		return
 	}
@@ -1242,14 +1241,14 @@ func (h *Handler) showSubjectProgress(ctx context.Context, cb *bot.CallbackQuery
 func (h *Handler) showProgress(ctx context.Context, chatID int64, user *models.User) {
 	text, kb, err := h.renderProgress(ctx, user)
 	if err != nil {
-		log.Printf("user progress: %v", err)
+		logf("user progress: %v", err)
 		if _, err := h.tg.SendMessage(ctx, chatID, "Ошибка загрузки прогресса 😔", nil); err != nil {
-			log.Printf("send progress error: %v", err)
+			logf("send progress error: %v", err)
 		}
 		return
 	}
 	if _, err := h.tg.SendMessage(ctx, chatID, text, kb); err != nil {
-		log.Printf("send progress: %v", err)
+		logf("send progress: %v", err)
 	}
 }
 
@@ -1257,7 +1256,7 @@ func (h *Handler) showProgress(ctx context.Context, chatID int64, user *models.U
 func (h *Handler) editProgress(ctx context.Context, cb *bot.CallbackQuery, user *models.User) {
 	text, kb, err := h.renderProgress(ctx, user)
 	if err != nil {
-		log.Printf("user progress: %v", err)
+		logf("user progress: %v", err)
 		h.answerCallback(ctx, cb, "Ошибка загрузки прогресса")
 		return
 	}
@@ -1286,7 +1285,7 @@ const settingsText = "⚙️ Настройки\n\n🌐 Язык тестов\n\
 // showSettings is used from the Reply Keyboard (new message).
 func (h *Handler) showSettings(ctx context.Context, chatID int64, user *models.User) {
 	if _, err := h.tg.SendMessage(ctx, chatID, settingsText, settingsKeyboard(user.TestLang)); err != nil {
-		log.Printf("send settings: %v", err)
+		logf("send settings: %v", err)
 	}
 }
 
@@ -1299,7 +1298,7 @@ func (h *Handler) editSettings(ctx context.Context, cb *bot.CallbackQuery, user 
 // re-renders the settings screen with the new checkmark.
 func (h *Handler) setTestLang(ctx context.Context, cb *bot.CallbackQuery, user *models.User, lang string) {
 	if err := h.users.SetTestLang(ctx, user.ID, lang); err != nil {
-		log.Printf("set test lang %d -> %q: %v", user.ID, lang, err)
+		logf("set test lang %d -> %q: %v", user.ID, lang, err)
 		h.answerCallback(ctx, cb, "Не удалось сохранить настройку")
 		return
 	}
@@ -1334,21 +1333,21 @@ func (h *Handler) renderLeaderboardMenu(ctx context.Context) (string, *bot.Inlin
 func (h *Handler) showLeaderboardMenu(ctx context.Context, chatID int64) {
 	text, kb, err := h.renderLeaderboardMenu(ctx)
 	if err != nil {
-		log.Printf("leaderboard menu: %v", err)
+		logf("leaderboard menu: %v", err)
 		if _, err := h.tg.SendMessage(ctx, chatID, "Ошибка загрузки 😔", nil); err != nil {
-			log.Printf("send leaderboard menu error: %v", err)
+			logf("send leaderboard menu error: %v", err)
 		}
 		return
 	}
 	if _, err := h.tg.SendMessage(ctx, chatID, text, kb); err != nil {
-		log.Printf("send leaderboard menu: %v", err)
+		logf("send leaderboard menu: %v", err)
 	}
 }
 
 func (h *Handler) editLeaderboardMenu(ctx context.Context, cb *bot.CallbackQuery) {
 	text, kb, err := h.renderLeaderboardMenu(ctx)
 	if err != nil {
-		log.Printf("leaderboard menu: %v", err)
+		logf("leaderboard menu: %v", err)
 		h.answerCallback(ctx, cb, "Ошибка загрузки")
 		return
 	}
@@ -1380,7 +1379,7 @@ func flame(e *models.LeaderboardEntry) string {
 func (h *Handler) showStreakLeaderboard(ctx context.Context, cb *bot.CallbackQuery) {
 	entries, err := h.quiz.StreakLeaderboard(ctx, services.LeaderboardSize)
 	if err != nil {
-		log.Printf("streak leaderboard: %v", err)
+		logf("streak leaderboard: %v", err)
 		h.answerCallback(ctx, cb, "Ошибка загрузки")
 		return
 	}
@@ -1415,19 +1414,19 @@ func (h *Handler) showSubjectLeaderboard(ctx context.Context, cb *bot.CallbackQu
 		return
 	}
 	if err != nil {
-		log.Printf("leaderboard subject %d: %v", subjectID, err)
+		logf("leaderboard subject %d: %v", subjectID, err)
 		h.answerCallback(ctx, cb, "Ошибка загрузки")
 		return
 	}
 	byLevels, err := h.quiz.UnlockedTestsLeaderboard(ctx, subjectID, services.LeaderboardSize)
 	if err != nil {
-		log.Printf("levels leaderboard %d: %v", subjectID, err)
+		logf("levels leaderboard %d: %v", subjectID, err)
 		h.answerCallback(ctx, cb, "Ошибка загрузки")
 		return
 	}
 	byGreen, err := h.quiz.GreenLeaderboard(ctx, subjectID, services.LeaderboardSize)
 	if err != nil {
-		log.Printf("green leaderboard %d: %v", subjectID, err)
+		logf("green leaderboard %d: %v", subjectID, err)
 		h.answerCallback(ctx, cb, "Ошибка загрузки")
 		return
 	}
@@ -1465,15 +1464,20 @@ func (h *Handler) handleCallback(ctx context.Context, cb *bot.CallbackQuery) {
 	// acknowledged (stops the spinner) — no DB query, no other Telegram
 	// call. Duplicate answer taps are thus dropped before SubmitAnswer
 	// (which stays idempotent on its own anyway).
+	// Private chats only (like handleMessage): callbacks from a group are
+	// ignored — no user registration, no DB work.
+	if cb.Message != nil && cb.Message.Chat.Type != "" && cb.Message.Chat.Type != "private" {
+		return
+	}
 	if h.throttled(cb.From.ID) {
 		if err := h.tg.AnswerCallbackQuery(ctx, cb.ID, ""); err != nil {
-			log.Printf("answer throttled callback: %v", err)
+			logf("answer throttled callback: %v", err)
 		}
 		return
 	}
 	user, err := h.ensureUser(ctx, cb.From)
 	if err != nil {
-		log.Printf("upsert user %d: %v", cb.From.ID, err)
+		logf("upsert user %d: %v", cb.From.ID, err)
 		return
 	}
 	data := cb.Data
@@ -1619,7 +1623,7 @@ func (h *Handler) editMessage(ctx context.Context, cb *bot.CallbackQuery, text s
 		// exactly this — sending a fresh copy would duplicate messages in the
 		// chat (it happened on repeated taps). Everything else (message too
 		// old to edit, deleted message) falls back to a new message.
-		if strings.Contains(err.Error(), "message is not modified") {
+		if bot.IsNotModified(err) {
 			return
 		}
 		// Rate limited: the edit is queued and will be applied later — a
@@ -1628,7 +1632,7 @@ func (h *Handler) editMessage(ctx context.Context, cb *bot.CallbackQuery, text s
 			return
 		}
 		if _, err2 := h.tg.SendMessage(ctx, cb.Message.Chat.ID, text, kb); err2 != nil {
-			log.Printf("edit/send message: %v / %v", err, err2)
+			logf("edit/send message: %v / %v", err, err2)
 		}
 	}
 }
@@ -1641,7 +1645,7 @@ func (h *Handler) answerAlert(ctx context.Context, cb *bot.CallbackQuery, text s
 		return
 	}
 	if err := h.tg.AnswerCallbackAlert(ctx, cb.ID, text); err != nil {
-		log.Printf("answer callback alert: %v", err)
+		logf("answer callback alert: %v", err)
 	}
 }
 
@@ -1649,7 +1653,7 @@ func (h *Handler) answerAlert(ctx context.Context, cb *bot.CallbackQuery, text s
 // has already been answered (Telegram accepts exactly one answer).
 func (h *Handler) sendText(ctx context.Context, chatID int64, text string) {
 	if _, err := h.tg.SendMessage(ctx, chatID, text, nil); err != nil {
-		log.Printf("send text: %v", err)
+		logf("send text: %v", err)
 	}
 }
 
@@ -1662,7 +1666,7 @@ func (h *Handler) answerCallback(ctx context.Context, cb *bot.CallbackQuery, tex
 		return
 	}
 	if err := h.tg.AnswerCallbackQuery(ctx, cb.ID, text); err != nil {
-		log.Printf("answer callback: %v", err)
+		logf("answer callback: %v", err)
 	}
 }
 
@@ -1703,7 +1707,7 @@ func (h *Handler) deferUntilTranslated(ctx context.Context, cb *bot.CallbackQuer
 	_, wait, err := h.quiz.PrepareTranslation(ctx, user, test)
 	if err != nil {
 		if !errors.Is(err, services.ErrTranslationUnavailable) {
-			log.Printf("prepare translation of test %d: %v", test.ID, err)
+			logf("prepare translation of test %d: %v", test.ID, err)
 		}
 		h.sendText(ctx, cb.Message.Chat.ID, translationFailedNote)
 		return false
@@ -1719,7 +1723,7 @@ func (h *Handler) deferUntilTranslated(ctx context.Context, cb *bot.CallbackQuer
 	chatID := cb.Message.Chat.ID
 	noteID, serr := h.tg.SendMessage(ctx, chatID, translationNote, nil)
 	if serr != nil {
-		log.Printf("send translation note: %v", serr)
+		logf("send translation note: %v", serr)
 	}
 	// The continuation runs after this update finished: mark the callback
 	// as answered for its duration, so any error notice goes to the chat
@@ -1741,7 +1745,7 @@ func (h *Handler) awaitTranslation(key string, chatID, noteID, testID int64, wai
 	defer h.watchers.Delete(key)
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("translation waiter %s panicked: %v", key, r)
+			logf("translation waiter %s panicked: %v", key, r)
 		}
 	}()
 	out := <-wait // always delivered (at the latest after the wait timeout)
@@ -1750,11 +1754,11 @@ func (h *Handler) awaitTranslation(key string, chatID, noteID, testID int64, wai
 	if out.Ready {
 		if noteID != 0 {
 			if err := h.tg.DeleteMessage(ctx, chatID, noteID); err != nil {
-				log.Printf("delete translation note: %v", err)
+				logf("delete translation note: %v", err)
 			}
 		}
 	} else {
-		log.Printf("translation of test %d not ready (timeout=%v err=%q) — opening the Russian master", testID, out.TimedOut, out.Err)
+		logf("translation of test %d not ready (timeout=%v err=%q) — opening the Russian master", testID, out.TimedOut, out.Err)
 		if noteID != 0 {
 			h.editNote(ctx, chatID, noteID, translationFailedNote, nil)
 		} else {
@@ -1780,7 +1784,7 @@ func (h *Handler) startGenerationWatch(ctx context.Context, cb *bot.CallbackQuer
 	h.answerCallback(ctx, cb, "")
 	msgID, err := h.tg.SendMessage(ctx, chatID, note, nil)
 	if err != nil {
-		log.Printf("send generation note: %v", err)
+		logf("send generation note: %v", err)
 		return
 	}
 	h.subscribeGeneration(key, chatID, msgID, check, retryData)
@@ -1790,11 +1794,11 @@ func (h *Handler) startGenerationWatch(ctx context.Context, cb *bot.CallbackQuer
 // the message) the text is sent as a new message instead.
 func (h *Handler) editNote(ctx context.Context, chatID, msgID int64, text string, kb *bot.InlineKeyboardMarkup) {
 	if err := h.tg.EditMessageText(ctx, chatID, msgID, text, kb); err != nil {
-		if strings.Contains(err.Error(), "message is not modified") || bot.IsDeferred(err) {
+		if bot.IsNotModified(err) || bot.IsDeferred(err) {
 			return
 		}
 		if _, err2 := h.tg.SendMessage(ctx, chatID, text, kb); err2 != nil {
-			log.Printf("edit/send note: %v / %v", err, err2)
+			logf("edit/send note: %v / %v", err, err2)
 		}
 	}
 }

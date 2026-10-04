@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"fmt"
-	"log"
 	"math/rand"
 	"strconv"
 	"sync"
@@ -138,7 +137,7 @@ func (h *Handler) pollGeneration(key string, gw *genWatch, check genCheck) {
 	defer w.take(key) // always unregister (result, timeout, shutdown, panic)
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("generation watcher %s panicked: %v", key, r)
+			logf("generation watcher %s panicked: %v", key, r)
 		}
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), w.timeout+30*time.Second)
@@ -171,7 +170,7 @@ func (h *Handler) pollGeneration(key string, gw *genWatch, check genCheck) {
 		test, pending, err := check(ctx)
 		switch {
 		case err != nil:
-			log.Printf("generation watcher %s: %v", key, err)
+			logf("generation watcher %s: %v", key, err)
 		case test != nil:
 			h.finishGeneration(ctx, key, readyText(test), &bot.InlineKeyboardMarkup{InlineKeyboard: [][]bot.InlineKeyboardButton{
 				bot.Row(bot.Btn("▶️ Начать тест", cbOpenTest+strconv.FormatInt(test.ID, 10))),
@@ -261,6 +260,6 @@ func (h *Handler) Close(d time.Duration) {
 	select {
 	case <-done:
 	case <-time.After(d):
-		log.Printf("shutdown: generation watchers did not stop within %s", d)
+		logf("shutdown: generation watchers did not stop within %s", d)
 	}
 }

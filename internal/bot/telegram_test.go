@@ -97,8 +97,17 @@ func TestCallNon429ErrorNotRetried(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := NewClient("T").WithBaseURL(srv.URL)
-	if _, err := c.SendMessage(context.Background(), 1, "x", nil); err == nil || calls != 1 {
+	_, err := c.SendMessage(context.Background(), 1, "x", nil)
+	if err == nil || calls != 1 {
 		t.Fatalf("err=%v calls=%d", err, calls)
+	}
+	var ae *APIError
+	if !errors.As(err, &ae) || ae.Code != 400 || IsNotModified(err) || IsForbidden(err) {
+		t.Fatalf("typed API error expected, got %#v", err)
+	}
+	if !IsNotModified(&APIError{Code: 400, Description: "Bad Request: message is not modified: x"}) ||
+		!IsForbidden(&APIError{Code: 403, Description: "Forbidden: bot was blocked by the user"}) {
+		t.Fatal("IsNotModified / IsForbidden")
 	}
 }
 

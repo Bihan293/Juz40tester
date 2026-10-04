@@ -348,8 +348,27 @@ func TestDeepSeekSpendingCap(t *testing.T) {
 	if cost > 0.01+1e-9 || reserved > 1e-9 {
 		t.Fatalf("ledger cost $%.5f reserved $%.5f — cap $0.01 exceeded or reservations leaked", cost, reserved)
 	}
-	if !b.Exhausted(ctx) && cost+0.0013 <= 0.01 {
-		t.Fatalf("cap state inconsistent: cost $%.5f", cost)
+	// Sequential follow-ups: each is either refused or keeps the ledger
+	// under the cap, and the cap stops them within a few calls. (A fixed
+	// "worst case ≈ $0.0013" constant was flaky: the client's real worst
+	// case also counts the request body, so a remaining $0.0015 may
+	// already be refused correctly.)
+	stopped := false
+	for i := 0; i < 10 && !stopped; i++ {
+		before := atomic.LoadInt32(&hits)
+		_, err := ds.GenerateJSON(ctx, []deepseek.Message{{Role: "user", Content: "x"}}, 1000, deepseek.ThinkingEffortLow)
+		switch {
+		case errors.Is(err, deepseek.ErrBudgetExceeded):
+			if atomic.LoadInt32(&hits) != before {
+				t.Fatal("a capped call reached the API")
+			}
+			stopped = true
+		case err != nil:
+			t.Fatalf("unexpected: %v", err)
+		}
+	}
+	if cost, _, err = repo.Spent(ctx, SpendProviderDeepSeek, b.day()); err != nil || cost > 0.01+1e-9 || !stopped {
+		t.Fatalf("cap not enforced: cost $%.5f stopped %v err %v", cost, stopped, err)
 	}
 	// Next day: budget is fresh again.
 	b.now = func() time.Time { return day.Add(25 * time.Hour) }
