@@ -220,6 +220,9 @@ func (r *TranslationRepository) EnqueueTranslationJob(ctx context.Context, testI
 	if err != nil {
 		return false, err
 	}
+	if tag.RowsAffected() > 0 {
+		notifyQueue(ctx, r.pool, ChannelTrJobs)
+	}
 	return tag.RowsAffected() > 0, nil
 }
 

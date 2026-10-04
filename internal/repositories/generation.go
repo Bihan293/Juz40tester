@@ -369,6 +369,9 @@ func (r *GenerationRepository) EnqueueChainJob(ctx context.Context, subjectID in
 		WHERE generation_jobs.status = 'pending'
 		  AND NOT generation_jobs.urgent
 		  AND EXCLUDED.urgent`, subjectID, testNumber, notBefore, urgent, owner)
+	if err == nil && tag.RowsAffected() > 0 {
+		notifyQueue(ctx, r.pool, ChannelGenJobs)
+	}
 	return tag.RowsAffected() > 0, err
 }
 
@@ -381,6 +384,9 @@ func (r *GenerationRepository) EnqueueChainJobNow(ctx context.Context, subjectID
 		INSERT INTO generation_jobs (kind, subject_id, test_number, not_before, urgent)
 		VALUES ('chain', $1, $2, now(), TRUE)
 		ON CONFLICT DO NOTHING`, subjectID, testNumber)
+	if err == nil && tag.RowsAffected() > 0 {
+		notifyQueue(ctx, r.pool, ChannelGenJobs)
+	}
 	return tag.RowsAffected() > 0, err
 }
 
@@ -393,10 +399,13 @@ func (r *GenerationRepository) EnqueuePersonalJob(ctx context.Context, subjectID
 	if fingerprint != "" {
 		fp = fingerprint
 	}
-	_, err := r.pool.Exec(ctx, `
+	tag, err := r.pool.Exec(ctx, `
 		INSERT INTO generation_jobs (kind, subject_id, owner_user_id, topics_fingerprint, not_before, urgent)
 		VALUES ('personal', $1, $2, $3, now(), TRUE)
 		ON CONFLICT DO NOTHING`, subjectID, userID, fp)
+	if err == nil && tag.RowsAffected() > 0 {
+		notifyQueue(ctx, r.pool, ChannelGenJobs)
+	}
 	return err
 }
 
