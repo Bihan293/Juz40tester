@@ -102,8 +102,9 @@ type GeneratorService struct {
 	now        func() time.Time   // injectable for tests
 
 	// wake nudges an idle worker the moment a job is enqueued in this
-	// instance (buffered, size 1 — signals coalesce). The 20s ticker stays
-	// only as a fallback for jobs enqueued by another instance / retries.
+	// instance or a gen_jobs NOTIFY arrives (buffered, size 1 — signals
+	// coalesce). The 3-minute ticker is only a fallback (retries, lost
+	// notifications).
 	wake chan struct{}
 	// dsSem bounds paid DeepSeek generation calls in flight across all
 	// workers (cfg.GenDeepSeekConcurrency).
@@ -150,6 +151,9 @@ func NewGeneratorService(ds *deepseek.Client, cfg *config.Config, gen *repositor
 		dsSem: make(chan struct{}, dsConc),
 	}
 }
+
+// Wake wakes an idle worker; called by the LISTEN gen_jobs listener (R-5b).
+func (g *GeneratorService) Wake() { g.notifyWorkers() }
 
 // notifyWorkers wakes one idle worker without blocking (no-op when a wake
 // is already pending or the service was built without a channel in tests).
@@ -842,11 +846,13 @@ func (g *GeneratorService) superviseLoop(ctx context.Context, name string, loop 
 	}
 }
 
-// workerPollEvery is the FALLBACK poll of an idle worker: jobs enqueued in
-// this instance wake a worker immediately (notifyWorkers); the poll only
-// picks up jobs enqueued by another instance and retries whose backoff
-// (not_before) has expired.
-const workerPollEvery = 20 * time.Second
+// workerPollEvery is the FALLBACK poll of an idle worker (R-5b): workers
+// are woken immediately by notifyWorkers — on a local enqueue and on a
+// gen_jobs NOTIFY received by the database listener (Wake) — so the poll
+// only picks up retries whose backoff (not_before) has expired and covers a
+// lost notification. An idle queue is therefore queried at most once per
+// workerPollEvery per worker.
+const workerPollEvery = 3 * time.Minute
 
 // runWorkerLoop is one worker's loop. It reports (via the return value)
 // whether it ended because of a panic (true — the caller restarts it) or
@@ -864,8 +870,15 @@ func (g *GeneratorService) runWorkerLoop(ctx context.Context, id int) (panicked 
 			panicked = true
 		}
 	}()
-	ticker := time.NewTicker(workerPollEvery)
-	defer ticker.Stop()
+	// Only worker 1 runs the fallback timer (one idle poll per
+	// workerPollEvery for the whole pool); a successful claim passes the
+	// wake signal on to the other workers.
+	var tick <-chan time.Time
+	if id == 1 {
+		ticker := time.NewTicker(workerPollEvery)
+		defer ticker.Stop()
+		tick = ticker.C
+	}
 	for {
 		g.drainQueue(ctx)
 		select {
@@ -873,7 +886,7 @@ func (g *GeneratorService) runWorkerLoop(ctx context.Context, id int) (panicked 
 			log.Printf("generator worker %d stopped", id)
 			return false
 		case <-g.wake:
-		case <-ticker.C:
+		case <-tick:
 		}
 	}
 }
@@ -882,7 +895,7 @@ func (g *GeneratorService) runWorkerLoop(ctx context.Context, id int) (panicked 
 // another until the queue has nothing due (or ctx is cancelled). After a
 // successful claim it passes the wake signal on, so another idle worker
 // also looks at the queue — a burst of N jobs is spread over the pool
-// within milliseconds instead of one job per 20s tick.
+// within milliseconds instead of one job per fallback tick.
 func (g *GeneratorService) drainQueue(ctx context.Context) {
 	g.reapStuckJobs(ctx)
 	for ctx.Err() == nil {
