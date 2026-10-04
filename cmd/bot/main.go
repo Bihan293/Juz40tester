@@ -141,7 +141,7 @@ func main() {
 	workerCtx, stopWorker := context.WithCancel(context.Background())
 	defer stopWorker()
 	var bgWG sync.WaitGroup
-	bgWG.Add(4)
+	bgWG.Add(5)
 	// R-5b: one dedicated DIRECT connection (same URL as the migrations;
 	// LISTEN does not work behind a transaction-mode pooler) listens on the
 	// queue channels and wakes the workers the moment a job is enqueued by
@@ -167,6 +167,19 @@ func main() {
 	// are closed as abandoned (they would otherwise keep their questions
 	// "busy" for the quality sweep forever).
 	go func() { defer bgWG.Done(); reapStaleAttempts(workerCtx, attemptRepo) }()
+	// R-8a: daily batched cleanup of old attempt rows and finished jobs.
+	cleanupRepo := repositories.NewCleanupRepository(pool)
+	go func() {
+		defer bgWG.Done()
+		runCleanup(workerCtx, cleanupRepo, cleanupSettings{
+			attemptAge: time.Duration(cfg.CleanupAttemptDays) * 24 * time.Hour,
+			jobAge:     time.Duration(cfg.CleanupJobDays) * 24 * time.Hour,
+			emptyAge:   emptyAbandonedAge,
+			firstDelay: 10 * time.Minute,
+			interval:   24 * time.Hour,
+			pause:      time.Second,
+		})
+	}()
 
 	// Bootstrap the AI chain: queue the generation of Тест 1 right away for
 	// EVERY subject whose chain is still empty — otherwise a fresh database

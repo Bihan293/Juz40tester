@@ -93,6 +93,13 @@ type Config struct {
 	ReaperInterval time.Duration
 	HealthCacheTTL time.Duration
 
+	// R-8a daily cleanup. CleanupAttemptDays (CLEANUP_ATTEMPT_DAYS, default
+	// 45): per-question rows of finished attempts older than this are
+	// deleted. CleanupJobDays (CLEANUP_JOB_DAYS, default 14): done/failed
+	// generation jobs older than this are deleted.
+	CleanupAttemptDays int
+	CleanupJobDays     int
+
 	OffPeakStartHour int  // custom window start (inclusive); -1 = official schedule
 	OffPeakEndHour   int  // custom window end (exclusive)
 	OffPeakCustom    bool // true when a custom window is configured
@@ -124,6 +131,8 @@ func Load() (*Config, error) {
 		DeepSeekDailyCapUSD:    DefaultDeepSeekDailyCapUSD,
 		ReaperInterval:         DefaultReaperInterval,
 		HealthCacheTTL:         DefaultHealthCacheTTL,
+		CleanupAttemptDays:     DefaultCleanupAttemptDays,
+		CleanupJobDays:         DefaultCleanupJobDays,
 	}
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV"))) {
 	case "development", "dev", "local", "test":
@@ -148,6 +157,12 @@ func Load() (*Config, error) {
 	}
 	if n, ok := envIntOpt("HEALTH_CACHE_SEC"); ok && n >= 0 {
 		cfg.HealthCacheTTL = time.Duration(n) * time.Second
+	}
+	if n, ok := envIntOpt("CLEANUP_ATTEMPT_DAYS"); ok && n > 0 {
+		cfg.CleanupAttemptDays = n
+	}
+	if n, ok := envIntOpt("CLEANUP_JOB_DAYS"); ok && n > 0 {
+		cfg.CleanupJobDays = n
 	}
 	if n, ok := envIntOpt("PERSONAL_GEN_PER_USER_DAY"); ok && n >= 0 {
 		cfg.PersonalGenPerUserDay = n
@@ -226,6 +241,9 @@ const (
 	DefaultReaperInterval = 5 * time.Minute
 	// DefaultHealthCacheTTL: /health pings the database at most every 45s.
 	DefaultHealthCacheTTL = 45 * time.Second
+	// R-8a cleanup retention defaults (days).
+	DefaultCleanupAttemptDays = 45
+	DefaultCleanupJobDays     = 14
 )
 
 // envIntOpt reads an integer env var; ok is false when it is unset or

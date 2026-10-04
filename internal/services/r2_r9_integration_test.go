@@ -8,10 +8,10 @@ package services
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -70,8 +70,10 @@ func TestCreateAttemptBatchInsert(t *testing.T) {
 		if err := rows.Scan(&qid, &pos, &raw, &answered); err != nil {
 			t.Fatal(err)
 		}
-		var ord []string
-		_ = json.Unmarshal(raw, &ord)
+		ord, _ := repositories.DecodeOptionOrder(raw)
+		if string(raw) != `"`+strings.Join(orders[n], "")+`"` {
+			t.Fatalf("row %d: option_order stored as %s, want compact string", n, raw)
+		}
 		if pos != n+1 || qid != ids[n] || answered || len(ord) != 4 || ord[0] != orders[n][0] || ord[3] != orders[n][3] {
 			t.Fatalf("row %d: qid=%d pos=%d ord=%v, want qid=%d pos=%d ord=%v", n, qid, pos, ord, ids[n], n+1, orders[n])
 		}
