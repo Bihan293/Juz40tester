@@ -1061,6 +1061,32 @@ func (g *GeneratorService) executeJob(ctx context.Context, job *models.Generatio
 		log.Printf("generator: complete job %d: %v", job.ID, err)
 	}
 	log.Printf("generator: job %d done -> test %d", job.ID, testID)
+	g.queueChainTranslation(ctx, job, testID)
+}
+
+// queueChainTranslation queues the Kazakh translation of a freshly generated
+// CHAIN test right away (R-4): chain tests are shared by every student of
+// the subject, so Kazakh-speaking students will open it anyway — with the
+// translation done in advance they never see «⏳ Перевод готовится…».
+// Language subjects are never translated. Failures are only logged: the
+// translation is then queued on the first Kazakh open.
+func (g *GeneratorService) queueChainTranslation(ctx context.Context, job *models.GenerationJob, testID int64) {
+	if job.Kind != models.TestKindChain || testID <= 0 || g.translator == nil || !g.translator.Enabled() {
+		return
+	}
+	subject, err := g.subjects.GetByID(ctx, job.SubjectID)
+	if err != nil {
+		log.Printf("generator: queue kk translation of test %d: subject %d: %v", testID, job.SubjectID, err)
+		return
+	}
+	if models.IsLanguageSubject(subject.Name) {
+		return
+	}
+	if err := g.translator.RequestTranslation(ctx, testID); err != nil {
+		log.Printf("generator: queue kk translation of test %d: %v", testID, err)
+		return
+	}
+	log.Printf("generator: queued kk translation of chain test %d", testID)
 }
 
 // claimDue claims the next due job. Errors are logged and returned (the

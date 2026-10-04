@@ -25,7 +25,6 @@ import (
 	"fmt"
 	"log"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/Bihan293/Juz40tester/internal/deepseek"
@@ -80,30 +79,31 @@ type translationResponse struct {
 }
 
 // TranslatorService translates test content into Kazakh and caches the
-// result. It is the ONLY component that calls the DeepSeek API for
+// result. It is the ONLY component that calls an AI provider for
 // translation.
+//
+// R-4: translation never runs inside a Telegram update handler anymore.
+// A handler only ENQUEUES a job (translation_jobs, UNIQUE (test_id, lang) —
+// the cross-instance guard that replaced the in-memory per-test mutex) and
+// subscribes to the shared per-test waiter (hub); the background worker
+// (RunWorker) claims the job with FOR UPDATE SKIP LOCKED, translates it and
+// publishes the outcome to every subscriber at once.
 type TranslatorService struct {
 	ds   *deepseek.Client // nil when DEEPSEEK_API_KEY is not set
 	gq   *groq.Client     // nil when GROQ_API_KEY is not set
 	repo *repositories.TranslationRepository
 
-	// inFlight serialises translation of the same test so two concurrent
-	// users never pay for the same translation twice. Entries are
-	// reference-counted and removed when the last holder/waiter releases,
-	// so the map holds only tests being translated right now.
-	mu       sync.Mutex
-	inFlight map[int64]*testLockEntry
-}
-
-// testLockEntry is a per-test mutex plus the number of goroutines that
-// currently hold or wait for it (guarded by TranslatorService.mu).
-type testLockEntry struct {
-	mu   sync.Mutex
-	refs int
+	// wake nudges an idle translation worker the moment a job is enqueued
+	// in this instance (buffered, signals coalesce).
+	wake chan struct{}
+	// hub fans the outcome of a translation out to every waiting user.
+	hub *translationHub
 }
 
 func NewTranslatorService(ds *deepseek.Client, repo *repositories.TranslationRepository) *TranslatorService {
-	return &TranslatorService{ds: ds, repo: repo, inFlight: map[int64]*testLockEntry{}}
+	t := &TranslatorService{ds: ds, repo: repo, wake: make(chan struct{}, 1)}
+	t.hub = newTranslationHub(t.pollJobOutcome, translationWaitPoll)
+	return t
 }
 
 // WithGroq wires the free Groq provider (Qwen primary, GPT-OSS secondary).
@@ -119,42 +119,15 @@ func (t *TranslatorService) Enabled() bool {
 	return t != nil && t.repo != nil && (t.ds != nil || t.gq != nil)
 }
 
-// lockTest acquires the per-test translation mutex and returns its release
-// function. Release must be deferred: it unlocks and drops the map entry
-// once nobody else holds or waits for it — also on error and on panic.
-func (t *TranslatorService) lockTest(testID int64) (release func()) {
-	t.mu.Lock()
-	e, ok := t.inFlight[testID]
-	if !ok {
-		e = &testLockEntry{}
-		t.inFlight[testID] = e
-	}
-	e.refs++
-	t.mu.Unlock()
-
-	e.mu.Lock()
-	return func() {
-		e.mu.Unlock()
-		t.mu.Lock()
-		e.refs--
-		if e.refs == 0 {
-			delete(t.inFlight, testID)
-		}
-		t.mu.Unlock()
-	}
-}
-
-// inFlightLen reports the number of tracked per-test locks (for tests).
-func (t *TranslatorService) inFlightLen() int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return len(t.inFlight)
-}
-
 // TranslateTest returns the Kazakh version of the given Russian questions of
 // ONE test: questionID -> translated question. The correct answers are
 // copied from the master questions (never translated). Cached rows are used
-// as is; only missing questions go through the model — in a single call.
+// as is; only missing questions go through the model.
+//
+// It is called ONLY by the background translation worker, for a job it has
+// claimed — the job row (UNIQUE per test and language, claimed with FOR
+// UPDATE SKIP LOCKED) guarantees that no other worker on any instance
+// translates the same test at the same time.
 //
 // The result may be incomplete when the model call fails: the caller must
 // fall back to the Russian master text for missing questions.
@@ -162,12 +135,6 @@ func (t *TranslatorService) TranslateTest(ctx context.Context, testID int64, que
 	if !t.Enabled() || len(questions) == 0 {
 		return nil, nil
 	}
-
-	// Serialise per test: the second user to open the same untranslated test
-	// waits for the first run and then reads the cached rows.
-	release := t.lockTest(testID)
-	defer release()
-
 	cached, err := t.repo.TranslationsForTest(ctx, testID, models.TestLangKK)
 	if err != nil {
 		return nil, err
@@ -182,14 +149,13 @@ func (t *TranslatorService) TranslateTest(ctx context.Context, testID int64, que
 		return cached, nil
 	}
 
-	// One call for the whole test (20 questions) — the cheapest way.
 	if err := t.translateBatch(ctx, missing); err != nil {
 		log.Printf("translator: test %d: translate %d questions: %v", testID, len(missing), err)
 		return nil, err
 	}
 	log.Printf("translator: test %d: translated %d question(s) to kk and cached them", testID, len(missing))
 
-	// Re-read: rows just written by us (or by a concurrent run we raced).
+	// Re-read: rows just written by us.
 	cached, err = t.repo.TranslationsForTest(ctx, testID, models.TestLangKK)
 	if err != nil {
 		return nil, err
