@@ -533,16 +533,31 @@ func topicsFingerprint(topics []string) string {
 // every question must be tagged with one of the REQUESTED topics and every
 // requested topic must be covered — otherwise the test would silently train
 // topics the user already knows (wasted money) or miss actual gaps.
-func validatePersonalCoverage(gt *generatedTest, topics []string) error {
-	allowed := make(map[string]bool, len(topics))
+//
+// B1: with a topic catalog, a spelling that is an alias of a requested topic
+// (same topic_key) is accepted too and rewritten to the requested topic.
+func validatePersonalCoverage(gt *generatedTest, topics []string, catalog *models.TopicCatalog) error {
+	allowed := make(map[string]string, len(topics)) // norm -> requested spelling
+	byKey := map[string]string{}                    // topic_key -> requested norm
 	for _, t := range topics {
-		allowed[normalizeTopic(t)] = true
+		n := normalizeTopic(t)
+		allowed[n] = t
+		if k, ok := catalog.Resolve(t); ok {
+			byKey[k] = n
+		}
 	}
 	covered := make(map[string]bool, len(topics))
 	for i := range gt.Questions {
-		n := normalizeTopic(gt.Questions[i].Topic)
-		if !allowed[n] {
-			return fmt.Errorf("question %d: topic %q is not in the weak-topics list", i+1, gt.Questions[i].Topic)
+		q := &gt.Questions[i]
+		n := normalizeTopic(q.Topic)
+		if _, ok := allowed[n]; !ok {
+			k, found := catalog.Resolve(q.Topic)
+			req, mapped := byKey[k]
+			if !found || !mapped {
+				return fmt.Errorf("question %d: topic %q is not in the weak-topics list", i+1, q.Topic)
+			}
+			n = req
+			q.Topic = allowed[req]
 		}
 		covered[n] = true
 	}
@@ -550,6 +565,63 @@ func validatePersonalCoverage(gt *generatedTest, topics []string) error {
 		return fmt.Errorf("only %d of %d weak topics covered", len(covered), len(allowed))
 	}
 	return nil
+}
+
+// maxNewChainTopics: how many topics OUTSIDE the catalog one generated chain
+// test may introduce (B1). The chain must still reach new sections of the
+// programme, so a few new topics are allowed (they are added to the catalog
+// when the test is stored); a reply that ignores the list is rejected.
+const maxNewChainTopics = 2
+
+// maxPromptTopics bounds the catalog list sent in a prompt (tokens).
+const maxPromptTopics = 80
+
+// validateChainTopics maps the topics of a chain test through the catalog
+// (an alias is rewritten to the canonical title) and rejects a reply with
+// more than maxNewChainTopics topics outside it. An empty catalog (new
+// subject) accepts everything — the first tests seed it.
+func validateChainTopics(gt *generatedTest, catalog *models.TopicCatalog) error {
+	if catalog == nil || len(catalog.Aliases) == 0 {
+		return nil
+	}
+	titles := make(map[string]string, len(catalog.Titles)) // key -> title
+	for _, t := range catalog.Titles {
+		titles[normalizeTopic(t)] = t
+	}
+	unknown := map[string]bool{}
+	for i := range gt.Questions {
+		q := &gt.Questions[i]
+		k, ok := catalog.Resolve(q.Topic)
+		if !ok {
+			if n := normalizeTopic(q.Topic); n != "" {
+				unknown[n] = true
+			}
+			continue
+		}
+		if t, ok := titles[k]; ok {
+			q.Topic = t
+		}
+	}
+	if len(unknown) > maxNewChainTopics {
+		return fmt.Errorf("%d topics outside the subject topic list (max %d)", len(unknown), maxNewChainTopics)
+	}
+	return nil
+}
+
+// topicListPrompt is the prompt block with the catalog topics of a subject.
+func topicListPrompt(catalog *models.TopicCatalog) string {
+	if catalog == nil || len(catalog.Titles) == 0 {
+		return ""
+	}
+	titles := catalog.Titles
+	if len(titles) > maxPromptTopics {
+		titles = titles[:maxPromptTopics]
+	}
+	var b strings.Builder
+	b.WriteString("\nСПРАВОЧНИК ТЕМ предмета — поле topic каждого вопроса ДОСЛОВНО копируй из этого списка: ")
+	b.WriteString(strings.Join(titles, "; "))
+	fmt.Fprintf(&b, ". Новую тему (не больше %d на тест) вводи, только если раздела программы нет в списке.\n", maxNewChainTopics)
+	return b.String()
 }
 
 // ---------------------------------------------------------------------------
@@ -1223,6 +1295,12 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 	if err != nil {
 		return 0, err
 	}
+	// B1: topic catalog of the subject — the model picks topics from it, the
+	// validators map aliases to canonical titles.
+	catalog, err := g.gen.TopicCatalog(ctx, job.SubjectID)
+	if err != nil {
+		return 0, err
+	}
 
 	var prompt string
 	var title string
@@ -1266,7 +1344,7 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 				}
 			}
 		}
-		prompt = chainGenPrompt(subject.Name, testNumber, prev, marks)
+		prompt = chainGenPrompt(subject.Name, testNumber, prev, marks) + topicListPrompt(catalog)
 
 	case models.TestKindPersonal:
 		ownerUserID = job.OwnerUserID
@@ -1338,7 +1416,7 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 		// Weak-topics tests carry a strict contract: only the requested
 		// topics, all of them covered — a sloppy reply never reaches the DB.
 		if kind == models.TestKindPersonal {
-			if err := validatePersonalCoverage(gt, promptTopics); err != nil {
+			if err := validatePersonalCoverage(gt, promptTopics, catalog); err != nil {
 				return fmt.Errorf("personal test: %w", err)
 			}
 		}
@@ -1347,6 +1425,9 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 		// for Тест 2) is rejected and the next provider writes it.
 		if kind == models.TestKindChain {
 			if err := validateChainDifficulty(gt, testNumber); err != nil {
+				return err
+			}
+			if err := validateChainTopics(gt, catalog); err != nil {
 				return err
 			}
 		}
@@ -1377,7 +1458,7 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 		return 0, fmt.Errorf("after repair: %w", err)
 	}
 	if kind == models.TestKindPersonal {
-		if err := validatePersonalCoverage(final, promptTopics); err != nil {
+		if err := validatePersonalCoverage(final, promptTopics, catalog); err != nil {
 			return 0, fmt.Errorf("after repair: personal test: %w", err)
 		}
 	}

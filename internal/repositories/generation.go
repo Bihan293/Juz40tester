@@ -866,6 +866,15 @@ func (r *GenerationRepository) createTest(ctx context.Context, test *models.Test
 		return test, nil
 	}
 
+	rawTopics := make([]string, len(questions))
+	for i, sq := range questions {
+		rawTopics[i] = sq.Topic
+	}
+	topicKeys, err := ensureTopicKeys(ctx, tx, test.SubjectID, rawTopics)
+	if err != nil {
+		return nil, err
+	}
+
 	labels := []string{"A", "B", "C", "D"}
 	for i, sq := range questions {
 		if sq.Correct < 0 || sq.Correct > 3 {
@@ -874,11 +883,12 @@ func (r *GenerationRepository) createTest(ctx context.Context, test *models.Test
 		var qid int64
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO questions (subject_id, question_text, option_a, option_b, option_c, option_d,
-			                       correct_answer, topic, difficulty, quality_checked_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CASE WHEN $10 THEN now() END)
+			                       correct_answer, topic, difficulty, quality_checked_at, topic_key)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CASE WHEN $10 THEN now() END, NULLIF($11, ''))
 			RETURNING id`,
 			test.SubjectID, sq.Text, sq.Options[0], sq.Options[1], sq.Options[2], sq.Options[3],
-			labels[sq.Correct], sq.Topic, sq.Difficulty, sq.QualityChecked).Scan(&qid); err != nil {
+			labels[sq.Correct], sq.Topic, sq.Difficulty, sq.QualityChecked,
+			topicKeys[models.NormalizeTopic(sq.Topic)]).Scan(&qid); err != nil {
 			return nil, err
 		}
 		if _, err := tx.Exec(ctx, `
