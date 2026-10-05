@@ -418,17 +418,33 @@ func (r *AttemptRepository) SubmitAnswer(ctx context.Context, userID, attemptID 
 		return nil, errors.New("attempt is not in progress")
 	}
 
-	// 2. Load the attempt question at this position.
+	// 2. ONE query (A4): the attempt question at this position (locked) JOINed
+	// with its question row, plus the lowest unanswered position and the
+	// number of unanswered questions of the attempt. The attempt row is
+	// locked above, so these numbers cannot change until commit.
 	var aq models.AttemptQuestion
 	var sel sql.NullString
 	var orderJSON []byte
+	q := &models.Question{}
+	var minUnanswered, unanswered int
 	err = tx.QueryRow(ctx, `
-		SELECT id, attempt_id, question_id, position, answered, selected_answer, is_correct, option_order
-		FROM attempt_questions
-		WHERE attempt_id = $1 AND position = $2
-		FOR UPDATE`, attemptID, position).
+		SELECT aq.id, aq.attempt_id, aq.question_id, aq.position, aq.answered, aq.selected_answer, aq.is_correct, aq.option_order,
+		       q.id, q.subject_id, q.question_text, q.option_a, q.option_b, q.option_c,
+		       q.option_d, q.correct_answer, q.topic, q.difficulty,
+		       u.min_pos, u.cnt
+		FROM attempt_questions aq
+		JOIN questions q ON q.id = aq.question_id
+		CROSS JOIN (
+			SELECT COALESCE(MIN(position), 0) AS min_pos, COUNT(*)::int AS cnt
+			FROM attempt_questions WHERE attempt_id = $1 AND NOT answered
+		) u
+		WHERE aq.attempt_id = $1 AND aq.position = $2
+		FOR UPDATE OF aq`, attemptID, position).
 		Scan(&aq.ID, &aq.AttemptID, &aq.QuestionID, &aq.Position, &aq.Answered,
-			&sel, &aq.IsCorrect, &orderJSON)
+			&sel, &aq.IsCorrect, &orderJSON,
+			&q.ID, &q.SubjectID, &q.Text, &q.OptionA, &q.OptionB, &q.OptionC,
+			&q.OptionD, &q.CorrectAnswer, &q.Topic, &q.Difficulty,
+			&minUnanswered, &unanswered)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -448,29 +464,15 @@ func (r *AttemptRepository) SubmitAnswer(ctx context.Context, userID, attemptID 
 	// 3b. Only the CURRENT question (the lowest unanswered position) may be
 	// answered — a stale/forged callback for a later position must neither
 	// skip questions nor finish the attempt early.
-	var minUnanswered int
-	if err := tx.QueryRow(ctx, `
-		SELECT COALESCE(MIN(position), 0) FROM attempt_questions
-		WHERE attempt_id = $1 AND NOT answered`, attemptID).Scan(&minUnanswered); err != nil {
-		return nil, err
-	}
 	if position != minUnanswered {
 		return nil, ErrAnswerOutOfOrder
 	}
-
-	// 4. Load the question and evaluate the answer.
-	q := &models.Question{}
-	if err := tx.QueryRow(ctx, `
-		SELECT id, subject_id, question_text, option_a, option_b, option_c,
-		       option_d, correct_answer, topic, difficulty
-		FROM questions WHERE id = $1`, aq.QuestionID).
-		Scan(&q.ID, &q.SubjectID, &q.Text, &q.OptionA, &q.OptionB, &q.OptionC,
-			&q.OptionD, &q.CorrectAnswer, &q.Topic, &q.Difficulty); err != nil {
-		return nil, err
-	}
 	correct := selected == q.CorrectAnswer
+	// The attempt is finished only when NO unanswered question is left
+	// after this one (not merely because this position is the last one).
+	finished := unanswered <= 1
 
-	// 5. Mark the question answered (optimistic guard).
+	// 4. Mark the question answered (optimistic guard).
 	tag, err := tx.Exec(ctx, `
 		UPDATE attempt_questions
 		SET answered = TRUE, selected_answer = $3, is_correct = $4
@@ -487,9 +489,10 @@ func (r *AttemptRepository) SubmitAnswer(ctx context.Context, userID, attemptID 
 		return &AnswerResult{AlreadyAnswered: true}, nil
 	}
 
-	// 6. Update user knowledge progress.
-	// Lock the (user, question) progress row, then apply the knowledge
-	// transition rules to the PREVIOUS status:
+	// 5. Update user knowledge progress in ONE upsert (A4). The previous
+	// status is read (and locked) in the CTE; the new one is computed in SQL
+	// from the stored row with the knowledge transition rules
+	// (models.NextStatus):
 	//   correct:   🔴→🟡, 🟡→🟢, 🟢→🟢
 	//   incorrect: 🔴→🔴, 🟡→🔴, 🟢→🟡
 	correctInc, wrongInc := 0, 0
@@ -498,28 +501,35 @@ func (r *AttemptRepository) SubmitAnswer(ctx context.Context, userID, attemptID 
 	} else {
 		wrongInc = 1
 	}
-	prevStatus := models.DefaultStatus // a never-seen question starts at 🔴
-	err = tx.QueryRow(ctx, `
-		SELECT status FROM user_question_progress
-		WHERE user_id = $1 AND question_id = $2
-		FOR UPDATE`, userID, aq.QuestionID).Scan(&prevStatus)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return nil, err
-	}
-	newStatus := models.NextStatus(prevStatus, correct)
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO user_question_progress (user_id, question_id, status, correct_count, wrong_count)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (user_id, question_id) DO UPDATE SET
-			status        = EXCLUDED.status,
-			correct_count = user_question_progress.correct_count + EXCLUDED.correct_count,
-			wrong_count   = user_question_progress.wrong_count   + EXCLUDED.wrong_count,
-			updated_at    = now()`,
-		userID, aq.QuestionID, newStatus, correctInc, wrongInc); err != nil {
+	var prevStatus, newStatus int
+	if err := tx.QueryRow(ctx, `
+		WITH prev AS (
+			SELECT status FROM user_question_progress
+			WHERE user_id = $1 AND question_id = $2
+			FOR UPDATE
+		), up AS (
+			INSERT INTO user_question_progress (user_id, question_id, status, correct_count, wrong_count)
+			SELECT $1, $2,
+			       CASE WHEN $3::bool THEN LEAST(COALESCE(prev.status, $4::int) + 1, $6::int)
+			            ELSE GREATEST(COALESCE(prev.status, $4::int) - 1, $5::int) END,
+			       $7, $8
+			FROM (SELECT 1) one LEFT JOIN prev ON TRUE
+			ON CONFLICT (user_id, question_id) DO UPDATE SET
+				status        = CASE WHEN $3::bool THEN LEAST(user_question_progress.status + 1, $6::int)
+				                     ELSE GREATEST(user_question_progress.status - 1, $5::int) END,
+				correct_count = user_question_progress.correct_count + EXCLUDED.correct_count,
+				wrong_count   = user_question_progress.wrong_count   + EXCLUDED.wrong_count,
+				updated_at    = now()
+			RETURNING status
+		)
+		SELECT (SELECT status FROM up), COALESCE((SELECT status FROM prev), $4::int)`,
+		userID, aq.QuestionID, correct, models.DefaultStatus, models.StatusNone,
+		models.StatusMastered, correctInc, wrongInc).
+		Scan(&newStatus, &prevStatus); err != nil {
 		return nil, err
 	}
 
-	// 6b. Per-TOPIC statistics (the source of weak topics) — in the same
+	// 5b. Per-TOPIC statistics (the source of weak topics) — in the same
 	// transaction, so the answer and the topic statistics never diverge.
 	if countsForTopic(prevStatus) {
 		if err := recordTopicAnswer(ctx, tx, userID, q.SubjectID, q.Topic, correct); err != nil {
@@ -527,17 +537,7 @@ func (r *AttemptRepository) SubmitAnswer(ctx context.Context, userID, attemptID 
 		}
 	}
 
-	// 7. Advance the attempt counters and position.
-	// The attempt is finished only when NO unanswered question is left
-	// (not merely because the answered position is the last one).
-	var finished bool
-	if err := tx.QueryRow(ctx, `
-		SELECT NOT EXISTS (
-			SELECT 1 FROM attempt_questions WHERE attempt_id = $1 AND NOT answered
-		)`, attemptID).Scan(&finished); err != nil {
-		return nil, err
-	}
-
+	// 6. Advance the attempt counters and position.
 	err = tx.QueryRow(ctx, `
 		UPDATE test_attempts
 		SET correct_count = correct_count + $3,
