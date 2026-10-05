@@ -290,6 +290,13 @@ func main() {
 		if err := genRepo.BackfillTopicCatalog(workerCtx); err != nil {
 			log.Printf("topic catalog backfill: %v", err)
 		}
+		// B2: per-topic statistics keyed by catalog topic_key — rows of an
+		// alias spelling are summed into the topic row (idempotent).
+		if n, err := genRepo.MergeTopicStatsByKey(workerCtx); err != nil {
+			log.Printf("topic stats merge by topic_key: %v", err)
+		} else if n > 0 {
+			log.Printf("topic stats merge by topic_key: %d rows merged", n)
+		}
 	}()
 
 	stop := make(chan os.Signal, 1)
