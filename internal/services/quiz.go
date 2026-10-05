@@ -38,11 +38,14 @@ type QuizService struct {
 	// the subject name never change during an attempt, so they are loaded
 	// once instead of on every question.
 	metas *viewMetaCache
+	// subjectNames caches the subject list for subjectTranslatable (A5).
+	subjectNames *subjectNameCache
 }
 
 func NewQuizService(subjects *repositories.SubjectRepository, attempts *repositories.AttemptRepository, state *repositories.StateRepository, gen *repositories.GenerationRepository, genSvc *GeneratorService, users *repositories.UserRepository) *QuizService {
 	s := &QuizService{subjects: subjects, attempts: attempts, state: state, gen: gen, genSvc: genSvc, rng: newSecureRand(),
 		boards: newLeaderboardCache(LeaderboardCacheTTL), metas: newViewMetaCache(viewMetaTTL, viewMetaMax), users: users}
+	s.subjectNames = newSubjectNameCache(subjectNamesTTL, subjects.List)
 	return s
 }
 
@@ -351,7 +354,9 @@ func (s *QuizService) CanOpenTest(ctx context.Context, userID int64, test *model
 	if err != nil {
 		return false, "", err
 	}
-	unlocked, err := s.unlockedMax(ctx, userID, test.SubjectID, chain)
+	// A5: the progress loaded for the unlock walk is reused for the
+	// blocking test below (it is one of the chain tests).
+	unlocked, progress, err := s.unlockedWithProgress(ctx, userID, test.SubjectID, chain)
 	if err != nil {
 		return false, "", err
 	}
@@ -370,10 +375,6 @@ func (s *QuizService) CanOpenTest(ctx context.Context, userID int64, test *model
 	if blocking == nil {
 		// The next test of the chain is still being generated.
 		return false, fmt.Sprintf("«Тест %d» ещё генерируется — загляни чуть позже ⏳", unlocked), nil
-	}
-	progress, err := s.gen.TestProgressForUser(ctx, userID, []int64{blocking.ID})
-	if err != nil {
-		return false, "", err
 	}
 	green, yellow := 0, 0
 	if p := progress[blocking.ID]; p != nil {
@@ -439,25 +440,50 @@ func (s *QuizService) OnTestCompleted(ctx context.Context, userID int64, test *m
 // trigger a (paid) generation — otherwise any Тест 50/100 could be
 // generated on demand.
 func (s *QuizService) ReviveChainTest(ctx context.Context, subjectID int64, testNumber int, userID int64) {
-	if s.genSvc == nil || testNumber < 1 {
-		return
+	_, _ = s.ChainTestOrRevive(ctx, subjectID, testNumber, userID)
+}
+
+// ChainTestOrRevive is the ⏳ tap in ONE pass (A5): it returns chain test
+// #testNumber when it already exists, otherwise revives/queues its
+// generation (same unlock guard as before) and returns nil. It replaces
+// ReviveChainTest + ChainTestStatus, which listed the chain twice, re-checked
+// the test inside the generator and re-read the job status nobody used.
+func (s *QuizService) ChainTestOrRevive(ctx context.Context, subjectID int64, testNumber int, userID int64) (*models.Test, error) {
+	if testNumber < 1 {
+		return nil, nil
 	}
 	chain, err := s.subjects.ListChainTests(ctx, subjectID)
 	if err != nil {
 		log.Printf("revive chain test: list subject %d: %v", subjectID, err)
-		return
+		return nil, err
+	}
+	for i := range chain {
+		if chain[i].TestNumber == testNumber {
+			return &chain[i], nil
+		}
+	}
+	// The chain list may be cached — a point query sees a test generated
+	// a moment ago.
+	if id, err := s.gen.ChainTestID(ctx, subjectID, testNumber); err != nil {
+		return nil, err
+	} else if id > 0 {
+		return &models.Test{ID: id, SubjectID: subjectID, TestNumber: testNumber, Kind: models.TestKindChain, IsActive: true}, nil
+	}
+	if s.genSvc == nil {
+		return nil, nil
 	}
 	unlocked, err := s.unlockedMax(ctx, userID, subjectID, chain)
 	if err != nil {
 		log.Printf("revive chain test: unlocked subject %d user %d: %v", subjectID, userID, err)
-		return
+		return nil, err
 	}
 	if testNumber > unlocked {
 		log.Printf("revive chain test: refused subject %d test %d for user %d (unlocked up to %d)",
 			subjectID, testNumber, userID, unlocked)
-		return
+		return nil, nil
 	}
 	s.genSvc.reviveChainTest(ctx, subjectID, testNumber, userID)
+	return nil, nil
 }
 
 // WeakMenu returns, in ONE topic-stats query (+ the subject list), the
@@ -591,9 +617,12 @@ func (s *QuizService) RestartTest(ctx context.Context, userID, testID int64) (*m
 }
 
 // StartTestFor is StartTest for a test row the caller has already loaded
-// (openTest) — saves re-reading the same tests row (R-2).
+// (openTest) — saves re-reading the same tests row (R-2). The caller has
+// just checked ResumeOrNil and found no active attempt, so the attempt is
+// created without looking the active one up again (A5); a concurrent
+// creation still resolves to the single winner via the unique index.
 func (s *QuizService) StartTestFor(ctx context.Context, userID int64, test *models.Test) (*models.TestAttempt, error) {
-	return s.startTestRow(ctx, userID, test, false)
+	return s.startTestRowMode(ctx, userID, test, false, true)
 }
 
 func (s *QuizService) startTest(ctx context.Context, userID, testID int64, replace bool) (*models.TestAttempt, error) {
@@ -605,23 +634,24 @@ func (s *QuizService) startTest(ctx context.Context, userID, testID int64, repla
 }
 
 func (s *QuizService) startTestRow(ctx context.Context, userID int64, test *models.Test, replace bool) (*models.TestAttempt, error) {
+	return s.startTestRowMode(ctx, userID, test, replace, false)
+}
+
+func (s *QuizService) startTestRowMode(ctx context.Context, userID int64, test *models.Test, replace, fresh bool) (*models.TestAttempt, error) {
 	if test == nil || !test.IsActive {
 		return nil, repositories.ErrNotFound
 	}
-	questions, err := s.subjects.TestQuestions(ctx, test.ID)
+	// A5: only the ids are needed here (loaded once, no question text).
+	ids, err := s.subjects.TestQuestionIDs(ctx, test.ID)
 	if err != nil {
 		return nil, err
 	}
-	if len(questions) == 0 {
+	if len(ids) == 0 {
 		return nil, fmt.Errorf("test %d has no questions", test.ID)
 	}
 
 	// Shuffle the question order for this attempt — under the mutex (the
 	// RNG source is shared across all concurrent webhook goroutines).
-	ids := make([]int64, len(questions))
-	for i, q := range questions {
-		ids[i] = q.ID
-	}
 	s.rngMu.Lock()
 	s.rng.Shuffle(len(ids), func(i, j int) { ids[i], ids[j] = ids[j], ids[i] })
 
@@ -633,6 +663,9 @@ func (s *QuizService) startTestRow(ctx context.Context, userID int64, test *mode
 		orders[i] = ord
 	}
 	s.rngMu.Unlock()
+	if fresh && !replace {
+		return s.attempts.CreateFreshAttempt(ctx, userID, test.ID, ids, orders)
+	}
 	return s.attempts.CreateAttempt(ctx, userID, test.ID, ids, orders, replace)
 }
 
@@ -904,25 +937,22 @@ func (s *QuizService) AllSubjectsProgress(ctx context.Context, userID int64, sub
 // already COMPLETE in the cache. Pure DB lookup, zero API cost — only an
 // incomplete translation queues a background job (PrepareTranslation).
 func (s *QuizService) TestFullyTranslated(ctx context.Context, testID int64) (bool, error) {
-	questions, err := s.subjects.TestQuestions(ctx, testID)
+	// A5: only the question ids are loaded, not the full texts.
+	ids, err := s.subjects.TestQuestionIDs(ctx, testID)
 	if err != nil {
 		return false, err
 	}
-	if len(questions) == 0 {
+	if len(ids) == 0 {
 		return false, fmt.Errorf("test %d has no questions", testID)
 	}
 	if s.translator == nil || !s.translator.Enabled() {
 		return false, nil
 	}
-	ids := make([]int64, len(questions))
-	for i, q := range questions {
-		ids[i] = q.ID
-	}
 	n, err := s.translator.TranslatedCount(ctx, ids)
 	if err != nil {
 		return false, err
 	}
-	return n >= len(questions), nil
+	return n >= len(ids), nil
 }
 
 // PrepareTranslation makes sure the Kazakh version of the test exists or is
@@ -974,13 +1004,16 @@ func (s *QuizService) PrepareTranslation(ctx context.Context, user *models.User,
 //
 // On a lookup error the subject is treated as NOT translatable: showing the
 // original is always correct, a wrong translation never is.
+//
+// A5: the subject names come from an in-memory cache of the subject list
+// (TTL subjectNamesTTL) instead of one DB read per call.
 func (s *QuizService) subjectTranslatable(ctx context.Context, subjectID int64) bool {
-	subject, err := s.subjects.GetByID(ctx, subjectID)
+	name, err := s.subjectNames.name(ctx, subjectID)
 	if err != nil {
 		log.Printf("subject %d lookup for translation check: %v", subjectID, err)
 		return false
 	}
-	return !models.IsLanguageSubject(subject.Name)
+	return !models.IsLanguageSubject(name)
 }
 
 // TestNeedsTranslationFor is TestNeedsTranslation for an already loaded

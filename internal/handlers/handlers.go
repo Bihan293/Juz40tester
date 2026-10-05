@@ -500,10 +500,9 @@ func (h *Handler) handlePendingTest(ctx context.Context, cb *bot.CallbackQuery, 
 		h.answerAlert(ctx, cb, "⏳ Тест ещё генерируется. Подожди минуточку и открой предмет снова.")
 		return
 	}
-	h.quiz.ReviveChainTest(ctx, subjectID, testNumber, user.ID)
-
+	// One pass (A5): the existing test, or revive/queue its generation.
 	// The test may have been generated a moment ago — open it right away.
-	if test, _, err := h.quiz.ChainTestStatus(ctx, subjectID, testNumber); err == nil && test != nil {
+	if test, err := h.quiz.ChainTestOrRevive(ctx, subjectID, testNumber, user.ID); err == nil && test != nil {
 		h.openTest(ctx, cb, user, test.ID)
 		return
 	}

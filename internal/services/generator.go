@@ -698,15 +698,12 @@ func (g *GeneratorService) EnsureChainTest(ctx context.Context, subjectID int64,
 // is QuizService.ReviveChainTest, which refuses test numbers above the
 // user's unlockedMax — so no caller can start a paid generation of a locked
 // test by bypassing that guard.
+//
+// A5: the caller (QuizService.ChainTestOrRevive) has already verified that
+// the test does not exist, so no second chain lookup is done here, and the
+// enqueue does not re-check the job status (nobody reads it).
 func (g *GeneratorService) reviveChainTest(ctx context.Context, subjectID int64, testNumber int, ownerUserID int64) {
 	if !g.Enabled() || testNumber < 1 || testNumber > models.MaxVisibleTests {
-		return
-	}
-	// Already generated — nothing to revive (a stale button at worst).
-	if existing, err := g.findChainTest(ctx, subjectID, testNumber); err != nil {
-		log.Printf("generator: revive lookup subject %d test %d: %v", subjectID, testNumber, err)
-		return
-	} else if existing != nil {
 		return
 	}
 	revived, err := g.gen.ReviveChainJob(ctx, subjectID, testNumber, ownerUserID)
@@ -718,9 +715,15 @@ func (g *GeneratorService) reviveChainTest(ctx context.Context, subjectID int64,
 		log.Printf("generator: revived failed chain job: subject %d test %d (urgent)", subjectID, testNumber)
 	}
 	// Belt and braces: the normal enqueue path (insert or upgrade to urgent).
-	if _, err := g.EnsureChainTest(ctx, subjectID, testNumber, true, ownerUserID); err != nil {
+	inserted, err := g.gen.EnqueueChainJob(ctx, subjectID, testNumber, time.Now(), true, ownerUserID)
+	if err != nil {
 		log.Printf("generator: ensure after revive subject %d test %d: %v", subjectID, testNumber, err)
+		return
 	}
+	if inserted {
+		log.Printf("generator: queued URGENT chain job: subject %d test %d", subjectID, testNumber)
+	}
+	g.notifyWorkers()
 }
 
 // EnsurePersonalTest returns the user's own weak-topics test of the subject,
@@ -796,11 +799,10 @@ func (g *GeneratorService) EnsurePersonalTest(ctx context.Context, userID, subje
 		return nil, false, nil, err
 	}
 	g.notifyWorkers()
-	pending, err = g.gen.HasPendingOrRunningPersonalJob(ctx, subjectID, userID)
-	if err != nil {
-		return nil, false, nil, err
-	}
-	return nil, pending, topics, nil
+	// A5: no second HasPendingOrRunningPersonalJob — after a successful
+	// enqueue a pending/running job exists (inserted now, or the active one
+	// the ON CONFLICT hit on idx_genjobs_personal_unique).
+	return nil, true, topics, nil
 }
 
 // ---------------------------------------------------------------------------

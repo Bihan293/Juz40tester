@@ -134,6 +134,16 @@ func (r *SubjectRepository) GetTest(ctx context.Context, id int64) (*models.Test
 	return &t, nil
 }
 
+// TestQuestionIDs returns only the question ids of a test in their fixed
+// order (A5: callers that need no question text).
+func (r *SubjectRepository) TestQuestionIDs(ctx context.Context, testID int64) ([]int64, error) {
+	var ids []int64
+	err := r.pool.QueryRow(ctx, `
+		SELECT COALESCE(array_agg(question_id ORDER BY position), '{}')
+		FROM test_questions WHERE test_id = $1`, testID).Scan(&ids)
+	return ids, err
+}
+
 // TestQuestions returns questions of a test ordered by their fixed position.
 func (r *SubjectRepository) TestQuestions(ctx context.Context, testID int64) ([]models.Question, error) {
 	rows, err := r.pool.Query(ctx, `

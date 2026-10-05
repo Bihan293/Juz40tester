@@ -52,10 +52,22 @@ func NewAttemptRepository(pool *pgxpool.Pool) *AttemptRepository {
 // A concurrent creation that loses the race on the unique index gets the
 // winner's attempt instead of an error.
 func (r *AttemptRepository) CreateAttempt(ctx context.Context, userID, testID int64, questionIDs []int64, optionOrders [][]string, replace bool) (*models.TestAttempt, error) {
+	return r.createAttempt(ctx, userID, testID, questionIDs, optionOrders, replace, true)
+}
+
+// CreateFreshAttempt is CreateAttempt(replace = false) for a caller that has
+// JUST looked the active attempt up and found none (A5): the second lookup
+// inside the transaction is skipped. A concurrent creation still loses on
+// the unique index and gets the winner's attempt, exactly as before.
+func (r *AttemptRepository) CreateFreshAttempt(ctx context.Context, userID, testID int64, questionIDs []int64, optionOrders [][]string) (*models.TestAttempt, error) {
+	return r.createAttempt(ctx, userID, testID, questionIDs, optionOrders, false, false)
+}
+
+func (r *AttemptRepository) createAttempt(ctx context.Context, userID, testID int64, questionIDs []int64, optionOrders [][]string, replace, lookup bool) (*models.TestAttempt, error) {
 	if len(questionIDs) != len(optionOrders) {
 		return nil, errors.New("questions and option orders length mismatch")
 	}
-	a, err := r.createAttemptTx(ctx, userID, testID, questionIDs, optionOrders, replace)
+	a, err := r.createAttemptTx(ctx, userID, testID, questionIDs, optionOrders, replace, lookup)
 	if isUniqueViolation(err) {
 		existing, gerr := r.GetActiveAttempt(ctx, userID, testID)
 		if gerr != nil {
@@ -68,7 +80,7 @@ func (r *AttemptRepository) CreateAttempt(ctx context.Context, userID, testID in
 	return a, err
 }
 
-func (r *AttemptRepository) createAttemptTx(ctx context.Context, userID, testID int64, questionIDs []int64, optionOrders [][]string, replace bool) (*models.TestAttempt, error) {
+func (r *AttemptRepository) createAttemptTx(ctx context.Context, userID, testID int64, questionIDs []int64, optionOrders [][]string, replace, lookup bool) (*models.TestAttempt, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -81,7 +93,7 @@ func (r *AttemptRepository) createAttemptTx(ctx context.Context, userID, testID 
 			WHERE user_id = $1 AND test_id = $2 AND status = 'in_progress'`, userID, testID); err != nil {
 			return nil, err
 		}
-	} else {
+	} else if lookup {
 		var a models.TestAttempt
 		err := tx.QueryRow(ctx, `
 			SELECT id, user_id, test_id, status, current_position, correct_count, wrong_count, started_at, completed_at
@@ -359,7 +371,6 @@ func (r *AttemptRepository) LoadSummary(ctx context.Context, attemptID, userID i
 			       COUNT(*) FILTER (WHERE p.status = 1)::int                   AS yellow,
 			       COUNT(*) FILTER (WHERE p.status = 2)::int                   AS green
 			FROM test_questions tq
-			JOIN questions q ON q.id = tq.question_id
 			LEFT JOIN user_question_progress p
 			       ON p.user_id = a.user_id AND p.question_id = tq.question_id
 			WHERE tq.test_id = t.id
