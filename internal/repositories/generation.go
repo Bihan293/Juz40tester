@@ -99,6 +99,21 @@ func (r *GenerationRepository) WeakTopics(ctx context.Context, userID, subjectID
 	return out, nil
 }
 
+// WeakTopicKeys (B2) returns the catalog topic_keys of the user's weak
+// topics, worst first (ties broken by topic_key — the set does not jump
+// from one answer to the next).
+func (r *GenerationRepository) WeakTopicKeys(ctx context.Context, userID, subjectID int64, limit int) ([]string, error) {
+	stats, err := r.WeakTopicStats(ctx, userID, subjectID, limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(stats))
+	for _, s := range stats {
+		out = append(out, s.Key)
+	}
+	return out, nil
+}
+
 // WeakTopicStats is WeakTopics with the statistics of each topic (for the
 // «🎯 Слабые темы» screen). limit <= 0 returns every weak topic.
 func (r *GenerationRepository) WeakTopicStats(ctx context.Context, userID, subjectID int64, limit int) ([]models.TopicStat, error) {
