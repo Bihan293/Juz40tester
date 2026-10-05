@@ -267,6 +267,7 @@ func TestParallelAnswersAtomic(t *testing.T) {
 // per day are capped; the cap is counted in the DB.
 func TestPersonalGenerationDailyLimit(t *testing.T) {
 	e := newFlowEnv(t)
+	e.genSvc.noBank = true // legacy clone/limit path (removed in B6)
 	ctx := context.Background()
 	uid := e.user(t, "Limit")
 	e.genSvc.cfg = &config.Config{PersonalGenPerUserDay: 2}

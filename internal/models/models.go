@@ -120,6 +120,9 @@ type Test struct {
 	// OriginTestID is the root personal test a clone was copied from (0 for
 	// generated tests). Used to never hand a user content they finished.
 	OriginTestID int64
+	// FromBank (B3): personal test assembled from the question bank — it
+	// links existing questions and owns none of them.
+	FromBank bool
 }
 
 // UserSubjectState is per-user UI/progress state that survives restarts.

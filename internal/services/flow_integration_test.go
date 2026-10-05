@@ -399,6 +399,7 @@ func TestFlowChainSharedAndUnlock(t *testing.T) {
 
 func TestFlowWeakTopicsSharedClone(t *testing.T) {
 	e := newFlowEnv(t)
+	e.genSvc.noBank = true // legacy clone/limit path (removed in B6)
 	ctx := context.Background()
 	alice, bob, dan := e.user(t, "Alice"), e.user(t, "Bob"), e.user(t, "Dan")
 

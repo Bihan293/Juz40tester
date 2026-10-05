@@ -125,14 +125,14 @@ func (r *GenerationRepository) WeakTopicStats(ctx context.Context, userID, subje
 }
 
 // scanTest scans a tests row (id, subject_id, test_number, title, is_active,
-// kind, topics, owner_user_id, topics_fingerprint) into a models.Test.
+// kind, topics, owner_user_id, topics_fingerprint, from_bank) into a models.Test.
 // Returns (nil, nil) when the row does not exist.
 func scanTest(row pgx.Row) (*models.Test, error) {
 	var t models.Test
 	var topicsJSON []byte
 	var owner sql.NullInt64
 	var fingerprint sql.NullString
-	err := row.Scan(&t.ID, &t.SubjectID, &t.TestNumber, &t.Title, &t.IsActive, &t.Kind, &topicsJSON, &owner, &fingerprint)
+	err := row.Scan(&t.ID, &t.SubjectID, &t.TestNumber, &t.Title, &t.IsActive, &t.Kind, &topicsJSON, &owner, &fingerprint, &t.FromBank)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -149,7 +149,7 @@ func scanTest(row pgx.Row) (*models.Test, error) {
 	return &t, nil
 }
 
-const testColumns = `id, subject_id, test_number, title, is_active, kind, topics, owner_user_id, topics_fingerprint`
+const testColumns = `id, subject_id, test_number, title, is_active, kind, topics, owner_user_id, topics_fingerprint, from_bank`
 
 // FindPersonalTest returns the user's own weak-topics test of the subject,
 // or nil if it has not been generated yet.
@@ -250,15 +250,26 @@ func (r *GenerationRepository) DeletePersonalTest(ctx context.Context, userID, t
 	// personal test of THIS subject.
 	var fingerprint sql.NullString
 	var rootID int64
+	var fromBank bool
 	err = tx.QueryRow(ctx, `
-		SELECT topics_fingerprint, COALESCE(origin_test_id, id) FROM tests
+		SELECT topics_fingerprint, COALESCE(origin_test_id, id), from_bank FROM tests
 		WHERE id = $1 AND owner_user_id = $2 AND kind = 'personal' AND subject_id = $3
-		FOR UPDATE`, testID, userID, subjectID).Scan(&fingerprint, &rootID)
+		FOR UPDATE`, testID, userID, subjectID).Scan(&fingerprint, &rootID, &fromBank)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
 	if err != nil {
 		return err
+	}
+	if fromBank {
+		// B3: a bank test owns no questions — they are shared bank rows
+		// (chain tests, other users' bank tests). Only the test row goes
+		// away (attempts cascade); the user's per-question progress stays:
+		// it is what keeps solved questions out of the next bank test.
+		if _, err := tx.Exec(ctx, `DELETE FROM tests WHERE id = $1`, testID); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
 	}
 	// The user has seen this content: their next weak-topics test must get
 	// NEW questions even when the weak-topics set is the same (see
@@ -762,7 +773,7 @@ func (r *GenerationRepository) FailJob(ctx context.Context, jobID int64, jobErr 
 // and links. For 'personal' tests the (subject, owner) unique index
 // deduplicates concurrent inserts: the loser of the race re-reads the
 // winner's test instead of failing. A personal test with test_number = 0
-// gets the next free personal number (9000+), keeping it far above the
+// gets the next personal number (personal_test_number_seq), far above the
 // chain. The UNIQUE (subject_id, test_number) constraint also guards chain
 // tests against concurrent generation of the same number.
 // personalLockNS is the advisory-lock namespace of personal-test creation.
@@ -817,9 +828,9 @@ func (r *GenerationRepository) createTest(ctx context.Context, test *models.Test
 		}
 	}
 	if test.Kind == models.TestKindPersonal && test.TestNumber == 0 {
-		if err := tx.QueryRow(ctx, `
-			SELECT COALESCE(MAX(test_number), 8999) + 1
-			FROM tests WHERE subject_id = $1 AND kind <> 'chain'`, test.SubjectID).
+		// B3: numbers come from personal_test_number_seq (shared with bank
+		// tests), not MAX(test_number)+1.
+		if err := tx.QueryRow(ctx, `SELECT nextval('personal_test_number_seq')`).
 			Scan(&test.TestNumber); err != nil {
 			return nil, err
 		}
