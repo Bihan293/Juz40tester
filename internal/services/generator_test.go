@@ -229,7 +229,7 @@ func TestValidatePersonalCoverage(t *testing.T) {
 	ok := &generatedTest{Questions: []generatedQuestion{
 		{Topic: "Генетика"}, {Topic: " генетика "}, {Topic: "МИКРООРГАНИЗМЫ"},
 	}}
-	if err := validatePersonalCoverage(ok, topics); err != nil {
+	if err := validatePersonalCoverage(ok, topics, nil); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -238,7 +238,7 @@ func TestValidatePersonalCoverage(t *testing.T) {
 	foreign := &generatedTest{Questions: []generatedQuestion{
 		{Topic: "Генетика"}, {Topic: "Ботаника"},
 	}}
-	if err := validatePersonalCoverage(foreign, topics); err == nil {
+	if err := validatePersonalCoverage(foreign, topics, nil); err == nil {
 		t.Fatal("expected error for a topic outside the weak-topics list")
 	}
 
@@ -246,7 +246,7 @@ func TestValidatePersonalCoverage(t *testing.T) {
 	missing := &generatedTest{Questions: []generatedQuestion{
 		{Topic: "Генетика"}, {Topic: "Генетика"},
 	}}
-	if err := validatePersonalCoverage(missing, topics); err == nil {
+	if err := validatePersonalCoverage(missing, topics, nil); err == nil {
 		t.Fatal("expected error when a weak topic is not covered")
 	}
 }
@@ -364,5 +364,46 @@ func TestToSeedMarksQualityChecked(t *testing.T) {
 		if !sq.QualityChecked {
 			t.Fatalf("question %d not marked as quality-checked", i)
 		}
+	}
+}
+
+// TestTopicCatalogValidators (B1): aliases are mapped to the requested /
+// canonical topic, topics outside the catalog are limited.
+func TestTopicCatalogValidators(t *testing.T) {
+	cat := &models.TopicCatalog{
+		Titles:  []string{"Генетика", "Клетка"},
+		Aliases: map[string]string{"генетика": "генетика", "наследственность": "генетика", "клетка": "клетка"},
+	}
+	// Personal: an alias of a requested topic is accepted and rewritten.
+	gt := &generatedTest{Questions: []generatedQuestion{{Topic: "Наследственность"}, {Topic: "Клетка"}}}
+	if err := validatePersonalCoverage(gt, []string{"Генетика", "Клетка"}, cat); err != nil {
+		t.Fatalf("alias rejected: %v", err)
+	}
+	if gt.Questions[0].Topic != "Генетика" {
+		t.Fatalf("alias not rewritten: %q", gt.Questions[0].Topic)
+	}
+	// Personal: a catalog topic that was NOT requested is still rejected.
+	gt = &generatedTest{Questions: []generatedQuestion{{Topic: "Генетика"}, {Topic: "Клетка"}}}
+	if err := validatePersonalCoverage(gt, []string{"Генетика"}, cat); err == nil {
+		t.Fatal("non-requested topic accepted")
+	}
+	// Chain: aliases mapped to canonical titles, <= 2 new topics allowed.
+	gt = &generatedTest{Questions: []generatedQuestion{{Topic: "наследственность"}, {Topic: "Новая 1"}, {Topic: "Новая 2"}}}
+	if err := validateChainTopics(gt, cat); err != nil {
+		t.Fatal(err)
+	}
+	if gt.Questions[0].Topic != "Генетика" {
+		t.Fatalf("chain alias not mapped: %q", gt.Questions[0].Topic)
+	}
+	gt.Questions = append(gt.Questions, generatedQuestion{Topic: "Новая 3"})
+	if err := validateChainTopics(gt, cat); err == nil {
+		t.Fatal("too many topics outside the catalog accepted")
+	}
+	// Empty catalog accepts everything; prompt lists the titles.
+	if err := validateChainTopics(gt, &models.TopicCatalog{}); err != nil {
+		t.Fatal(err)
+	}
+	if p := topicListPrompt(cat); !strings.Contains(p, "Генетика; Клетка") {
+		t.Fatalf("prompt: %q", p)
 	}
 }

@@ -285,6 +285,11 @@ func main() {
 		if err := genRepo.BackfillTopicStats(workerCtx); err != nil {
 			log.Printf("topic stats backfill: %v", err)
 		}
+		// B1: seed the topic catalog from existing questions and map
+		// questions.topic_key (one-off, no-op once done).
+		if err := genRepo.BackfillTopicCatalog(workerCtx); err != nil {
+			log.Printf("topic catalog backfill: %v", err)
+		}
 	}()
 
 	stop := make(chan os.Signal, 1)
