@@ -417,7 +417,7 @@ func TestEnsurePersonalTestKeepsActiveAttemptAndNormalizes(t *testing.T) {
 	// while an attempt of THIS test is in progress → must not be deleted.
 	setStat(models.NormalizeTopic("Тема 0"), "Тема 0", "1111111111")
 	setStat(models.NormalizeTopic("Тема 4"), "Тема 4", "0000000000")
-	a, err := e.quiz.StartTest(ctx, u, pt.ID)
+	a, err := e.quiz.startTest(ctx, u, pt.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -184,7 +184,7 @@ func TestTranslationQueuedNotSynchronous(t *testing.T) {
 	if err != nil || !ready || wait != nil {
 		t.Fatalf("after translation: ready=%v wait=%v err=%v", ready, wait != nil, err)
 	}
-	a, err := e.quiz.StartTest(ctx, uid, test.ID)
+	a, err := e.quiz.startTest(ctx, uid, test.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +233,7 @@ func TestTranslationFailureFallsBack(t *testing.T) {
 	stop()
 	<-done
 	// The test still opens — in the Russian master.
-	a, err := e.quiz.StartTest(ctx, kk.ID, test.ID)
+	a, err := e.quiz.startTest(ctx, kk.ID, test.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}

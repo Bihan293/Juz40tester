@@ -52,27 +52,6 @@ func (r *TranslationRepository) TranslationsForTest(ctx context.Context, testID 
 	return out, rows.Err()
 }
 
-// TranslationForQuestion returns the cached translation of ONE question, or
-// (nil, nil) when it has not been translated yet.
-func (r *TranslationRepository) TranslationForQuestion(ctx context.Context, questionID int64, lang string) (*models.QuestionTranslation, error) {
-	var tr models.QuestionTranslation
-	err := r.pool.QueryRow(ctx, `
-		SELECT tr.question_id, tr.lang, tr.question_text, tr.option_a, tr.option_b,
-		       tr.option_c, tr.option_d, tr.topic, q.correct_answer
-		FROM question_translations tr
-		JOIN questions q ON q.id = tr.question_id
-		WHERE tr.question_id = $1 AND tr.lang = $2`, questionID, lang).
-		Scan(&tr.QuestionID, &tr.Lang, &tr.Text, &tr.OptionA, &tr.OptionB,
-			&tr.OptionC, &tr.OptionD, &tr.Topic, &tr.CorrectAnswer)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &tr, nil
-}
-
 // SaveTranslations atomically stores translations for a batch of questions.
 // The model translates the OPTION TEXTS only — the correct-answer letter
 // never leaves the server: the answer key is read back from the master

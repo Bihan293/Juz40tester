@@ -159,11 +159,12 @@ func TestWeakTopicsSubjectsIsolated(t *testing.T) {
 	if w := b.weak(t, u, b.sid); len(w) != 0 {
 		t.Fatalf("subject B must not inherit subject A's mistakes, got %v", w)
 	}
-	subs, err := a.gen.SubjectsWithWeakTopics(context.Background(), u)
+	stats, err := a.gen.AllTopicStats(context.Background(), u)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !subs[a.sid] || subs[b.sid] {
+	subs := models.WeakTopicStatsBySubject(stats, 0)
+	if len(subs[a.sid]) == 0 || len(subs[b.sid]) != 0 {
 		t.Fatalf("weak subjects = %v, want only %d", subs, a.sid)
 	}
 }
@@ -214,8 +215,11 @@ func TestWeakTopicsPracticeNewQuestions(t *testing.T) {
 		t.Fatal("the next weak-topics test must be generated anew")
 	}
 	p2, _, _, _ := e.quiz.EnsurePersonalTest(ctx, u, e.sid)
+	if p2 == nil {
+		t.Fatal("the new test must exist")
+	}
 	q2, _ := e.gen.PersonalTestQuestions(ctx, p2.ID)
-	if p2 == nil || q2[0].Text == q1[0].Text {
+	if len(q2) == 0 || q2[0].Text == q1[0].Text {
 		t.Fatal("the new test must have new questions")
 	}
 

@@ -106,9 +106,3 @@ func (c *viewMetaCache) drop(attemptID int64) {
 	delete(c.entries, attemptID)
 	c.mu.Unlock()
 }
-
-func (c *viewMetaCache) len() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return len(c.entries)
-}

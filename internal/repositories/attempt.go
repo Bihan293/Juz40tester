@@ -220,58 +220,6 @@ func (r *AttemptRepository) GetAttemptForUser(ctx context.Context, attemptID, us
 	return &a, nil
 }
 
-// CurrentQuestion returns the first unanswered question of the attempt
-// (nil, nil, nil when everything is answered). One JOIN query.
-func (r *AttemptRepository) CurrentQuestion(ctx context.Context, attemptID int64) (*models.AttemptQuestion, *models.Question, error) {
-	return r.questionJoin(ctx, attemptID, 0)
-}
-
-// QuestionAtPosition returns the attempt question at a fixed position
-// (ErrNotFound when there is none). One JOIN query.
-func (r *AttemptRepository) QuestionAtPosition(ctx context.Context, attemptID int64, position int) (*models.AttemptQuestion, *models.Question, error) {
-	if position <= 0 {
-		return nil, nil, ErrNotFound
-	}
-	aq, q, err := r.questionJoin(ctx, attemptID, position)
-	if err == nil && aq == nil {
-		return nil, nil, ErrNotFound
-	}
-	return aq, q, err
-}
-
-// questionJoin loads attempt_question + question in one round trip.
-// position 0 = the first unanswered question.
-func (r *AttemptRepository) questionJoin(ctx context.Context, attemptID int64, position int) (*models.AttemptQuestion, *models.Question, error) {
-	var aq models.AttemptQuestion
-	var q models.Question
-	var sel sql.NullString
-	var orderJSON []byte
-	err := r.pool.QueryRow(ctx, `
-		SELECT aq.id, aq.attempt_id, aq.question_id, aq.position, aq.answered, aq.selected_answer, aq.is_correct, aq.option_order,
-		       q.id, q.subject_id, q.question_text, q.option_a, q.option_b, q.option_c,
-		       q.option_d, q.correct_answer, q.topic, q.difficulty
-		FROM attempt_questions aq
-		JOIN questions q ON q.id = aq.question_id
-		WHERE aq.attempt_id = $1
-		  AND (CASE WHEN $2::int = 0 THEN NOT aq.answered ELSE aq.position = $2::int END)
-		ORDER BY aq.position
-		LIMIT 1`, attemptID, position).
-		Scan(&aq.ID, &aq.AttemptID, &aq.QuestionID, &aq.Position, &aq.Answered, &sel, &aq.IsCorrect, &orderJSON,
-			&q.ID, &q.SubjectID, &q.Text, &q.OptionA, &q.OptionB, &q.OptionC,
-			&q.OptionD, &q.CorrectAnswer, &q.Topic, &q.Difficulty)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil, nil
-	}
-	if err != nil {
-		return nil, nil, err
-	}
-	aq.SelectedAnswer = sel.String
-	if aq.OptionOrder, err = decodeOptionOrder(orderJSON); err != nil {
-		return nil, nil, err
-	}
-	return &aq, &q, nil
-}
-
 // QuestionRow is everything rendering one question of an attempt needs,
 // loaded by LoadQuestionView in ONE query.
 type QuestionRow struct {
