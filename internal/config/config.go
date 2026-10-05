@@ -41,6 +41,10 @@ type Config struct {
 	// processing of one Telegram update. Long work (generation, translation)
 	// runs in the background, so a handler never needs more.
 	UpdateTimeout time.Duration
+	// TGMaxRPS (TG_MAX_RPS, default 20): global rate of outgoing Telegram
+	// calls that create / change messages (answerCallbackQuery is not
+	// limited). Calls wait for their slot instead of hitting 429.
+	TGMaxRPS int
 	// DBMinConns (DB_MIN_CONNS, default 5): connections kept open when idle
 	// (pgxpool has no "max idle": idle conns above this are closed after
 	// DBConnMaxIdleTime).
@@ -151,6 +155,7 @@ func Load() (*Config, error) {
 		MigrationDatabaseURL:   strings.TrimSpace(os.Getenv("MIGRATION_DATABASE_URL")),
 		DBMaxConns:             defaultDBMaxConns,
 		UpdateTimeout:          DefaultUpdateTimeout,
+		TGMaxRPS:               DefaultTGMaxRPS,
 		DBMinConns:             DefaultDBMinConns,
 		DBConnMaxLifetime:      DefaultDBConnMaxLifetime,
 		DBConnMaxIdleTime:      DefaultDBConnMaxIdleTime,
@@ -179,6 +184,9 @@ func Load() (*Config, error) {
 	}
 	if n, ok := envIntOpt("UPDATE_TIMEOUT_SEC"); ok && n > 0 {
 		cfg.UpdateTimeout = time.Duration(n) * time.Second
+	}
+	if n, ok := envIntOpt("TG_MAX_RPS"); ok && n > 0 {
+		cfg.TGMaxRPS = n
 	}
 	if n, ok := envIntOpt("DB_MIN_CONNS"); ok && n >= 0 {
 		cfg.DBMinConns = n
@@ -282,6 +290,9 @@ const defaultDBMaxConns = 20
 
 // DefaultUpdateTimeout bounds the processing of one Telegram update.
 const DefaultUpdateTimeout = 60 * time.Second
+
+// DefaultTGMaxRPS is the default TG_MAX_RPS.
+const DefaultTGMaxRPS = 20
 
 const (
 	// DefaultGenWorkers is the default size of the generation worker pool.
