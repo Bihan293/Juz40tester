@@ -81,3 +81,96 @@ func (r *CleanupRepository) DeleteEmptyAbandonedAttempts(ctx context.Context, ol
 	}
 	return tag.RowsAffected(), nil
 }
+
+// DeleteOldTranslationJobs removes up to limit translation_jobs in status
+// done last updated before olderThan (A3). Safe: a test that turns out to be
+// incompletely translated simply gets a fresh job row on the next request.
+func (r *CleanupRepository) DeleteOldTranslationJobs(ctx context.Context, olderThan time.Duration, limit int) (int64, error) {
+	tag, err := r.pool.Exec(ctx, `
+		DELETE FROM translation_jobs
+		WHERE id IN (
+			SELECT id FROM translation_jobs
+			WHERE status = 'done'
+			  AND updated_at < now() - make_interval(secs => $1)
+			LIMIT $2)`, durationSecs(olderThan), limit)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// DeleteStaleTemplates removes up to limit ownerless hidden personal-test
+// templates (left by «🏁 Закончить тест») created before olderThan (A3; the
+// schema has no last-access date, so the creation date is used). Their
+// questions are deleted with the same guard as DeletePersonalTest: only
+// questions no other test references. Returns the number of templates.
+func (r *CleanupRepository) DeleteStaleTemplates(ctx context.Context, olderThan time.Duration, limit int) (int64, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	rows, err := tx.Query(ctx, `
+		SELECT id FROM tests
+		WHERE kind = 'personal' AND owner_user_id IS NULL AND NOT is_active
+		  AND created_at < now() - make_interval(secs => $1)
+		ORDER BY id
+		LIMIT $2
+		FOR UPDATE SKIP LOCKED`, durationSecs(olderThan), limit)
+	if err != nil {
+		return 0, err
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil || len(ids) == 0 {
+		return 0, err
+	}
+	var qids []int64
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(array_agg(DISTINCT question_id), '{}')
+		FROM test_questions WHERE test_id = ANY($1::bigint[])`, ids).Scan(&qids); err != nil {
+		return 0, err
+	}
+	tag, err := tx.Exec(ctx, `DELETE FROM tests WHERE id = ANY($1::bigint[])`, ids)
+	if err != nil {
+		return 0, err
+	}
+	if len(qids) > 0 {
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM questions q
+			WHERE q.id = ANY($1::bigint[])
+			  AND NOT EXISTS (SELECT 1 FROM test_questions tq WHERE tq.question_id = q.id)`, qids); err != nil {
+			return 0, err
+		}
+	}
+	return tag.RowsAffected(), tx.Commit(ctx)
+}
+
+// DeleteOrphanPersonalDone removes up to limit user_personal_done rows whose
+// lineage is gone entirely: neither the root test nor any clone of it
+// exists (A3). olderThan is unused. A row whose ROOT was deleted while
+// clones of the lineage remain is kept on purpose — it still stops the user
+// from getting those clones (the same questions) again; that is also why no
+// ON DELETE CASCADE foreign key to tests(id) is added.
+func (r *CleanupRepository) DeleteOrphanPersonalDone(ctx context.Context, _ time.Duration, limit int) (int64, error) {
+	tag, err := r.pool.Exec(ctx, `
+		DELETE FROM user_personal_done
+		WHERE (user_id, root_test_id) IN (
+			SELECT d.user_id, d.root_test_id FROM user_personal_done d
+			WHERE NOT EXISTS (
+				SELECT 1 FROM tests t
+				WHERE t.id = d.root_test_id OR t.origin_test_id = d.root_test_id)
+			LIMIT $1)`, limit)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}

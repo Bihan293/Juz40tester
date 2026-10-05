@@ -116,6 +116,12 @@ type Config struct {
 	// generation jobs older than this are deleted.
 	CleanupAttemptDays int
 	CleanupJobDays     int
+	// A3: TemplateTTLDays (TEMPLATE_TTL_DAYS, default 60): ownerless hidden
+	// personal-test templates older than this are deleted.
+	// TranslationJobTTLDays (TRANSLATION_JOB_TTL_DAYS, default 1): done
+	// translation jobs older than this are deleted.
+	TemplateTTLDays       int
+	TranslationJobTTLDays int
 
 	OffPeakStartHour int  // custom window start (inclusive); -1 = official schedule
 	OffPeakEndHour   int  // custom window end (exclusive)
@@ -153,6 +159,8 @@ func Load() (*Config, error) {
 		ReaperInterval:         DefaultReaperInterval,
 		HealthCacheTTL:         DefaultHealthCacheTTL,
 		CleanupAttemptDays:     DefaultCleanupAttemptDays,
+		TemplateTTLDays:        DefaultTemplateTTLDays,
+		TranslationJobTTLDays:  DefaultTranslationJobTTLDays,
 		CleanupJobDays:         DefaultCleanupJobDays,
 		ChainCacheTTL:          DefaultChainCacheTTL,
 	}
@@ -198,6 +206,12 @@ func Load() (*Config, error) {
 	}
 	if n, ok := envIntOpt("CLEANUP_ATTEMPT_DAYS"); ok && n > 0 {
 		cfg.CleanupAttemptDays = n
+	}
+	if n, ok := envIntOpt("TEMPLATE_TTL_DAYS"); ok && n > 0 {
+		cfg.TemplateTTLDays = n
+	}
+	if n, ok := envIntOpt("TRANSLATION_JOB_TTL_DAYS"); ok && n > 0 {
+		cfg.TranslationJobTTLDays = n
 	}
 	if n, ok := envIntOpt("CLEANUP_JOB_DAYS"); ok && n > 0 {
 		cfg.CleanupJobDays = n
@@ -285,6 +299,9 @@ const (
 	// R-8a cleanup retention defaults (days).
 	DefaultCleanupAttemptDays = 45
 	DefaultCleanupJobDays     = 14
+	// A3 retention defaults (days).
+	DefaultTemplateTTLDays       = 60
+	DefaultTranslationJobTTLDays = 1
 	// R-10a pool defaults.
 	DefaultDBMinConns        = 5
 	DefaultDBConnMaxLifetime = 30 * time.Minute
