@@ -109,23 +109,6 @@ func (r *GenerationRepository) WeakTopicStats(ctx context.Context, userID, subje
 	return models.WeakTopicStats(stats, limit), nil
 }
 
-// SubjectsWithWeakTopics returns the ids of subjects in which the user has
-// at least one weak topic — EXACTLY the same definition as WeakTopics. The
-// «🎯 Слабые темы» picker lists only these subjects.
-func (r *GenerationRepository) SubjectsWithWeakTopics(ctx context.Context, userID int64) (map[int64]bool, error) {
-	stats, err := r.AllTopicStats(ctx, userID)
-	if err != nil {
-		return nil, err
-	}
-	out := map[int64]bool{}
-	for _, s := range stats {
-		if s.IsWeak() {
-			out[s.SubjectID] = true
-		}
-	}
-	return out, nil
-}
-
 // scanTest scans a tests row (id, subject_id, test_number, title, is_active,
 // kind, topics, owner_user_id, topics_fingerprint) into a models.Test.
 // Returns (nil, nil) when the row does not exist.

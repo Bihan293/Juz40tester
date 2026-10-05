@@ -104,7 +104,7 @@ func TestSubjectScreenBatchedResumeAndClamp(t *testing.T) {
 		t.Fatalf("want 2 tests, got %d", len(chain))
 	}
 	// In-progress attempt only on Тест 2.
-	if _, err := e.quiz.StartTest(ctx, u, chain[1].ID); err != nil {
+	if _, err := e.quiz.startTest(ctx, u, chain[1].ID, false); err != nil {
 		t.Fatal(err)
 	}
 	scr, err := e.quiz.GetSubjectScreen(ctx, u, e.sid, 0, false)
@@ -163,7 +163,7 @@ func TestQuestionViewMetaTranslationRules(t *testing.T) {
 	}
 	e.drain(t)
 	t1 := e.chain(t)[0]
-	a, err := e.quiz.StartTest(ctx, uid, t1.ID)
+	a, err := e.quiz.startTest(ctx, uid, t1.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,10 +171,11 @@ func TestQuestionViewMetaTranslationRules(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	meta, err := e.subjects.TestViewMeta(ctx, t1.ID, models.TestLangKK)
+	row, err := e.quiz.attempts.LoadQuestionView(ctx, a.ID, uid, 1, true, models.TestLangKK)
 	if err != nil {
 		t.Fatal(err)
 	}
+	meta := row.Meta
 	if meta.Total != len(qs) || meta.Translated != 0 {
 		t.Fatalf("meta %+v, want total %d translated 0", *meta, len(qs))
 	}

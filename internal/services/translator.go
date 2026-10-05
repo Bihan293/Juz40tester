@@ -166,17 +166,6 @@ func (t *TranslatorService) TranslateTest(ctx context.Context, testID int64, que
 	return cached, nil
 }
 
-// TranslationFor returns the cached Kazakh translation of ONE question, or
-// (nil, nil) when it does not exist yet. Used when rendering questions —
-// translations are bulk-created by TranslateTest when the test is opened,
-// so this is a pure DB lookup with zero API cost.
-func (t *TranslatorService) TranslationFor(ctx context.Context, questionID int64, lang string) (*models.QuestionTranslation, error) {
-	if !t.Enabled() {
-		return nil, nil
-	}
-	return t.repo.TranslationForQuestion(ctx, questionID, lang)
-}
-
 // TranslatedCount returns how many of the given questions already have a
 // cached Kazakh translation. Pure DB lookup, zero API cost — used to decide
 // whether opening a test will trigger the one-time translation run.

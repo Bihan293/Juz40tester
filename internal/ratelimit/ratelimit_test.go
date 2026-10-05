@@ -56,8 +56,11 @@ func TestRateLimitBurstConcurrent(t *testing.T) {
 // TestRateLimitDisabledAndBounded: interval 0 disables the limiter; stale
 // keys are swept so memory stays bounded.
 func TestRateLimitDisabledAndBounded(t *testing.T) {
-	if l := New(0); !l.Allow(1) || !l.Allow(1) {
-		t.Fatal("disabled limiter must allow everything")
+	l0 := New(0)
+	for i := 0; i < 2; i++ {
+		if !l0.Allow(1) {
+			t.Fatal("disabled limiter must allow everything")
+		}
 	}
 	var nilL *Limiter
 	if !nilL.Allow(1) {

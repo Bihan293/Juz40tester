@@ -78,11 +78,6 @@ func (s *QuizService) GetTest(ctx context.Context, testID int64) (*models.Test, 
 	return s.subjects.GetTest(ctx, testID)
 }
 
-// TestQuestionCount returns how many questions are attached to a test.
-func (s *QuizService) TestQuestionCount(ctx context.Context, testID int64) (int, error) {
-	return s.subjects.TestQuestionCount(ctx, testID)
-}
-
 // ResumeOrNil returns the user's unfinished attempt for a test, or nil.
 func (s *QuizService) ResumeOrNil(ctx context.Context, userID, testID int64) (*models.TestAttempt, error) {
 	return s.attempts.GetActiveAttempt(ctx, userID, testID)
@@ -460,28 +455,6 @@ func (s *QuizService) ReviveChainTest(ctx context.Context, subjectID int64, test
 	s.genSvc.reviveChainTest(ctx, subjectID, testNumber, userID)
 }
 
-// SubjectsWithWeakTopics returns only the subjects in which the user has at
-// least one weak (🔴/🟡) topic — the «🎯 Слабые темы» picker must not offer
-// subjects the user never practised (there is nothing to build a personal
-// test from, and tapping such a subject used to hang in «generating…»).
-func (s *QuizService) SubjectsWithWeakTopics(ctx context.Context, userID int64) ([]models.Subject, error) {
-	all, err := s.subjects.List(ctx)
-	if err != nil {
-		return nil, err
-	}
-	weak, err := s.gen.SubjectsWithWeakTopics(ctx, userID)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]models.Subject, 0, len(weak))
-	for _, subj := range all {
-		if weak[subj.ID] {
-			out = append(out, subj)
-		}
-	}
-	return out, nil
-}
-
 // WeakMenu returns, in ONE topic-stats query (+ the subject list), the
 // subjects with weak topics and their weak topics (worst first, at most
 // limit each) for the «🎯 Слабые темы» picker (R-10a: no N+1).
@@ -502,12 +475,6 @@ func (s *QuizService) WeakMenu(ctx context.Context, userID int64, limit int) ([]
 		}
 	}
 	return out, weak, nil
-}
-
-// WeakTopicStats returns the user's weak topics of the subject with their
-// statistics (worst first) for the «🎯 Слабые темы» screen.
-func (s *QuizService) WeakTopicStats(ctx context.Context, userID, subjectID int64, limit int) ([]models.TopicStat, error) {
-	return s.gen.WeakTopicStats(ctx, userID, subjectID, limit)
 }
 
 // ChainTestStatus reports whether chain test #number of the subject already
@@ -609,14 +576,6 @@ func (s *QuizService) FinishPersonalTest(ctx context.Context, userID, testID int
 		return repositories.ErrNotFound
 	}
 	return s.gen.DeletePersonalTest(ctx, userID, testID, test.SubjectID)
-}
-
-// StartTest creates a brand-new attempt of the given test with shuffled
-// questions and shuffled answer options. Every launch is a separate
-// test_attempt; the shuffled orders are persisted in attempt_questions so a
-// resumed attempt keeps its original order.
-func (s *QuizService) StartTest(ctx context.Context, userID, testID int64) (*models.TestAttempt, error) {
-	return s.startTest(ctx, userID, testID, false)
 }
 
 // RestartTest starts a brand-new attempt («🔄 Пройти ещё раз»): any attempt
@@ -1019,26 +978,6 @@ func (s *QuizService) subjectTranslatable(ctx context.Context, subjectID int64) 
 	return !models.IsLanguageSubject(subject.Name)
 }
 
-// testTranslatable is subjectTranslatable for the subject of a test.
-func (s *QuizService) testTranslatable(ctx context.Context, testID int64) bool {
-	test, err := s.subjects.GetTest(ctx, testID)
-	if err != nil {
-		log.Printf("test %d lookup for translation check: %v", testID, err)
-		return false
-	}
-	return s.subjectTranslatable(ctx, test.SubjectID)
-}
-
-// wantsTranslation reports whether the test must be served in Kazakh to this
-// user: the user picked 🇰🇿, a translator is configured and the test does
-// NOT belong to a language subject.
-func (s *QuizService) wantsTranslation(ctx context.Context, user *models.User, testID int64) bool {
-	if user == nil || user.TestLang != models.TestLangKK || s.translator == nil || !s.translator.Enabled() {
-		return false
-	}
-	return s.testTranslatable(ctx, testID)
-}
-
 // TestNeedsTranslationFor is TestNeedsTranslation for an already loaded
 // test row: it skips re-reading the tests row (R-2, test open path).
 func (s *QuizService) TestNeedsTranslationFor(ctx context.Context, user *models.User, test *models.Test) bool {
@@ -1046,12 +985,4 @@ func (s *QuizService) TestNeedsTranslationFor(ctx context.Context, user *models.
 		return false
 	}
 	return s.subjectTranslatable(ctx, test.SubjectID)
-}
-
-// TestNeedsTranslation is the handler-facing check: true only when opening
-// this test should make sure its Kazakh version exists. Language subjects
-// (Русский/Английский/Казахский язык, литература) always return false —
-// they are shown in the original language and never sent to the translator.
-func (s *QuizService) TestNeedsTranslation(ctx context.Context, user *models.User, testID int64) bool {
-	return s.wantsTranslation(ctx, user, testID)
 }

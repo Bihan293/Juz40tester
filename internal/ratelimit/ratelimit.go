@@ -38,14 +38,6 @@ func (l *Limiter) WithClock(now func() time.Time) *Limiter {
 	return l
 }
 
-// Interval returns the configured interval.
-func (l *Limiter) Interval() time.Duration {
-	if l == nil {
-		return 0
-	}
-	return l.interval
-}
-
 // Allow reports whether key may act now and, if so, records the action.
 // A rejected action does NOT move the window, so a user who keeps tapping
 // gets through again exactly Interval after the last accepted action.

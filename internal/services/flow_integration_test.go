@@ -238,20 +238,22 @@ func (e *flowEnv) setStatuses(t *testing.T, userID, testID int64, green, yellow 
 func (e *flowEnv) play(t *testing.T, userID, testID int64, right func(topic string) bool) int {
 	t.Helper()
 	ctx := context.Background()
-	a, err := e.quiz.StartTest(ctx, userID, testID)
+	a, err := e.quiz.startTest(ctx, userID, testID, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	n, err := e.quiz.TestQuestionCount(ctx, testID)
+	qs, err := e.subjects.TestQuestions(ctx, testID)
 	if err != nil {
 		t.Fatal(err)
 	}
+	n := len(qs)
 	correct := 0
 	for pos := 1; pos <= n; pos++ {
-		_, q, err := e.attempts.QuestionAtPosition(ctx, a.ID, pos)
-		if err != nil {
+		row, err := e.attempts.LoadQuestionView(ctx, a.ID, userID, pos, false, "")
+		if err != nil || row.Question == nil {
 			t.Fatal(err)
 		}
+		q := row.Question
 		ans := q.CorrectAnswer
 		if right(q.Topic) {
 			correct++

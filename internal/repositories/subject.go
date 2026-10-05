@@ -107,14 +107,6 @@ func (r *SubjectRepository) listTests(ctx context.Context, subjectID int64, kind
 	return out, rows.Err()
 }
 
-// TestQuestionCount returns how many questions are attached to a test.
-func (r *SubjectRepository) TestQuestionCount(ctx context.Context, testID int64) (int, error) {
-	var n int
-	err := r.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM test_questions WHERE test_id = $1`, testID).Scan(&n)
-	return n, err
-}
-
 // GetTest returns a test by id.
 func (r *SubjectRepository) GetTest(ctx context.Context, id int64) (*models.Test, error) {
 	var t models.Test
@@ -159,28 +151,6 @@ func (r *SubjectRepository) TestQuestions(ctx context.Context, testID int64) ([]
 			return nil, err
 		}
 		out = append(out, q)
-	}
-	return out, rows.Err()
-}
-
-// QuestionStatuses returns knowledge statuses of the user for given questions.
-func (r *SubjectRepository) QuestionStatuses(ctx context.Context, userID int64, questionIDs []int64) (map[int64]int, error) {
-	rows, err := r.pool.Query(ctx, `
-		SELECT question_id, status FROM user_question_progress
-		WHERE user_id = $1 AND question_id = ANY($2)`, userID, questionIDs)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	out := make(map[int64]int, len(questionIDs))
-	for rows.Next() {
-		var qid int64
-		var status int
-		if err := rows.Scan(&qid, &status); err != nil {
-			return nil, err
-		}
-		out[qid] = status
 	}
 	return out, rows.Err()
 }
@@ -352,31 +322,6 @@ type TestViewMeta struct {
 	Total       int    // questions attached to the test
 	SubjectName string // subject of the test (language subjects are never translated)
 	Translated  int    // test questions that have a cached translation in lang
-}
-
-// TestViewMeta loads, in ONE query, the question count, the subject name and
-// the number of translated questions of a test (replaces TestQuestionCount +
-// GetByID + TestQuestions + TranslatedQuestionCount per rendered question).
-func (r *SubjectRepository) TestViewMeta(ctx context.Context, testID int64, lang string) (*TestViewMeta, error) {
-	var m TestViewMeta
-	err := r.pool.QueryRow(ctx, `
-		SELECT s.name,
-		       (SELECT COUNT(*) FROM test_questions tq WHERE tq.test_id = t.id),
-		       (SELECT COUNT(DISTINCT tr.question_id)
-		          FROM test_questions tq
-		          JOIN question_translations tr
-		            ON tr.question_id = tq.question_id AND tr.lang = $2
-		         WHERE tq.test_id = t.id)
-		FROM tests t
-		JOIN subjects s ON s.id = t.subject_id
-		WHERE t.id = $1`, testID, lang).Scan(&m.SubjectName, &m.Total, &m.Translated)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &m, nil
 }
 
 // UnlockedTestsLeaderboard ranks users by their chain LEVEL in the subject

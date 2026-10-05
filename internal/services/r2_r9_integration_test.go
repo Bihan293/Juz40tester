@@ -83,15 +83,15 @@ func TestCreateAttemptBatchInsert(t *testing.T) {
 		t.Fatalf("stored %d questions, want %d", n, len(qs))
 	}
 	// The JOINed loaders agree with the stored rows.
-	aq, q, err := e.attempts.CurrentQuestion(ctx, a.ID)
-	if err != nil || aq.Position != 1 || q.ID != ids[0] || aq.OptionOrder[0] != orders[0][0] {
-		t.Fatalf("CurrentQuestion: %+v %+v %v", aq, q, err)
+	cur, err := e.attempts.LoadQuestionView(ctx, a.ID, uid, 0, false, "")
+	if err != nil || cur.AQ == nil || cur.AQ.Position != 1 || cur.Question.ID != ids[0] || cur.AQ.OptionOrder[0] != orders[0][0] {
+		t.Fatalf("current question: %+v %v", cur, err)
 	}
-	aq, q, err = e.attempts.QuestionAtPosition(ctx, a.ID, 5)
-	if err != nil || aq.Position != 5 || q.ID != ids[4] {
-		t.Fatalf("QuestionAtPosition: %+v %+v %v", aq, q, err)
+	at5, err := e.attempts.LoadQuestionView(ctx, a.ID, uid, 5, false, "")
+	if err != nil || at5.AQ == nil || at5.AQ.Position != 5 || at5.Question.ID != ids[4] {
+		t.Fatalf("question at position: %+v %v", at5, err)
 	}
-	if _, _, err := e.attempts.QuestionAtPosition(ctx, a.ID, 999); !errors.Is(err, repositories.ErrNotFound) {
+	if _, err := e.quiz.QuestionAtPosition(ctx, a.ID, &models.User{ID: uid}, 999); !errors.Is(err, repositories.ErrNotFound) {
 		t.Fatalf("missing position: %v", err)
 	}
 }
@@ -106,7 +106,7 @@ func TestQuestionViewOwnershipAndMetaCache(t *testing.T) {
 	uid := e.user(t, "Owner")
 	other := e.user(t, "Stranger")
 	t1 := e.readyTest(t)
-	a, err := e.quiz.StartTest(ctx, uid, t1.ID)
+	a, err := e.quiz.startTest(ctx, uid, t1.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,16 @@ func TestQuestionViewOwnershipAndMetaCache(t *testing.T) {
 	for i := range qs {
 		ids[i] = qs[i].ID
 	}
-	st, _ := e.subjects.QuestionStatuses(ctx, uid, ids)
+	st := map[int64]int{}
+	rows, _ := e.pool.Query(ctx, `SELECT question_id, status FROM user_question_progress
+		WHERE user_id = $1 AND question_id = ANY($2)`, uid, ids)
+	for rows.Next() {
+		var qid int64
+		var s int
+		_ = rows.Scan(&qid, &s)
+		st[qid] = s
+	}
+	rows.Close()
 	want := map[int]int{0: 0, 1: 0, 2: 0}
 	for _, id := range ids {
 		want[st[id]]++
@@ -185,17 +194,18 @@ func TestParallelAnswersAtomic(t *testing.T) {
 	uid := e.user(t, "Parallel")
 	other := e.user(t, "Intruder")
 	t1 := e.readyTest(t)
-	a, err := e.quiz.StartTest(ctx, uid, t1.ID)
+	a, err := e.quiz.startTest(ctx, uid, t1.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	const total = 20
 	var finished, counted int32
 	for pos := 1; pos <= total; pos++ {
-		_, q, err := e.attempts.QuestionAtPosition(ctx, a.ID, pos)
-		if err != nil {
+		row, err := e.attempts.LoadQuestionView(ctx, a.ID, uid, pos, false, "")
+		if err != nil || row.Question == nil {
 			t.Fatal(err)
 		}
+		q := row.Question
 		var wg sync.WaitGroup
 		for i := 0; i < 8; i++ {
 			wg.Add(1)

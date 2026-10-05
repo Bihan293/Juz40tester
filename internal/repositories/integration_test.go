@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Bihan293/Juz40tester/internal/database"
@@ -219,12 +220,14 @@ func TestQualitySweepRepository(t *testing.T) {
 	if q.CorrectAnswer != "A" || q.OptionA != fixed.Options[0] || q.Topic != "Тире" {
 		t.Fatalf("rewrite not applied: %+v", q)
 	}
-	st, err := subjects.QuestionStatuses(ctx, user.ID, []int64{bad.ID})
 	// A rewritten question is a NEW question: the old 🟢/🟡 must be reset.
-	if err != nil {
+	st := models.StatusNone
+	err = pool.QueryRow(ctx, `SELECT status FROM user_question_progress
+		WHERE user_id = $1 AND question_id = $2`, user.ID, bad.ID).Scan(&st)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatal(err)
 	}
-	if s, ok := st[bad.ID]; ok && s != models.StatusNone {
+	if st != models.StatusNone {
 		t.Fatalf("stale progress kept after rewrite: %v", st)
 	}
 
