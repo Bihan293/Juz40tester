@@ -178,14 +178,15 @@ func main() {
 	go func() {
 		defer bgWG.Done()
 		runCleanup(workerCtx, cleanupRepo, cleanupSettings{
-			attemptAge:  time.Duration(cfg.CleanupAttemptDays) * 24 * time.Hour,
-			jobAge:      time.Duration(cfg.CleanupJobDays) * 24 * time.Hour,
-			emptyAge:    emptyAbandonedAge,
-			templateAge: time.Duration(cfg.TemplateTTLDays) * 24 * time.Hour,
-			trJobAge:    time.Duration(cfg.TranslationJobTTLDays) * 24 * time.Hour,
-			firstDelay:  10 * time.Minute,
-			interval:    24 * time.Hour,
-			pause:       time.Second,
+			attemptAge:         time.Duration(cfg.CleanupAttemptDays) * 24 * time.Hour,
+			jobAge:             time.Duration(cfg.CleanupJobDays) * 24 * time.Hour,
+			emptyAge:           emptyAbandonedAge,
+			templateAge:        time.Duration(cfg.TemplateTTLDays) * 24 * time.Hour,
+			trJobAge:           time.Duration(cfg.TranslationJobTTLDays) * 24 * time.Hour,
+			finishedAttemptAge: time.Duration(cfg.AttemptTTLDays) * 24 * time.Hour,
+			firstDelay:         10 * time.Minute,
+			interval:           24 * time.Hour,
+			pause:              time.Second,
 		})
 	}()
 

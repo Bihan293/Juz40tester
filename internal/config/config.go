@@ -122,6 +122,9 @@ type Config struct {
 	// translation jobs older than this are deleted.
 	TemplateTTLDays       int
 	TranslationJobTTLDays int
+	// AttemptTTLDays (ATTEMPT_TTL_DAYS, default 180): finished attempts older
+	// than this are deleted, except the latest and the best per (user, test).
+	AttemptTTLDays int
 
 	OffPeakStartHour int  // custom window start (inclusive); -1 = official schedule
 	OffPeakEndHour   int  // custom window end (exclusive)
@@ -161,6 +164,7 @@ func Load() (*Config, error) {
 		CleanupAttemptDays:     DefaultCleanupAttemptDays,
 		TemplateTTLDays:        DefaultTemplateTTLDays,
 		TranslationJobTTLDays:  DefaultTranslationJobTTLDays,
+		AttemptTTLDays:         DefaultAttemptTTLDays,
 		CleanupJobDays:         DefaultCleanupJobDays,
 		ChainCacheTTL:          DefaultChainCacheTTL,
 	}
@@ -206,6 +210,9 @@ func Load() (*Config, error) {
 	}
 	if n, ok := envIntOpt("CLEANUP_ATTEMPT_DAYS"); ok && n > 0 {
 		cfg.CleanupAttemptDays = n
+	}
+	if n, ok := envIntOpt("ATTEMPT_TTL_DAYS"); ok && n > 0 {
+		cfg.AttemptTTLDays = n
 	}
 	if n, ok := envIntOpt("TEMPLATE_TTL_DAYS"); ok && n > 0 {
 		cfg.TemplateTTLDays = n
@@ -302,6 +309,7 @@ const (
 	// A3 retention defaults (days).
 	DefaultTemplateTTLDays       = 60
 	DefaultTranslationJobTTLDays = 1
+	DefaultAttemptTTLDays        = 180
 	// R-10a pool defaults.
 	DefaultDBMinConns        = 5
 	DefaultDBConnMaxLifetime = 30 * time.Minute

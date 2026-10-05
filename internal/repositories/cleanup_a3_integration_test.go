@@ -56,3 +56,48 @@ func TestCleanupStaleTemplatesKeepsSharedQuestions(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestCleanupOldFinishedAttemptsKeepsBestAndLatest (A3): of four old
+// finished attempts only the best and the latest survive.
+func TestCleanupOldFinishedAttemptsKeepsBestAndLatest(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	gen := NewGenerationRepository(pool)
+	cl := NewCleanupRepository(pool)
+	u, err := NewUserRepository(pool).Upsert(ctx, &models.User{TelegramID: time.Now().UnixNano()%1_000_000_000 + 5_000_000_000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid, err := testutil.CreateSubject(ctx, pool, "Попытки "+time.Now().Format("150405.000000"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	qs := []models.SeedQuestion{{Text: "В", Options: [4]string{"a", "b", "c", "d"}, Topic: "Т", Difficulty: 2}}
+	tst, err := gen.CreateGeneratedTest(ctx, &models.Test{SubjectID: sid, TestNumber: 1, Title: "C", Kind: models.TestKindChain}, qs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []int64
+	for _, c := range []int{3, 9, 1, 2} { // best = 9, latest = 2
+		var id int64
+		if err := pool.QueryRow(ctx, `INSERT INTO test_attempts (user_id, test_id, status, correct_count, updated_at)
+			VALUES ($1, $2, 'completed', $3, now() - interval '400 days') RETURNING id`, u.ID, tst.ID, c).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if _, err := cl.DeleteOldFinishedAttempts(ctx, 180*24*time.Hour, CleanupBatchSize); err != nil {
+		t.Fatal(err)
+	}
+	var left []int64
+	rows, _ := pool.Query(ctx, `SELECT id FROM test_attempts WHERE user_id = $1 ORDER BY id`, u.ID)
+	for rows.Next() {
+		var id int64
+		_ = rows.Scan(&id)
+		left = append(left, id)
+	}
+	rows.Close()
+	if len(left) != 2 || left[0] != ids[1] || left[1] != ids[3] {
+		t.Fatalf("left %v, want [%d %d]", left, ids[1], ids[3])
+	}
+}

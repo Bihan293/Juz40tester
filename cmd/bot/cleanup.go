@@ -20,11 +20,13 @@ type cleanupStore interface {
 	DeleteOldTranslationJobs(ctx context.Context, olderThan time.Duration, limit int) (int64, error)
 	DeleteStaleTemplates(ctx context.Context, olderThan time.Duration, limit int) (int64, error)
 	DeleteOrphanPersonalDone(ctx context.Context, olderThan time.Duration, limit int) (int64, error)
+	DeleteOldFinishedAttempts(ctx context.Context, olderThan time.Duration, limit int) (int64, error)
 }
 
 type cleanupSettings struct {
 	attemptAge, jobAge, emptyAge time.Duration
 	templateAge, trJobAge        time.Duration
+	finishedAttemptAge           time.Duration
 	firstDelay, interval, pause  time.Duration
 }
 
@@ -58,6 +60,7 @@ func cleanupOnce(ctx context.Context, store cleanupStore, s cleanupSettings) {
 		{"done translation_jobs", s.trJobAge, store.DeleteOldTranslationJobs},
 		{"stale personal-test templates", s.templateAge, store.DeleteStaleTemplates},
 		{"orphan user_personal_done rows", 0, store.DeleteOrphanPersonalDone},
+		{"old finished attempts", s.finishedAttemptAge, store.DeleteOldFinishedAttempts},
 	}
 	for _, st := range steps {
 		total := deleteInBatches(ctx, st.age, s.pause, st.del)
