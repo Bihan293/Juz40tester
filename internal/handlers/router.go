@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/Bihan293/Juz40tester/internal/bot"
+	"github.com/Bihan293/Juz40tester/internal/models"
 )
 
 // Callback data prefixes (kept short — Telegram limit is 64 bytes).
@@ -128,6 +129,9 @@ func (h *Handler) handleCallback(ctx context.Context, cb *bot.CallbackQuery) {
 	// тест генерируется…» popups never showed because the router answered
 	// the callback BEFORE the handlers did). The router therefore answers
 	// nothing; each handler acknowledges the callback itself.
+	if h.routeByID(ctx, cb, user, data) {
+		return
+	}
 	switch {
 	case data == cbNoop:
 		h.answerCallback(ctx, cb, "")
@@ -145,82 +149,11 @@ func (h *Handler) handleCallback(ctx context.Context, cb *bot.CallbackQuery) {
 	case data == cbWeakMenu:
 		h.answerCallback(ctx, cb, "")
 		h.editWeakMenu(ctx, cb, user)
-	case strings.HasPrefix(data, cbWeakSubject):
-		// openWeakSubject answers the callback itself (the result decides the
-		// text: a toast, an error, or a silent transition into the test).
-		id, err := strconv.ParseInt(strings.TrimPrefix(data, cbWeakSubject), 10, 64)
-		if err != nil {
-			h.answerCallback(ctx, cb, "")
-			return
-		}
-		h.openWeakSubject(ctx, cb, user, id)
-	case strings.HasPrefix(data, cbFinish):
-		// finishPersonalTest answers the callback itself.
-		id, err := strconv.ParseInt(strings.TrimPrefix(data, cbFinish), 10, 64)
-		if err != nil {
-			h.answerCallback(ctx, cb, "")
-			return
-		}
-		h.finishPersonalTest(ctx, cb, user, id)
-	case strings.HasPrefix(data, cbSubject):
-		h.answerCallback(ctx, cb, "")
-		id, err := strconv.ParseInt(strings.TrimPrefix(data, cbSubject), 10, 64)
-		if err != nil {
-			return
-		}
-		h.openSubject(ctx, cb, user, id)
-	case strings.HasPrefix(data, cbOpenTest):
-		// openTest answers the callback itself: a locked test shows the
-		// unlock requirements as a toast — the router must not consume the
-		// single allowed answer with an empty one first.
-		id, err := strconv.ParseInt(strings.TrimPrefix(data, cbOpenTest), 10, 64)
-		if err != nil {
-			h.answerCallback(ctx, cb, "")
-			return
-		}
-		h.openTest(ctx, cb, user, id)
 	case strings.HasPrefix(data, cbAnswer):
 		h.handleAnswer(ctx, cb, user, data)
-	case strings.HasPrefix(data, cbExitYes):
-		// exitTest answers the callback itself ("Прогресс сохранён").
-		id, err := strconv.ParseInt(strings.TrimPrefix(data, cbExitYes), 10, 64)
-		if err != nil {
-			h.answerCallback(ctx, cb, "")
-			return
-		}
-		h.exitTest(ctx, cb, user, id)
-	case strings.HasPrefix(data, cbExitNo):
-		// cancelExit answers the callback itself ("Продолжаем 💪").
-		id, err := strconv.ParseInt(strings.TrimPrefix(data, cbExitNo), 10, 64)
-		if err != nil {
-			h.answerCallback(ctx, cb, "")
-			return
-		}
-		h.cancelExit(ctx, cb, user, id)
-	case strings.HasPrefix(data, cbExit):
-		h.answerCallback(ctx, cb, "")
-		id, err := strconv.ParseInt(strings.TrimPrefix(data, cbExit), 10, 64)
-		if err != nil {
-			return
-		}
-		h.confirmExit(ctx, cb, user, id)
-	case strings.HasPrefix(data, cbRetry):
-		h.answerCallback(ctx, cb, "")
-		id, err := strconv.ParseInt(strings.TrimPrefix(data, cbRetry), 10, 64)
-		if err != nil {
-			return
-		}
-		h.retryTest(ctx, cb, user, id)
 	case data == cbProgress:
 		h.answerCallback(ctx, cb, "")
 		h.editProgress(ctx, cb, user)
-	case strings.HasPrefix(data, cbProgSubject):
-		h.answerCallback(ctx, cb, "")
-		id, err := strconv.ParseInt(strings.TrimPrefix(data, cbProgSubject), 10, 64)
-		if err != nil {
-			return
-		}
-		h.showSubjectProgress(ctx, cb, user, id)
 	case data == cbSettings:
 		h.answerCallback(ctx, cb, "")
 		h.editSettings(ctx, cb, user)
@@ -233,14 +166,64 @@ func (h *Handler) handleCallback(ctx context.Context, cb *bot.CallbackQuery) {
 	case data == cbLbStreak:
 		h.answerCallback(ctx, cb, "")
 		h.showStreakLeaderboard(ctx, cb)
-	case strings.HasPrefix(data, cbLbSubject):
-		h.answerCallback(ctx, cb, "")
-		id, err := strconv.ParseInt(strings.TrimPrefix(data, cbLbSubject), 10, 64)
-		if err != nil {
-			return
-		}
-		h.showSubjectLeaderboard(ctx, cb, id)
 	default:
 		h.answerCallback(ctx, cb, "")
 	}
+}
+
+// idRoute is a callback whose data is prefix + numeric id (A7). ack = the
+// router acknowledges the callback (silently) before calling fn; otherwise
+// fn answers the callback itself. A malformed id is acknowledged silently
+// and nothing else happens — the behaviour of the former switch cases.
+type idRoute struct {
+	prefix string
+	ack    bool
+	fn     func(h *Handler, ctx context.Context, cb *bot.CallbackQuery, user *models.User, id int64)
+}
+
+// idRoutes: a new numeric-id section is one line here. Order matters where
+// prefixes overlap: cbExitYes / cbExitNo must precede cbExit.
+var idRoutes = []idRoute{
+	{cbWeakSubject, false, (*Handler).openWeakSubject},    // answers itself (toast / error / silent)
+	{cbFinish, false, (*Handler).finishPersonalTest},      // answers itself
+	{cbSubject, true, (*Handler).openSubject},             //
+	{cbOpenTest, false, (*Handler).openTest},              // answers itself (unlock requirements toast)
+	{cbExitYes, false, (*Handler).exitTest},               // answers itself («Прогресс сохранён»)
+	{cbExitNo, false, (*Handler).cancelExit},              // answers itself («Продолжаем 💪»)
+	{cbExit, true, (*Handler).confirmExit},                //
+	{cbRetry, true, (*Handler).retryTest},                 //
+	{cbProgSubject, true, (*Handler).showSubjectProgress}, //
+	{cbLbSubject, true, (*Handler).showSubjectLeaderboardFor},
+}
+
+// matchIDRoute finds the route of data and parses its id (r == nil: data is
+// not a numeric-id callback).
+func matchIDRoute(data string) (r *idRoute, id int64, err error) {
+	for i := range idRoutes {
+		if strings.HasPrefix(data, idRoutes[i].prefix) {
+			id, err = strconv.ParseInt(strings.TrimPrefix(data, idRoutes[i].prefix), 10, 64)
+			return &idRoutes[i], id, err
+		}
+	}
+	return nil, 0, nil
+}
+
+// routeByID dispatches a numeric-id callback; false when data is not one.
+func (h *Handler) routeByID(ctx context.Context, cb *bot.CallbackQuery, user *models.User, data string) bool {
+	r, id, err := matchIDRoute(data)
+	if r == nil {
+		return false
+	}
+	if r.ack || err != nil {
+		h.answerCallback(ctx, cb, "")
+	}
+	if err == nil {
+		r.fn(h, ctx, cb, user, id)
+	}
+	return true
+}
+
+// showSubjectLeaderboardFor adapts showSubjectLeaderboard to idRoute.fn.
+func (h *Handler) showSubjectLeaderboardFor(ctx context.Context, cb *bot.CallbackQuery, _ *models.User, id int64) {
+	h.showSubjectLeaderboard(ctx, cb, id)
 }
