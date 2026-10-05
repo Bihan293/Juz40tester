@@ -244,7 +244,7 @@ func main() {
 	// R-3: a fixed pool of maxConcurrentUpdates workers + a bounded queue of
 	// defaultUpdateQueueSize; overflow is answered with 503 (Telegram
 	// re-delivers later).
-	updates := newUpdateDispatcher(cfg.WebhookSecret, maxConcurrentUpdates, defaultUpdateQueueSize, updateTimeout, h.HandleUpdate)
+	updates := newUpdateDispatcher(cfg.WebhookSecret, updateWorkers(cfg.DBMaxConns), defaultUpdateQueueSize, cfg.UpdateTimeout, h.HandleUpdate)
 	mux.Handle("POST /telegram/webhook", updates)
 
 	srv := &http.Server{
@@ -318,6 +318,24 @@ func main() {
 // maxConcurrentUpdates bounds simultaneously processed Telegram updates.
 const maxConcurrentUpdates = 32
 
+// dbConnsReserved is the part of the pgx pool kept for the generation /
+// translation workers, reapers and cleanup, so update handlers can never
+// take every pooled connection.
+const dbConnsReserved = 8
+
+// updateWorkers caps maxConcurrentUpdates at DB_MAX_CONNS - 8 (at least 1):
+// more concurrent updates than free pool connections only queue on the
+// pool and starve the background workers.
+func updateWorkers(dbMaxConns int) int {
+	n := maxConcurrentUpdates
+	if limit := dbMaxConns - dbConnsReserved; n > limit {
+		n = max(limit, 1)
+		log.Printf("WARNING: concurrent updates capped at %d (DB_MAX_CONNS=%d - %d reserved), was %d",
+			n, dbMaxConns, dbConnsReserved, maxConcurrentUpdates)
+	}
+	return n
+}
+
 // shutdownTimeout bounds the graceful wait for HTTP + in-flight updates
 // (Render sends SIGKILL ~30 s after SIGTERM).
 const shutdownTimeout = 20 * time.Second
@@ -363,9 +381,6 @@ func reapStaleAttempts(ctx context.Context, attempts *repositories.AttemptReposi
 		}
 	}
 }
-
-// updateTimeout bounds the processing of one Telegram update.
-const updateTimeout = 5 * time.Minute
 
 // selfPing hits the given URL every 5 minutes so the hosting platform keeps
 // the instance alive (Render free tier spins services down after ~15 minutes

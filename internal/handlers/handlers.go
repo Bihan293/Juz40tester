@@ -571,9 +571,7 @@ func (h *Handler) renderWeakMenu(ctx context.Context, user *models.User) (string
 	rows := bot.ChunkButtons(buttons, 1)
 	rows = append(rows, bot.Row(bot.Btn("⬅️ Главное меню", cbMainMenu)))
 	text := b.String()
-	if r := []rune(text); len(r) > 3900 { // Telegram message limit is 4096
-		text = string(r[:3900]) + "…"
-	}
+	text = truncateUTF16(text, weakMenuMaxUTF16)
 	return text, &bot.InlineKeyboardMarkup{InlineKeyboard: rows}, nil
 }
 
@@ -787,7 +785,7 @@ func (h *Handler) showCurrentQuestion(ctx context.Context, cb *bot.CallbackQuery
 	view := h.loadCurrentQuestion(ctx, cb, user, attemptID)
 	if view == nil {
 		// All questions answered -> show the result.
-		h.showResult(ctx, cb, user, attemptID)
+		h.showResult(ctx, cb, user, attemptID, 0)
 		return
 	}
 	h.editMessage(ctx, cb, renderQuestion(view), questionKeyboard(view))
@@ -953,7 +951,7 @@ func renderAnswered(v *services.QuestionView, res *repositories.AnswerResult) st
 
 // showResult renders the attempt summary as a NEW message. cb may be nil
 // (called after an answer); in that case chatID must be provided.
-func (h *Handler) showResult(ctx context.Context, cb *bot.CallbackQuery, user *models.User, attemptID int64, chatID ...int64) {
+func (h *Handler) showResult(ctx context.Context, cb *bot.CallbackQuery, user *models.User, attemptID, chatID int64) {
 	sum, err := h.quiz.BuildSummary(ctx, attemptID, user.ID)
 	if err != nil {
 		logf("summary: %v", err)
@@ -964,11 +962,9 @@ func (h *Handler) showResult(ctx context.Context, cb *bot.CallbackQuery, user *m
 	}
 
 	// Resolve the target chat: from the callback message or the argument.
-	target := int64(0)
+	target := chatID
 	if cb != nil && cb.Message != nil {
 		target = cb.Message.Chat.ID
-	} else if len(chatID) > 0 {
-		target = chatID[0]
 	}
 	h.renderSummary(ctx, sum, user, attemptID, target)
 }

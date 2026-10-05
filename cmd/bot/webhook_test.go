@@ -271,3 +271,14 @@ func TestWebhookQueueOverflowReturns503(t *testing.T) {
 		t.Fatalf("processed %d, want %d (no acknowledged update may be lost)", done, workers+queue+1)
 	}
 }
+
+// TestUpdateWorkersCappedByPool (A2): concurrent updates never exceed
+// DB_MAX_CONNS - 8.
+func TestUpdateWorkersCappedByPool(t *testing.T) {
+	cases := map[int]int{20: 12, 40: maxConcurrentUpdates, 100: maxConcurrentUpdates, 9: 1, 5: 1}
+	for conns, want := range cases {
+		if got := updateWorkers(conns); got != want {
+			t.Errorf("updateWorkers(%d) = %d, want %d", conns, got, want)
+		}
+	}
+}
