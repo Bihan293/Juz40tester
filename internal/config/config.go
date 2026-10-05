@@ -37,6 +37,10 @@ type Config struct {
 	// The LISTEN listener, the quality-sweep advisory lock and the migration
 	// connection are DEDICATED connections outside the pool (+3 at most).
 	DBMaxConns int
+	// UpdateTimeout (UPDATE_TIMEOUT_SEC, default 60): upper bound of the
+	// processing of one Telegram update. Long work (generation, translation)
+	// runs in the background, so a handler never needs more.
+	UpdateTimeout time.Duration
 	// DBMinConns (DB_MIN_CONNS, default 5): connections kept open when idle
 	// (pgxpool has no "max idle": idle conns above this are closed after
 	// DBConnMaxIdleTime).
@@ -137,6 +141,7 @@ func Load() (*Config, error) {
 		OffPeakEndHour:         -1,
 		MigrationDatabaseURL:   strings.TrimSpace(os.Getenv("MIGRATION_DATABASE_URL")),
 		DBMaxConns:             defaultDBMaxConns,
+		UpdateTimeout:          DefaultUpdateTimeout,
 		DBMinConns:             DefaultDBMinConns,
 		DBConnMaxLifetime:      DefaultDBConnMaxLifetime,
 		DBConnMaxIdleTime:      DefaultDBConnMaxIdleTime,
@@ -159,6 +164,9 @@ func Load() (*Config, error) {
 	}
 	if n, ok := envIntOpt("DB_MAX_CONNS"); ok && n > 0 {
 		cfg.DBMaxConns = n
+	}
+	if n, ok := envIntOpt("UPDATE_TIMEOUT_SEC"); ok && n > 0 {
+		cfg.UpdateTimeout = time.Duration(n) * time.Second
 	}
 	if n, ok := envIntOpt("DB_MIN_CONNS"); ok && n >= 0 {
 		cfg.DBMinConns = n
@@ -250,6 +258,9 @@ func Load() (*Config, error) {
 // too small for concurrent updates + worker + reapers on a 1-CPU instance,
 // and unbounded concurrency would exhaust a Neon free-tier connection cap).
 const defaultDBMaxConns = 20
+
+// DefaultUpdateTimeout bounds the processing of one Telegram update.
+const DefaultUpdateTimeout = 60 * time.Second
 
 const (
 	// DefaultGenWorkers is the default size of the generation worker pool.

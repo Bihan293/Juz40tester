@@ -266,7 +266,9 @@ func (s *QuizService) GetSubjectScreen(ctx context.Context, userID, subjectID in
 		}
 		if !byNumber0[unlockedMax] && unlockedMax >= 1 && unlockedMax <= models.MaxVisibleTests {
 			if _, err := s.genSvc.EnsureChainTest(ctx, subjectID, unlockedMax, true, userID); err != nil {
-				_ = err // generation failures must never break the UI
+				// Generation failures must never break the UI — log only.
+				log.Printf("subject screen: ensure chain test subject %d #%d for user %d: %v",
+					subjectID, unlockedMax, userID, err)
 			}
 		}
 	}
@@ -404,6 +406,8 @@ func (s *QuizService) OnTestCompleted(ctx context.Context, userID int64, test *m
 	// The bar is reached — remember it permanently (the unlock watermark):
 	// a later retry with mistakes must never lock the next tests again.
 	if err := s.state.SaveProgress(ctx, userID, test.SubjectID, test.TestNumber); err != nil {
+		log.Printf("test completed: save progress user %d subject %d test #%d: %v",
+			userID, test.SubjectID, test.TestNumber, err)
 		return
 	}
 	if s.genSvc == nil || !s.genSvc.Enabled() {
@@ -411,6 +415,7 @@ func (s *QuizService) OnTestCompleted(ctx context.Context, userID int64, test *m
 	}
 	chain, err := s.subjects.ListChainTests(ctx, test.SubjectID)
 	if err != nil {
+		log.Printf("test completed: list chain tests subject %d (user %d): %v", test.SubjectID, userID, err)
 		return
 	}
 	byNumber := make(map[int]bool, len(chain))

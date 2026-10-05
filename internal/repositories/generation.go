@@ -263,7 +263,8 @@ func (r *GenerationRepository) DeletePersonalTest(ctx context.Context, userID, t
 				SELECT 1 FROM tests
 				WHERE subject_id = $1 AND kind = 'personal'
 				  AND topics_fingerprint = $2 AND id <> $3
-			)`, subjectID, fingerprint.String, testID).Scan(&others); err != nil {
+				  AND COALESCE(origin_test_id, id) = $4
+			)`, subjectID, fingerprint.String, testID, rootID).Scan(&others); err != nil {
 			return err
 		}
 		keepTemplate = !others

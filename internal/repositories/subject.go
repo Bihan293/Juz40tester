@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -100,7 +101,9 @@ func (r *SubjectRepository) listTests(ctx context.Context, subjectID int64, kind
 			return nil, err
 		}
 		if len(topicsJSON) > 0 {
-			_ = json.Unmarshal(topicsJSON, &t.Topics)
+			if err := json.Unmarshal(topicsJSON, &t.Topics); err != nil {
+				log.Printf("test %d: decode topics: %v", t.ID, err)
+			}
 		}
 		out = append(out, t)
 	}
@@ -123,7 +126,9 @@ func (r *SubjectRepository) GetTest(ctx context.Context, id int64) (*models.Test
 		return nil, err
 	}
 	if len(topicsJSON) > 0 {
-		_ = json.Unmarshal(topicsJSON, &t.Topics)
+		if err := json.Unmarshal(topicsJSON, &t.Topics); err != nil {
+			log.Printf("test %d: decode topics: %v", t.ID, err)
+		}
 	}
 	t.OwnerUserID = owner.Int64
 	return &t, nil
@@ -310,7 +315,9 @@ func (r *SubjectRepository) ListChainTestsBySubject(ctx context.Context, subject
 			return nil, err
 		}
 		if len(topicsJSON) > 0 {
-			_ = json.Unmarshal(topicsJSON, &t.Topics)
+			if err := json.Unmarshal(topicsJSON, &t.Topics); err != nil {
+				log.Printf("test %d: decode topics: %v", t.ID, err)
+			}
 		}
 		out[t.SubjectID] = append(out[t.SubjectID], t)
 	}

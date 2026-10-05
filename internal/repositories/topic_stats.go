@@ -47,7 +47,7 @@ func recordTopicAnswer(ctx context.Context, tx pgx.Tx, userID, subjectID int64, 
 // ignoring its correct answers) skewed the statistics: a well-learnt topic
 // slowly accumulated random slips and drifted into 🔴/🟡. Answers to
 // not-yet-mastered questions always count, both ways.
-func countsForTopic(prevStatus int, _ bool) bool {
+func countsForTopic(prevStatus int) bool {
 	return prevStatus < models.StatusMastered
 }
 
@@ -160,7 +160,7 @@ func (r *GenerationRepository) BackfillTopicStats(ctx context.Context) error {
 		k := qkey{user, question}
 		prev := status[k]
 		status[k] = models.NextStatus(prev, correct)
-		if !countsForTopic(prev, correct) {
+		if !countsForTopic(prev) {
 			continue
 		}
 		key := models.NormalizeTopic(topic)
