@@ -25,6 +25,9 @@ type Client struct {
 
 	// flood keeps 429 back-off state and the deferred-retry queue (R-3).
 	flood *floodControl
+	// limiter is the global token bucket of message-changing calls (A8,
+	// TG_MAX_RPS). answerCallbackQuery and service calls bypass it.
+	limiter *rateLimiter
 }
 
 // NewClient creates a client for the given bot token.
@@ -34,6 +37,7 @@ func NewClient(token string) *Client {
 		httpClient: httpx.NewClient(15 * time.Second),
 		baseURL:    "https://api.telegram.org",
 		flood:      newFloodControl(defaultMaxDeferred),
+		limiter:    newRateLimiter(DefaultMaxRPS, defaultBurst),
 	}
 }
 
@@ -288,6 +292,11 @@ func (c *Client) call(ctx context.Context, method string, payload any, out any) 
 			}
 			return &RateLimitError{Method: method, RetryAfter: retryAfter}
 		}
+		if c.limiter != nil && limitedMethods[method] {
+			// The 429 paused the global limiter (callOnce): the retry waits
+			// for it there instead of sleeping here as well.
+			continue
+		}
 		t := time.NewTimer(retryAfter)
 		select {
 		case <-ctx.Done():
@@ -334,7 +343,13 @@ func (c *Client) safeErr(method string, err error) error {
 
 // callOnce sends the request once. retryAfter > 0 means Telegram answered
 // 429 and the request may be repeated after that delay.
+//
+// Message-changing methods first wait for the global limiter (A8); a 429
+// pauses the whole limiter for retry_after (capped at maxGlobalPause).
 func (c *Client) callOnce(ctx context.Context, method string, body []byte, out any) (retryAfter time.Duration, err error) {
+	if err := c.waitLimit(ctx, method); err != nil {
+		return 0, err
+	}
 	url := fmt.Sprintf("%s/bot%s/%s", c.baseURL, c.token, method)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
@@ -360,6 +375,9 @@ func (c *Client) callOnce(ctx context.Context, method string, body []byte, out a
 			wait := time.Second
 			if ar.Parameters != nil && ar.Parameters.RetryAfter > 0 {
 				wait = time.Duration(ar.Parameters.RetryAfter) * time.Second
+			}
+			if c.limiter != nil {
+				c.limiter.pause(min(wait, maxGlobalPause))
 			}
 			return wait, fmt.Errorf("telegram %s: %s", method, ar.Description)
 		}

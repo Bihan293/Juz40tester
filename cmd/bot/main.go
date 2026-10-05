@@ -132,7 +132,7 @@ func main() {
 	genSvc.WithTranslator(translatorSvc)
 	quiz := services.NewQuizService(subjectRepo, attemptRepo, stateRepo, genRepo, genSvc, userRepo).
 		WithTranslator(translatorSvc)
-	tg := bot.NewClient(cfg.BotToken)
+	tg := bot.NewClient(cfg.BotToken).WithMaxRPS(cfg.TGMaxRPS)
 	h := handlers.New(tg, userRepo, quiz).WithActionLimiter(ratelimit.New(cfg.UserActionInterval))
 	// R-7: the worker delivers a finished generation to the waiting users
 	// at once (shared watcher per key) instead of waiting for their poll.
