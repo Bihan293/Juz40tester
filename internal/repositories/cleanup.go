@@ -174,3 +174,28 @@ func (r *CleanupRepository) DeleteOrphanPersonalDone(ctx context.Context, _ time
 	}
 	return tag.RowsAffected(), nil
 }
+
+// DeleteOldFinishedAttempts removes up to limit finished (completed /
+// abandoned) attempts last touched before olderThan (A3, ATTEMPT_TTL_DAYS).
+// The latest attempt and the best one (max correct_count) of every
+// (user, test) pair are always kept. Safe: unlocks read user_subject_state,
+// statistics read user_question_progress / user_topic_stats; finished
+// attempts are only read when the user opens that attempt's result.
+func (r *CleanupRepository) DeleteOldFinishedAttempts(ctx context.Context, olderThan time.Duration, limit int) (int64, error) {
+	tag, err := r.pool.Exec(ctx, `
+		DELETE FROM test_attempts
+		WHERE id IN (
+			SELECT a.id FROM test_attempts a
+			WHERE a.status IN ('completed','abandoned')
+			  AND a.updated_at < now() - make_interval(secs => $1)
+			  AND EXISTS (SELECT 1 FROM test_attempts n
+			              WHERE n.user_id = a.user_id AND n.test_id = a.test_id AND n.id > a.id)
+			  AND a.id <> (SELECT b.id FROM test_attempts b
+			               WHERE b.user_id = a.user_id AND b.test_id = a.test_id
+			               ORDER BY b.correct_count DESC, b.id DESC LIMIT 1)
+			LIMIT $2)`, durationSecs(olderThan), limit)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}

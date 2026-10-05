@@ -804,7 +804,7 @@ func (r *GenerationRepository) createTest(ctx context.Context, test *models.Test
 	if test.Kind == models.TestKindPersonal && test.TestNumber == 0 {
 		if err := tx.QueryRow(ctx, `
 			SELECT COALESCE(MAX(test_number), 8999) + 1
-			FROM tests WHERE subject_id = $1 AND kind IN ('personal','weak')`, test.SubjectID).
+			FROM tests WHERE subject_id = $1 AND kind <> 'chain'`, test.SubjectID).
 			Scan(&test.TestNumber); err != nil {
 			return nil, err
 		}
