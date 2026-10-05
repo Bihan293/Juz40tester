@@ -54,6 +54,8 @@ const (
 	GeneratedQuestionsPerTest = 20
 	// weakTopicsCount is how many weak topics go into one weak test.
 	weakTopicsCount = 5
+	// personalTestTitle is the title of every personal weak-topics test.
+	personalTestTitle = "🎯 Слабые темы"
 	// maxJobAttempts caps retries of a failing generation job.
 	maxJobAttempts = 3
 	// retryDelay is the backoff applied between job retries.
@@ -116,6 +118,8 @@ type GeneratorService struct {
 	// failed (R-7): the bot's generation watchers deliver the result to
 	// the waiting users at once instead of waiting for their next poll.
 	onJobFinished func(job *models.GenerationJob)
+	// noBank disables B3 bank assembly (tests of the legacy clone path only).
+	noBank bool
 }
 
 // WithJobFinishedHook installs the in-process «job finished» callback (R-7).
@@ -808,12 +812,17 @@ func (g *GeneratorService) reviveChainTest(ctx context.Context, subjectID int64,
 // weakness profiles get identical questions — the second one receives a
 // fresh CLONE of the already-generated test (no model call at all).
 func (g *GeneratorService) EnsurePersonalTest(ctx context.Context, userID, subjectID int64) (test *models.Test, pending bool, topics []string, err error) {
-	topics, err = g.gen.WeakTopics(ctx, userID, subjectID, weakTopicsCount)
+	weak, err := g.gen.WeakTopicStats(ctx, userID, subjectID, weakTopicsCount)
 	if err != nil {
 		return nil, false, nil, err
 	}
-	if len(topics) == 0 {
+	if len(weak) == 0 {
 		return nil, false, nil, nil // no weak topics yet
+	}
+	keys := make([]string, len(weak))
+	topics = make([]string, len(weak))
+	for i, w := range weak {
+		keys[i], topics[i] = w.Key, w.Topic
 	}
 	test, err = g.gen.FindPersonalTest(ctx, subjectID, userID)
 	if err != nil {
@@ -821,6 +830,23 @@ func (g *GeneratorService) EnsurePersonalTest(ctx context.Context, userID, subje
 	}
 	if test != nil {
 		return test, false, topics, nil
+	}
+	// B3: assemble the test from the question bank — audited questions of
+	// the weak topics the user has not seen (or still has 🔴). One tests
+	// row + links, no new questions, no AI call. Not enough questions —
+	// the old path below (clone / generation) keeps the bot working.
+	var banked *models.Test
+	var missing []string
+	if !g.noBank {
+		banked, missing, err = g.gen.AssembleBankPersonalTest(ctx, subjectID, userID, keys, topics, GeneratedQuestionsPerTest, personalTestTitle)
+	}
+	if err != nil {
+		log.Printf("generator: bank assembly for user %d subject %d: %v", userID, subjectID, err)
+	} else if banked != nil {
+		log.Printf("generator: personal test %d for user %d assembled from the bank (no AI call)", banked.ID, userID)
+		return banked, false, topics, nil
+	} else if len(missing) > 0 {
+		log.Printf("generator: bank short for user %d subject %d on %d topic(s): %v", userID, subjectID, len(missing), missing)
 	}
 	if !g.Enabled() {
 		return nil, false, topics, nil
@@ -1387,7 +1413,7 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 			return cloned.ID, nil
 		}
 		testNumber = 0 // assigned by the DB: next free personal number (9000+)
-		title = "🎯 Слабые темы"
+		title = personalTestTitle
 		promptTopics = topics
 		prompt = personalGenPrompt(subject.Name, topics)
 

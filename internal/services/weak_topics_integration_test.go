@@ -7,6 +7,7 @@ package services
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -175,6 +176,7 @@ func TestWeakTopicsSubjectsIsolated(t *testing.T) {
 // free clone.
 func TestWeakTopicsPracticeNewQuestions(t *testing.T) {
 	e := newFlowEnv(t)
+	e.genSvc.noBank = true // legacy clone/limit path (removed in B6)
 	ctx := context.Background()
 	u, other := e.user(t, "Practice"), e.user(t, "Other")
 	t1 := e.firstChainTest(t, 1)
@@ -277,4 +279,63 @@ func (e *flowEnv) statsTotal(t *testing.T, userID int64) int {
 		n += s.Correct + s.Wrong
 	}
 	return n
+}
+
+// TestWeakTopicsFromBankB3: with enough audited bank questions of the weak
+// topics, EnsurePersonalTest assembles the personal test at once — no job,
+// no AI call, no new questions rows; questions the user already solved are
+// not handed out again.
+func TestWeakTopicsFromBankB3(t *testing.T) {
+	e := newFlowEnv(t)
+	ctx := context.Background()
+	u := e.user(t, "Bank")
+	t1 := e.firstChainTest(t, 1)
+	e.play(t, u, t1, notIn("Тема 0", "Тема 1"))
+	keys, err := e.gen.WeakTopicKeys(ctx, u, e.sid, 5)
+	if err != nil || len(keys) != 2 {
+		t.Fatalf("weak keys = %v, %v", keys, err)
+	}
+	// Top the bank up: 10 audited questions per weak topic.
+	for _, k := range keys {
+		for i := 0; i < 10; i++ {
+			if _, err := e.pool.Exec(ctx, `
+				INSERT INTO questions (subject_id, question_text, option_a, option_b, option_c, option_d,
+				                       correct_answer, topic, difficulty, quality_checked_at, topic_key)
+				VALUES ($1, $2, 'a','b','c','d','A', $3, 2, now(), $3)`,
+				e.sid, fmt.Sprintf("bank %s %d", k, i), k); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	var qBefore int
+	_ = e.pool.QueryRow(ctx, `SELECT COUNT(*) FROM questions WHERE subject_id = $1`, e.sid).Scan(&qBefore)
+	calls := atomic.LoadInt32(&e.ai.calls)
+
+	p, pending, _, err := e.quiz.EnsurePersonalTest(ctx, u, e.sid)
+	if err != nil || p == nil || pending || !p.FromBank {
+		t.Fatalf("bank test: test=%+v pending=%v err=%v", p, pending, err)
+	}
+	var qAfter, jobs, solvedAgain, links int
+	_ = e.pool.QueryRow(ctx, `SELECT COUNT(*) FROM questions WHERE subject_id = $1`, e.sid).Scan(&qAfter)
+	_ = e.pool.QueryRow(ctx, `SELECT COUNT(*) FROM generation_jobs WHERE subject_id = $1 AND kind = 'personal'`, e.sid).Scan(&jobs)
+	_ = e.pool.QueryRow(ctx, `
+		SELECT COUNT(*), COUNT(*) FILTER (WHERE p.status > 0)
+		FROM test_questions tq
+		LEFT JOIN user_question_progress p ON p.user_id = $2 AND p.question_id = tq.question_id
+		WHERE tq.test_id = $1`, p.ID, u).Scan(&links, &solvedAgain)
+	if atomic.LoadInt32(&e.ai.calls) != calls || jobs != 0 || qAfter != qBefore {
+		t.Fatalf("bank path must be free: calls %d->%d jobs=%d questions %d->%d", calls, atomic.LoadInt32(&e.ai.calls), jobs, qBefore, qAfter)
+	}
+	if links != GeneratedQuestionsPerTest || solvedAgain != 0 {
+		t.Fatalf("links=%d solvedAgain=%d", links, solvedAgain)
+	}
+	// The test is playable like any other personal test.
+	e.play(t, u, p.ID, func(string) bool { return true })
+	if err := e.quiz.FinishPersonalTest(ctx, u, p.ID); err != nil {
+		t.Fatal(err)
+	}
+	_ = e.pool.QueryRow(ctx, `SELECT COUNT(*) FROM questions WHERE subject_id = $1`, e.sid).Scan(&qAfter)
+	if qAfter != qBefore {
+		t.Fatalf("finishing a bank test must keep the bank: %d -> %d", qBefore, qAfter)
+	}
 }
