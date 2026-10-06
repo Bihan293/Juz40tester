@@ -101,6 +101,9 @@ func (q *Question) Options() []string {
 const (
 	TestKindChain    = "chain"    // main linear chain: Тест 1, Тест 2, ...
 	TestKindPersonal = "personal" // per-user weak-topics test (owner_user_id), deletable on finish
+	// JobKindTopicBatch (B4) is a generation job (not a test kind): ~10 bank
+	// questions on one catalog topic, stored without a test row.
+	JobKindTopicBatch = "topic_batch"
 )
 
 // Test is a fixed set of questions for a subject.
@@ -144,8 +147,9 @@ type GenerationJob struct {
 	Attempts          int
 	LastError         string
 	TestID            int64
-	Urgent            bool  // run immediately, ignore the off-peak deferral
-	OwnerUserID       int64 // personal jobs only: the user the test is generated for
+	Urgent            bool   // run immediately, ignore the off-peak deferral
+	OwnerUserID       int64  // personal jobs only: the user the test is generated for
+	TopicKey          string // topic_batch jobs only: the catalog topic (B4)
 }
 
 // Unlock rule for the next chain test: the previous test must have at least

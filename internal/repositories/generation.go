@@ -714,14 +714,15 @@ func (r *GenerationRepository) ClaimNextJob(ctx context.Context) (*models.Genera
 	var testNumber sql.NullInt64
 	var fingerprint sql.NullString
 	var owner sql.NullInt64
+	var topicKey sql.NullString
 	err = tx.QueryRow(ctx, `
-		SELECT id, kind, subject_id, test_number, topics_fingerprint, owner_user_id, status, attempts, urgent
+		SELECT id, kind, subject_id, test_number, topics_fingerprint, owner_user_id, status, attempts, urgent, topic_key
 		FROM generation_jobs
 		WHERE status = 'pending' AND not_before <= now()
 		ORDER BY urgent DESC, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED`).
-		Scan(&j.ID, &j.Kind, &j.SubjectID, &testNumber, &fingerprint, &owner, &j.Status, &j.Attempts, &j.Urgent)
+		Scan(&j.ID, &j.Kind, &j.SubjectID, &testNumber, &fingerprint, &owner, &j.Status, &j.Attempts, &j.Urgent, &topicKey)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -731,6 +732,7 @@ func (r *GenerationRepository) ClaimNextJob(ctx context.Context) (*models.Genera
 	j.TestNumber = int(testNumber.Int64)
 	j.TopicsFingerprint = fingerprint.String
 	j.OwnerUserID = owner.Int64
+	j.TopicKey = topicKey.String
 
 	if _, err := tx.Exec(ctx, `
 		UPDATE generation_jobs
