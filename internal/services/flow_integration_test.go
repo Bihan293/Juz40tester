@@ -62,6 +62,9 @@ func (f *flowFakeAI) server(t *testing.T) *httptest.Server {
 		seq := atomic.AddInt32(&f.seq, 1)
 
 		qs := validQuestions()
+		if strings.Contains(user, "ТОЛЬКО по одной теме") {
+			qs = qs[:repositories.TopicBatchSize] // topic_batch (B4)
+		}
 		var topics []string
 		if strings.Contains(user, "ТОЛЬКО по этим слабым темам") {
 			for _, line := range strings.Split(user, "\n") {
@@ -188,8 +191,8 @@ func (e *flowEnv) claimOwn(ctx context.Context) (*models.GenerationJob, error) {
 	err := e.pool.QueryRow(ctx, `
 		UPDATE generation_jobs SET status = 'running', attempts = attempts + 1
 		WHERE id = (SELECT id FROM generation_jobs WHERE subject_id = $1 AND status = 'pending' ORDER BY id LIMIT 1)
-		RETURNING id, kind, subject_id, test_number, owner_user_id, attempts`, e.sid).
-		Scan(&j.ID, &j.Kind, &j.SubjectID, &tn, &owner, &j.Attempts)
+		RETURNING id, kind, subject_id, test_number, owner_user_id, attempts, COALESCE(topic_key, '')`, e.sid).
+		Scan(&j.ID, &j.Kind, &j.SubjectID, &tn, &owner, &j.Attempts, &j.TopicKey)
 	if err != nil {
 		if strings.Contains(err.Error(), "no rows") {
 			return nil, nil
