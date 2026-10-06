@@ -634,8 +634,14 @@ func topicListPrompt(catalog *models.TopicCatalog) string {
 
 // validateTest enforces the JSON contract before anything reaches the DB.
 func validateTest(gt *generatedTest) error {
-	if len(gt.Questions) != GeneratedQuestionsPerTest {
-		return fmt.Errorf("need %d questions, got %d", GeneratedQuestionsPerTest, len(gt.Questions))
+	return validateQuestions(gt, GeneratedQuestionsPerTest)
+}
+
+// validateQuestions is validateTest for a reply of exactly want questions
+// (a test has GeneratedQuestionsPerTest, a topic_batch TopicBatchSize).
+func validateQuestions(gt *generatedTest, want int) error {
+	if len(gt.Questions) != want {
+		return fmt.Errorf("need %d questions, got %d", want, len(gt.Questions))
 	}
 	seen := make(map[string]bool, len(gt.Questions))
 	positions := map[int]int{}
@@ -671,7 +677,7 @@ func validateTest(gt *generatedTest) error {
 	}
 	// Reject degenerate key distributions (all answers on one position etc.).
 	for _, n := range positions {
-		if n > GeneratedQuestionsPerTest/2 {
+		if n > want/2 {
 			return fmt.Errorf("unbalanced answer key distribution: %v", positions)
 		}
 	}
@@ -697,6 +703,11 @@ func (gt *generatedTest) toSeed() []models.SeedQuestion {
 // parseTestJSON extracts the JSON object from a model reply (tolerates
 // accidental markdown fences and leading/trailing prose) and validates it.
 func parseTestJSON(raw string) (*generatedTest, error) {
+	return parseQuestionsJSON(raw, GeneratedQuestionsPerTest)
+}
+
+// parseQuestionsJSON is parseTestJSON for a reply of exactly want questions.
+func parseQuestionsJSON(raw string, want int) (*generatedTest, error) {
 	raw = strings.TrimSpace(raw)
 	raw = strings.TrimPrefix(raw, "```json")
 	raw = strings.TrimPrefix(raw, "```")
@@ -710,7 +721,7 @@ func parseTestJSON(raw string) (*generatedTest, error) {
 	if err := json.Unmarshal([]byte(raw[start:end+1]), &gt); err != nil {
 		return nil, fmt.Errorf("decode model JSON: %w", err)
 	}
-	if err := validateTest(&gt); err != nil {
+	if err := validateQuestions(&gt, want); err != nil {
 		return nil, err
 	}
 	return &gt, nil
@@ -1252,7 +1263,11 @@ func (g *GeneratorService) executeJob(ctx context.Context, job *models.Generatio
 	}
 	repositories.InvalidateChainCache(job.SubjectID)
 	g.jobFinished(job)
-	log.Printf("generator: job %d done -> test %d", job.ID, testID)
+	if job.Kind == models.JobKindTopicBatch {
+		log.Printf("generator: job %d done -> bank topic %q", job.ID, job.TopicKey)
+	} else {
+		log.Printf("generator: job %d done -> test %d", job.ID, testID)
+	}
 	g.queueChainTranslation(ctx, job, testID)
 }
 
@@ -1417,6 +1432,10 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 		promptTopics = topics
 		prompt = personalGenPrompt(subject.Name, topics)
 
+	case models.JobKindTopicBatch:
+		// B4: bank questions on one catalog topic, no test row (test_id 0).
+		return 0, g.runTopicBatch(ctx, job, subject.Name)
+
 	default:
 		return 0, fmt.Errorf("unknown job kind %q", kind)
 	}
@@ -1554,7 +1573,7 @@ func (g *GeneratorService) generationSteps(messages []deepseek.Message, kind str
 	}
 	if g.ds != nil {
 		effort := deepseek.ThinkingEffortHigh
-		if kind == models.TestKindPersonal || retry {
+		if kind == models.TestKindPersonal || kind == models.JobKindTopicBatch || retry {
 			effort = deepseek.ThinkingEffortLow
 		}
 		ds := g.ds

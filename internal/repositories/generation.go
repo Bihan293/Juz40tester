@@ -751,7 +751,7 @@ func (r *GenerationRepository) ClaimNextJob(ctx context.Context) (*models.Genera
 func (r *GenerationRepository) CompleteJob(ctx context.Context, jobID, testID int64) error {
 	_, err := r.pool.Exec(ctx, `
 		UPDATE generation_jobs
-		SET status = 'done', test_id = $2, last_error = '', updated_at = now()
+		SET status = 'done', test_id = NULLIF($2::bigint, 0), last_error = '', updated_at = now()
 		WHERE id = $1`, jobID, testID)
 	return err
 }

@@ -407,3 +407,17 @@ func TestTopicCatalogValidators(t *testing.T) {
 		t.Fatalf("prompt: %q", p)
 	}
 }
+
+func TestTopicBatchPromptB4a(t *testing.T) {
+	p := topicBatchPrompt("Биология", "Генетика", []string{"Что такое ген?"})
+	if !strings.Contains(p, "«Генетика»") || !strings.Contains(p, "Что такое ген?") || !strings.Contains(p, "ровно 10") {
+		t.Fatalf("prompt: %s", p)
+	}
+	gt := &generatedTest{Questions: validQuestions()[:10]}
+	if err := validateQuestions(gt, 10); err != nil {
+		t.Fatalf("10-question batch rejected: %v", err)
+	}
+	if err := validateQuestions(gt, GeneratedQuestionsPerTest); err == nil {
+		t.Fatal("10 questions accepted as a full test")
+	}
+}

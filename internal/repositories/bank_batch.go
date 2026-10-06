@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/Bihan293/Juz40tester/internal/models"
+	"github.com/jackc/pgx/v5"
 )
 
 // TopicBatchSize is the number of questions one topic_batch job generates.
@@ -68,7 +69,8 @@ func (r *GenerationRepository) ActiveTopicBatchKeys(ctx context.Context, subject
 
 // SaveBankQuestions (B4) stores audited questions of a topic_batch job in
 // the bank: no test row, topic_key set, quality_checked_at = now(). Runs in
-// one transaction (all or nothing). Returns the new question ids.
+// one transaction (all or nothing). Questions whose text already exists in
+// the bank of the topic are skipped. Returns the new question ids.
 func (r *GenerationRepository) SaveBankQuestions(ctx context.Context, subjectID int64, topicKey string, questions []models.SeedQuestion) ([]int64, error) {
 	if topicKey == "" {
 		return nil, errors.New("bank questions without topic_key")
@@ -98,14 +100,24 @@ func (r *GenerationRepository) SaveBankQuestions(ctx context.Context, subjectID 
 		if sq.Correct < 0 || sq.Correct > 3 {
 			return nil, fmt.Errorf("question %d: invalid correct index %d", i+1, sq.Correct)
 		}
+		// Duplicates by question text within the topic are skipped (B4a):
+		// the same question is never stored twice in the bank of a topic.
 		var id int64
-		if err := tx.QueryRow(ctx, `
+		err := tx.QueryRow(ctx, `
 			INSERT INTO questions (subject_id, question_text, option_a, option_b, option_c, option_d,
 			                       correct_answer, topic, difficulty, quality_checked_at, topic_key)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), $10)
+			SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, now(), $10
+			WHERE NOT EXISTS (
+				SELECT 1 FROM questions
+				WHERE subject_id = $1 AND topic_key = $10
+				  AND lower(btrim(question_text)) = lower(btrim($2)))
 			RETURNING id`,
 			subjectID, sq.Text, sq.Options[0], sq.Options[1], sq.Options[2], sq.Options[3],
-			labels[sq.Correct], sq.Topic, sq.Difficulty, topicKey).Scan(&id); err != nil {
+			labels[sq.Correct], sq.Topic, sq.Difficulty, topicKey).Scan(&id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue
+		}
+		if err != nil {
 			return nil, err
 		}
 		ids = append(ids, id)
@@ -114,4 +126,41 @@ func (r *GenerationRepository) SaveBankQuestions(ctx context.Context, subjectID 
 		return nil, err
 	}
 	return ids, nil
+}
+
+// EnqueueTopicBatch (B4a) queues one topic_batch job for a single catalog
+// topic; reports whether a NEW job was created (false: one is already
+// active — the unique index dedupes concurrent calls).
+func (r *GenerationRepository) EnqueueTopicBatch(ctx context.Context, subjectID int64, topicKey string) (bool, error) {
+	n, err := r.EnqueueTopicBatchJobs(ctx, subjectID, []string{topicKey})
+	return n > 0, err
+}
+
+// TopicBankInfo (B4a) returns the catalog title of a topic and the texts of
+// the bank questions already stored for it (at most limit, newest first).
+func (r *GenerationRepository) TopicBankInfo(ctx context.Context, subjectID int64, topicKey string, limit int) (title string, texts []string, err error) {
+	if err := r.pool.QueryRow(ctx, `
+		SELECT title FROM subject_topics WHERE subject_id = $1 AND topic_key = $2`,
+		subjectID, topicKey).Scan(&title); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", nil, fmt.Errorf("topic_key %q is not in the catalog of subject %d", topicKey, subjectID)
+		}
+		return "", nil, err
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT question_text FROM questions
+		WHERE subject_id = $1 AND topic_key = $2
+		ORDER BY id DESC LIMIT $3`, subjectID, topicKey, limit)
+	if err != nil {
+		return "", nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return "", nil, err
+		}
+		texts = append(texts, t)
+	}
+	return title, texts, rows.Err()
 }
