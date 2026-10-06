@@ -332,7 +332,27 @@ B4. Генерация пакетами по теме и пополнение б
 Готово, когда: нехватка банка запускает пакетную генерацию, дубли невозможны,
 chain-вопросы пополняют банк.
 
-СТАТУС: не сделано
+СТАТУС: сделано наполовину
+ЗАМЕТКА (сделано): миграция 023 - generation_jobs.topic_key, kind 'topic_batch'
+  в CHECK, уникальный частичный индекс idx_genjobs_topic_batch_unique
+  (subject_id, topic_key) для pending/running; models.JobKindTopicBatch,
+  GenerationJob.TopicKey (ClaimNextJob читает topic_key);
+  repositories/bank_batch.go: EnqueueTopicBatchJobs (ON CONFLICT DO NOTHING,
+  дубли невозможны), ActiveTopicBatchKeys, SaveBankQuestions (вопросы без
+  теста, topic_key из справочника, quality_checked_at = now()); PG-тест
+  bank_batch_b4_integration_test.go (8 параллельных постановок -> 1 задача
+  на тему, сохранение в банк).
+ЗАМЕТКА (НЕ сделано): 1) обработка topic_batch в GeneratorService.runJob
+  (промт ~10 вопросов по одной теме, тот же маршрут Groq/DeepSeek, лимиты и
+  дневной бюджет, аудит качества, SaveBankQuestions, CompleteJob без test_id)
+  - сейчас worker такую задачу отклонит как "unknown job kind", но в проде её
+  пока никто не ставит; 2) EnsurePersonalTest: при нехватке банка (missing из
+  AssembleBankPersonalTest) ставить EnqueueTopicBatchJobs только на
+  недостающие темы; 3) после завершения пакета оповестить ждущих (хук
+  WithJobFinishedHook/genwatch, NOTIFY) и повторить сборку B3; 4) chain-тесты:
+  после аудита проставлять questions.topic_key через ResolveTopicKey
+  (несопоставленные пропускать) - проверить, не делает ли это уже
+  ensureTopicKeys в createTest; 5) тесты на пункты 1-4.
 
 ================================================================================
 B5. Интеграционные тесты банка (PostgreSQL)
