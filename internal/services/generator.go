@@ -847,7 +847,7 @@ func (g *GeneratorService) EnsurePersonalTest(ctx context.Context, userID, subje
 	// row + links, no new questions, no AI call. Not enough questions —
 	// the old path below (clone / generation) keeps the bot working.
 	var banked *models.Test
-	var missing []string
+	var missing []repositories.BankShortage
 	if !g.noBank {
 		banked, missing, err = g.gen.AssembleBankPersonalTest(ctx, subjectID, userID, keys, topics, GeneratedQuestionsPerTest, personalTestTitle)
 	}
@@ -861,6 +861,27 @@ func (g *GeneratorService) EnsurePersonalTest(ctx context.Context, userID, subje
 	}
 	if !g.Enabled() {
 		return nil, false, topics, nil
+	}
+	// B4b: a short bank queues topic_batch jobs ONLY for the short topics
+	// (the unique index dedupes concurrent requests). The user waits while
+	// every short topic has an active batch; the watcher re-runs the
+	// assembly when a batch finishes. A topic whose batch has just finished
+	// (cooldown) or is not in the catalog can not be filled that way — then
+	// the legacy path below (clone / personal generation) is the fallback.
+	if len(missing) > 0 {
+		short := repositories.ShortageKeys(missing)
+		created, active, berr := g.gen.EnqueueShortTopicBatches(ctx, subjectID, short, repositories.TopicBatchCooldown)
+		if berr != nil {
+			log.Printf("generator: topic batches for user %d subject %d: %v", userID, subjectID, berr)
+		} else {
+			if created > 0 {
+				log.Printf("generator: queued %d topic_batch job(s) for subject %d: %v", created, subjectID, short)
+				g.notifyWorkers()
+			}
+			if len(active) == len(short) {
+				return nil, true, topics, nil
+			}
+		}
 	}
 
 	fp := topicsFingerprint(topics)
