@@ -242,3 +242,99 @@ func (r *GenerationRepository) BackfillTopicCatalog(ctx context.Context) error {
 	log.Printf("topic catalog backfill: %d topics seeded, %d questions mapped, %d questions left without topic_key", topics, mapped, unmapped)
 	return nil
 }
+
+// chainTopicBackfillBatch: questions per batch of BackfillChainTopicKeys.
+const chainTopicBackfillBatch = 500
+
+// BackfillChainTopicKeys (B4c, one-off, marker "chain_topic_keys_v1") sets
+// questions.topic_key of existing chain-test questions that still have none,
+// through the topic aliases (models.NormalizeTopic runs in Go). Topics
+// missing from the catalog stay NULL (no error, no new catalog topics).
+// Works in batches by question id, each batch a short read + one UPDATE; the
+// marker is written after the last batch, so an interrupted run resumes.
+// Returns the number of questions mapped.
+func (r *GenerationRepository) BackfillChainTopicKeys(ctx context.Context) (int, error) {
+	const name = "chain_topic_keys_v1"
+	var done bool
+	if err := r.pool.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM app_backfills WHERE name = $1)`, name).Scan(&done); err != nil {
+		return 0, err
+	}
+	if done {
+		return 0, nil
+	}
+	aliases := map[int64]map[string]string{}
+	var lastID int64
+	mapped := 0
+	for {
+		type row struct {
+			id, sid int64
+			topic   string
+		}
+		rows, err := r.pool.Query(ctx, `
+			SELECT q.id, q.subject_id, q.topic
+			FROM questions q
+			WHERE q.id > $1 AND q.topic_key IS NULL AND q.topic <> ''
+			  AND EXISTS (
+				SELECT 1 FROM test_questions tq JOIN tests t ON t.id = tq.test_id
+				WHERE tq.question_id = q.id AND t.kind = 'chain')
+			ORDER BY q.id
+			LIMIT $2`, lastID, chainTopicBackfillBatch)
+		if err != nil {
+			return mapped, err
+		}
+		var batch []row
+		for rows.Next() {
+			var x row
+			if err := rows.Scan(&x.id, &x.sid, &x.topic); err != nil {
+				rows.Close()
+				return mapped, err
+			}
+			batch = append(batch, x)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return mapped, err
+		}
+		if len(batch) == 0 {
+			break
+		}
+		var ids []int64
+		var keys []string
+		for _, x := range batch {
+			lastID = x.id
+			m, ok := aliases[x.sid]
+			if !ok {
+				c, err := r.TopicCatalog(ctx, x.sid)
+				if err != nil {
+					return mapped, err
+				}
+				m = c.Aliases
+				aliases[x.sid] = m
+			}
+			if k, ok := m[models.NormalizeTopic(x.topic)]; ok {
+				ids = append(ids, x.id)
+				keys = append(keys, k)
+			}
+		}
+		if len(ids) > 0 {
+			tag, err := r.pool.Exec(ctx, `
+				UPDATE questions q SET topic_key = u.k
+				FROM unnest($1::bigint[], $2::text[]) AS u(id, k)
+				WHERE q.id = u.id AND q.topic_key IS NULL`, ids, keys)
+			if err != nil {
+				return mapped, err
+			}
+			mapped += int(tag.RowsAffected())
+		}
+		if len(batch) < chainTopicBackfillBatch {
+			break
+		}
+	}
+	if _, err := r.pool.Exec(ctx, `
+		INSERT INTO app_backfills (name) VALUES ($1) ON CONFLICT DO NOTHING`, name); err != nil {
+		return mapped, err
+	}
+	log.Printf("chain topic_key backfill: %d questions mapped", mapped)
+	return mapped, nil
+}

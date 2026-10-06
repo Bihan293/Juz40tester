@@ -290,6 +290,11 @@ func main() {
 		if err := genRepo.BackfillTopicCatalog(workerCtx); err != nil {
 			log.Printf("topic catalog backfill: %v", err)
 		}
+		// B4c: map existing chain-test questions without topic_key through
+		// the aliases (one-off, batched, unknown topics stay NULL).
+		if _, err := genRepo.BackfillChainTopicKeys(workerCtx); err != nil {
+			log.Printf("chain topic_key backfill: %v", err)
+		}
 		// B2: per-topic statistics keyed by catalog topic_key — rows of an
 		// alias spelling are summed into the topic row (idempotent).
 		if n, err := genRepo.MergeTopicStatsByKey(workerCtx); err != nil {
