@@ -62,3 +62,47 @@ func TestTopicBatchEnqueueAndSaveB4(t *testing.T) {
 		t.Fatal("unknown topic_key must be rejected")
 	}
 }
+
+// B4a: two concurrent EnqueueTopicBatch calls on one topic create one job;
+// a banked question text is not stored twice in the same topic.
+func TestEnqueueTopicBatchConcurrentB4a(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	gen := NewGenerationRepository(pool)
+	sid := bankFixture(t, ctx, pool, "Банк B4a", []string{"т1"}, 0)
+
+	var wg sync.WaitGroup
+	created := make([]bool, 2)
+	for i := range created {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ok, err := gen.EnqueueTopicBatch(ctx, sid, "т1")
+			if err != nil {
+				t.Error(err)
+			}
+			created[i] = ok
+		}(i)
+	}
+	wg.Wait()
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM generation_jobs WHERE subject_id = $1 AND kind = 'topic_batch'`, sid).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 || created[0] == created[1] {
+		t.Fatalf("jobs=%d created=%v, want exactly one new job", n, created)
+	}
+
+	qs := []models.SeedQuestion{
+		{Text: "Один вопрос", Options: [4]string{"a", "b", "c", "d"}, Correct: 0, Topic: "т1", Difficulty: 2},
+		{Text: "  один ВОПРОС ", Options: [4]string{"a", "b", "c", "d"}, Correct: 1, Topic: "т1", Difficulty: 2},
+	}
+	ids, err := gen.SaveBankQuestions(ctx, sid, "т1", qs)
+	if err != nil || len(ids) != 1 {
+		t.Fatalf("SaveBankQuestions dedupe: ids=%v err=%v", ids, err)
+	}
+	title, texts, err := gen.TopicBankInfo(ctx, sid, "т1", 10)
+	if err != nil || title != "т1" || len(texts) != 1 {
+		t.Fatalf("TopicBankInfo: %q %v %v", title, texts, err)
+	}
+}
