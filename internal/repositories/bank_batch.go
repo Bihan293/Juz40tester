@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/Bihan293/Juz40tester/internal/models"
 	"github.com/jackc/pgx/v5"
@@ -163,4 +164,56 @@ func (r *GenerationRepository) TopicBankInfo(ctx context.Context, subjectID int6
 		texts = append(texts, t)
 	}
 	return title, texts, rows.Err()
+}
+
+// TopicBatchCooldown: a topic whose topic_batch finished (done or failed)
+// this recently is not batched again for a bank shortage (B4b) — the batch
+// did not help (duplicates, failures), the caller falls back to the legacy
+// personal generation instead of looping on paid batches.
+const TopicBatchCooldown = 15 * time.Minute
+
+// EnqueueShortTopicBatches (B4b) queues URGENT topic_batch jobs for the
+// short topics of a bank assembly: only catalog topics, none finished within
+// cooldown; duplicates are cut by idx_genjobs_topic_batch_unique. Returns
+// the number of NEW jobs and the given keys that now have an active
+// (pending/running) batch — the topics worth waiting for.
+func (r *GenerationRepository) EnqueueShortTopicBatches(ctx context.Context, subjectID int64, topicKeys []string, cooldown time.Duration) (created int, active []string, err error) {
+	if len(topicKeys) == 0 {
+		return 0, nil, nil
+	}
+	tag, err := r.pool.Exec(ctx, `
+		INSERT INTO generation_jobs (kind, subject_id, topic_key, not_before, urgent)
+		SELECT 'topic_batch', $1, k, now(), TRUE
+		FROM (SELECT DISTINCT k FROM unnest($2::text[]) AS k WHERE k <> '') u
+		WHERE EXISTS (SELECT 1 FROM subject_topics st WHERE st.subject_id = $1 AND st.topic_key = u.k)
+		  AND NOT EXISTS (
+			SELECT 1 FROM generation_jobs j
+			WHERE j.kind = 'topic_batch' AND j.subject_id = $1 AND j.topic_key = u.k
+			  AND j.status IN ('done','failed')
+			  AND j.updated_at > now() - make_interval(secs => $3::float8))
+		ON CONFLICT (subject_id, topic_key) WHERE kind = 'topic_batch' AND status IN ('pending','running')
+		DO NOTHING`, subjectID, topicKeys, cooldown.Seconds())
+	if err != nil {
+		return 0, nil, err
+	}
+	if tag.RowsAffected() > 0 {
+		notifyQueue(ctx, r.pool, ChannelGenJobs)
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT DISTINCT topic_key FROM generation_jobs
+		WHERE kind = 'topic_batch' AND subject_id = $1 AND topic_key = ANY($2::text[])
+		  AND status IN ('pending','running')
+		ORDER BY topic_key`, subjectID, topicKeys)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return 0, nil, err
+		}
+		active = append(active, k)
+	}
+	return int(tag.RowsAffected()), active, rows.Err()
 }

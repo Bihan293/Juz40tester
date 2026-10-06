@@ -107,12 +107,18 @@ func (h *Handler) openWeakSubject(ctx context.Context, cb *bot.CallbackQuery, us
 			h.answerAlert(ctx, cb, "Генерация тестов сейчас недоступна 😔 Попробуй чуть позже.")
 			return
 		}
-		// R-7: personal watchers are keyed by the job (job:<id>); the
-		// per-user fallback key covers the tiny window where the job has
-		// already finished.
-		key := fmt.Sprintf("weak:%d:%d", user.ID, subjectID)
+		// R-7: personal watchers are keyed by the job (job:<id>). Without a
+		// personal job the user waits for topic_batch jobs (B4b): the
+		// watcher re-runs the bank assembly (kicked when a batch of the
+		// subject finishes), which also covers the tiny window where a
+		// personal job has already finished.
+		key := bankWatchKey(subjectID, user.ID)
 		check := func(ctx context.Context) (*models.Test, bool, error) {
-			return h.quiz.PersonalTestStatus(ctx, user.ID, subjectID)
+			test, pending, _, err := h.quiz.EnsurePersonalTest(ctx, user.ID, subjectID)
+			if errors.Is(err, services.ErrPersonalGenLimit) {
+				return nil, false, nil
+			}
+			return test, pending, err
 		}
 		if jobID, jerr := h.quiz.ActivePersonalJobID(ctx, user.ID, subjectID); jerr != nil {
 			logf("personal job of %d/%d: %v", user.ID, subjectID, jerr)

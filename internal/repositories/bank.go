@@ -50,10 +50,26 @@ const bankCandidatesSQL = `
 	WHERE c.rn <= quota.n
 	ORDER BY random()`
 
+// BankShortage is a topic whose bank quota could not be filled for the user
+// (B4b): Missing questions are lacking.
+type BankShortage struct {
+	TopicKey string
+	Missing  int
+}
+
+// ShortageKeys returns the topic_keys of the shortages (in order).
+func ShortageKeys(s []BankShortage) []string {
+	out := make([]string, len(s))
+	for i, x := range s {
+		out[i] = x.TopicKey
+	}
+	return out
+}
+
 // BankCandidates returns the bank questions selected for the quotas
-// (question ids in display order) and the topic_keys whose quota could not
-// be filled (missing, in the order of topicKeys).
-func (r *GenerationRepository) BankCandidates(ctx context.Context, subjectID, userID int64, topicKeys []string, quota map[string]int) (ids []int64, missing []string, err error) {
+// (question ids in display order) and the topics whose quota could not be
+// filled with the number of lacking questions (in the order of topicKeys).
+func (r *GenerationRepository) BankCandidates(ctx context.Context, subjectID, userID int64, topicKeys []string, quota map[string]int) (ids []int64, missing []BankShortage, err error) {
 	keys := make([]string, 0, len(topicKeys))
 	ns := make([]int32, 0, len(topicKeys))
 	for _, k := range topicKeys {
@@ -80,7 +96,7 @@ func (r *GenerationRepository) BankCandidates(ctx context.Context, subjectID, us
 	}
 	for _, k := range topicKeys {
 		if got[k] < quota[k] {
-			missing = append(missing, k)
+			missing = append(missing, BankShortage{TopicKey: k, Missing: quota[k] - got[k]})
 		}
 	}
 	return ids, missing, nil
@@ -162,7 +178,7 @@ var errBankChanged = errors.New("bank questions changed during assembly")
 // questions the user has not seen or has 🔴. Returns (nil, missing, nil)
 // when the bank can not fill every quota — the caller then uses the old
 // path (clone / AI generation). Zero AI calls, zero new questions rows.
-func (r *GenerationRepository) AssembleBankPersonalTest(ctx context.Context, subjectID, userID int64, topicKeys, titles []string, total int, title string) (*models.Test, []string, error) {
+func (r *GenerationRepository) AssembleBankPersonalTest(ctx context.Context, subjectID, userID int64, topicKeys, titles []string, total int, title string) (*models.Test, []BankShortage, error) {
 	if len(topicKeys) == 0 || total <= 0 {
 		return nil, nil, nil
 	}

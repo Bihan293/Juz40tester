@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -66,6 +67,28 @@ func chainWatchKey(subjectID int64, number int) string {
 }
 
 func jobWatchKey(jobID int64) string { return "job:" + strconv.FormatInt(jobID, 10) }
+
+// bankWatchKey: a user waiting for topic_batch jobs of the subject (B4b).
+// Per user — the check assembles THIS user's test from the bank.
+func bankWatchKey(subjectID, userID int64) string {
+	return bankWatchPrefix(subjectID) + strconv.FormatInt(userID, 10)
+}
+
+func bankWatchPrefix(subjectID int64) string { return fmt.Sprintf("bank:%d:", subjectID) }
+
+// kickPrefix kicks every key starting with prefix (non-blocking).
+func (w *genWatchers) kickPrefix(prefix string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for k, gw := range w.m {
+		if strings.HasPrefix(k, prefix) {
+			select {
+			case gw.kick <- struct{}{}:
+			default:
+			}
+		}
+	}
+}
 
 // isSubscribed reports whether the chat already waits on the key.
 func (w *genWatchers) isSubscribed(key string, chatID int64) bool {
@@ -243,6 +266,9 @@ func (h *Handler) NotifyJobFinished(job *models.GenerationJob) {
 	switch job.Kind {
 	case models.TestKindChain:
 		h.gen.kick(chainWatchKey(job.SubjectID, job.TestNumber))
+	case models.JobKindTopicBatch:
+		// B4b: every user of the subject waiting for the bank re-assembles.
+		h.gen.kickPrefix(bankWatchPrefix(job.SubjectID))
 	default:
 		h.gen.kick(jobWatchKey(job.ID))
 	}

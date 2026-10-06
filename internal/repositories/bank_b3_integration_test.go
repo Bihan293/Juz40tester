@@ -135,7 +135,7 @@ func TestBankAssemblyB3(t *testing.T) {
 
 	// Short bank: 6 per topic needed, т1 has only 4 left for this user.
 	_, missing, err = gen.AssembleBankPersonalTest(ctx, sid, u.ID, keys[:1], keys[:1], 6, "x")
-	if err != nil || len(missing) != 1 || missing[0] != "т1" {
+	if err != nil || len(missing) != 1 || missing[0].TopicKey != "т1" || missing[0].Missing != 2 {
 		t.Fatalf("short bank: missing=%v err=%v", missing, err)
 	}
 	if p, _ := gen.FindPersonalTest(ctx, sid, u.ID); p != nil {
