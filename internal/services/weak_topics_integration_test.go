@@ -285,6 +285,57 @@ func (e *flowEnv) statsTotal(t *testing.T, userID int64) int {
 // topics, EnsurePersonalTest assembles the personal test at once — no job,
 // no AI call, no new questions rows; questions the user already solved are
 // not handed out again.
+func TestWeakTopicsSharedBankProgressIsIndependent(t *testing.T) {
+	e := newFlowEnv(t)
+	ctx := context.Background()
+	alice, bob := e.user(t, "Bank Alice"), e.user(t, "Bank Bob")
+	chain := e.firstChainTest(t, 1)
+	e.play(t, alice, chain, notIn("Тема 0", "Тема 1"))
+	e.play(t, bob, chain, notIn("Тема 0", "Тема 1"))
+	keys, err := e.gen.WeakTopicKeys(ctx, alice, e.sid, 5)
+	if err != nil || len(keys) != 2 {
+		t.Fatalf("weak keys = %v, %v", keys, err)
+	}
+	for _, k := range keys {
+		for i := 0; i < 20; i++ {
+			if _, err := e.pool.Exec(ctx, `
+				INSERT INTO questions (subject_id, question_text, option_a, option_b, option_c, option_d,
+				                       correct_answer, topic, difficulty, quality_checked_at, topic_key)
+				VALUES ($1, $2, 'a','b','c','d','A', $3, 2, now(), $3)`,
+				e.sid, fmt.Sprintf("shared bank %s %d", k, i), k); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	before := atomic.LoadInt32(&e.ai.calls)
+	pa, pending, _, err := e.quiz.EnsurePersonalTest(ctx, alice, e.sid)
+	if err != nil || pa == nil || pending || !pa.FromBank {
+		t.Fatalf("Alice bank test: test=%+v pending=%v err=%v", pa, pending, err)
+	}
+	pb, pending, _, err := e.quiz.EnsurePersonalTest(ctx, bob, e.sid)
+	if err != nil || pb == nil || pending || !pb.FromBank {
+		t.Fatalf("Bob bank test: test=%+v pending=%v err=%v", pb, pending, err)
+	}
+	if atomic.LoadInt32(&e.ai.calls) != before {
+		t.Fatal("shared bank assembly called AI")
+	}
+	var shared int
+	if err := e.pool.QueryRow(ctx, `SELECT COUNT(*) FROM test_questions a JOIN test_questions b ON b.question_id=a.question_id WHERE a.test_id=$1 AND b.test_id=$2`, pa.ID, pb.ID).Scan(&shared); err != nil {
+		t.Fatal(err)
+	}
+	if shared != GeneratedQuestionsPerTest {
+		t.Fatalf("shared questions=%d, want %d", shared, GeneratedQuestionsPerTest)
+	}
+	e.play(t, alice, pa.ID, func(string) bool { return true })
+	var aliceDone, bobDone int
+	if err := e.pool.QueryRow(ctx, `SELECT COUNT(*) FILTER (WHERE user_id=$1), COUNT(*) FILTER (WHERE user_id=$2) FROM user_question_progress WHERE question_id IN (SELECT question_id FROM test_questions WHERE test_id=$3) AND status > 0`, alice, bob, pa.ID).Scan(&aliceDone, &bobDone); err != nil {
+		t.Fatal(err)
+	}
+	if aliceDone != GeneratedQuestionsPerTest || bobDone != 0 {
+		t.Fatalf("progress not independent: Alice=%d Bob=%d", aliceDone, bobDone)
+	}
+}
+
 func TestWeakTopicsFromBankB3(t *testing.T) {
 	e := newFlowEnv(t)
 	ctx := context.Background()
