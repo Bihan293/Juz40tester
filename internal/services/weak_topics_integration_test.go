@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -333,6 +334,69 @@ func TestWeakTopicsSharedBankProgressIsIndependent(t *testing.T) {
 	}
 	if aliceDone != GeneratedQuestionsPerTest || bobDone != 0 {
 		t.Fatalf("progress not independent: Alice=%d Bob=%d", aliceDone, bobDone)
+	}
+}
+
+// Parallel requests for the same short bank must share the topic_batch job;
+// concurrently saved equivalent questions must not create duplicate bank rows.
+func TestWeakTopicsParallelBankRequestsB5b(t *testing.T) {
+	e := newFlowEnv(t)
+	ctx := context.Background()
+	u := e.user(t, "ParallelBank")
+	chain := e.firstChainTest(t, 1)
+	e.play(t, u, chain, notIn("Тема 0", "Тема 1"))
+	keys, err := e.gen.WeakTopicKeys(ctx, u, e.sid, 5)
+	if err != nil || len(keys) != 2 {
+		t.Fatalf("weak keys = %v, %v", keys, err)
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 12)
+	for i := 0; i < cap(errs); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _, _, err := e.quiz.EnsurePersonalTest(ctx, u, e.sid)
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	var jobs int
+	if err := e.pool.QueryRow(ctx, `SELECT COUNT(*) FROM generation_jobs WHERE subject_id=$1 AND kind='topic_batch' AND status IN ('pending','running')`, e.sid).Scan(&jobs); err != nil {
+		t.Fatal(err)
+	}
+	if jobs != len(keys) {
+		t.Fatalf("active topic_batch jobs = %d, want one for each of %v", jobs, keys)
+	}
+
+	// Concurrently inserting normalized duplicates into a single topic only
+	// retains one bank question, even when requests race.
+	var saves sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		saves.Add(1)
+		go func() {
+			defer saves.Done()
+			_, err := e.gen.SaveBankQuestions(ctx, e.sid, keys[0], []models.SeedQuestion{{
+				Text: "Параллельный общий вопрос", Options: [4]string{"a", "b", "c", "d"}, Correct: 0, Topic: keys[0], Difficulty: 2,
+			}})
+			if err != nil {
+				t.Errorf("SaveBankQuestions: %v", err)
+			}
+		}()
+	}
+	saves.Wait()
+	var duplicateCount int
+	if err := e.pool.QueryRow(ctx, `SELECT COUNT(*) FROM questions WHERE subject_id=$1 AND topic_key=$2 AND lower(btrim(question_text))=lower(btrim($3))`, e.sid, keys[0], "Параллельный общий вопрос").Scan(&duplicateCount); err != nil {
+		t.Fatal(err)
+	}
+	if duplicateCount != 1 {
+		t.Fatalf("parallel saves stored %d equivalent questions, want 1", duplicateCount)
 	}
 }
 

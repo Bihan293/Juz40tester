@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Bihan293/Juz40tester/internal/models"
@@ -97,6 +98,11 @@ func (r *GenerationRepository) SaveBankQuestions(ctx context.Context, subjectID 
 
 	labels := []string{"A", "B", "C", "D"}
 	ids := make([]int64, 0, len(questions))
+	// Serialize writers per subject/topic: NOT EXISTS alone races across
+	// transactions because neither transaction sees the other's uncommitted row.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, hashtext($2))`, int32(subjectID), topicKey); err != nil {
+		return nil, err
+	}
 	for i, sq := range questions {
 		if sq.Correct < 0 || sq.Correct > 3 {
 			return nil, fmt.Errorf("question %d: invalid correct index %d", i+1, sq.Correct)
@@ -113,7 +119,7 @@ func (r *GenerationRepository) SaveBankQuestions(ctx context.Context, subjectID 
 				WHERE subject_id = $1 AND topic_key = $10
 				  AND lower(btrim(question_text)) = lower(btrim($2)))
 			RETURNING id`,
-			subjectID, sq.Text, sq.Options[0], sq.Options[1], sq.Options[2], sq.Options[3],
+			subjectID, strings.TrimSpace(sq.Text), sq.Options[0], sq.Options[1], sq.Options[2], sq.Options[3],
 			labels[sq.Correct], sq.Topic, sq.Difficulty, topicKey).Scan(&id)
 		if errors.Is(err, pgx.ErrNoRows) {
 			continue
