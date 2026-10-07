@@ -45,14 +45,12 @@ func TestDeletePersonalTestOtherLineage(t *testing.T) {
 	if err := gen.DeletePersonalTest(ctx, u1.ID, t1.ID, sid); err != nil {
 		t.Fatal(err)
 	}
-	var owner *int64
+	// B6a: no templates — the finished test is gone.
+	var left int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM tests WHERE id = $1`, t1.ID).Scan(&left); err != nil || left != 0 {
+		t.Fatalf("finished personal test must be deleted: left=%d err=%v", left, err)
+	}
 	var active bool
-	if err := pool.QueryRow(ctx, `SELECT owner_user_id, is_active FROM tests WHERE id = $1`, t1.ID).Scan(&owner, &active); err != nil {
-		t.Fatalf("the last test of its lineage must stay as a template: %v", err)
-	}
-	if owner != nil || active {
-		t.Fatalf("template must be ownerless and hidden: owner=%v active=%v", owner, active)
-	}
 	// The other lineage is untouched.
 	if err := pool.QueryRow(ctx, `SELECT is_active FROM tests WHERE id = $1`, t2.ID).Scan(&active); err != nil || !active {
 		t.Fatalf("other lineage changed: active=%v err=%v", active, err)

@@ -19,7 +19,6 @@ type cleanupStore interface {
 	DeleteEmptyAbandonedAttempts(ctx context.Context, olderThan time.Duration, limit int) (int64, error)
 	DeleteOldTranslationJobs(ctx context.Context, olderThan time.Duration, limit int) (int64, error)
 	DeleteStaleTemplates(ctx context.Context, olderThan time.Duration, limit int) (int64, error)
-	DeleteOrphanPersonalDone(ctx context.Context, olderThan time.Duration, limit int) (int64, error)
 	DeleteOldFinishedAttempts(ctx context.Context, olderThan time.Duration, limit int) (int64, error)
 }
 
@@ -59,7 +58,6 @@ func cleanupOnce(ctx context.Context, store cleanupStore, s cleanupSettings) {
 		{"empty abandoned attempts", s.emptyAge, store.DeleteEmptyAbandonedAttempts},
 		{"done translation_jobs", s.trJobAge, store.DeleteOldTranslationJobs},
 		{"stale personal-test templates", s.templateAge, store.DeleteStaleTemplates},
-		{"orphan user_personal_done rows", 0, store.DeleteOrphanPersonalDone},
 		{"old finished attempts", s.finishedAttemptAge, store.DeleteOldFinishedAttempts},
 	}
 	for _, st := range steps {

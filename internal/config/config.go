@@ -41,7 +41,7 @@ type Config struct {
 	// processing of one Telegram update. Long work (generation, translation)
 	// runs in the background, so a handler never needs more.
 	UpdateTimeout time.Duration
-	// TGMaxRPS (TG_MAX_RPS, default 20): global rate of outgoing Telegram
+	// TGMaxRPS (TG_MAX_RPS, default 25): global rate of outgoing Telegram
 	// calls that create / change messages (answerCallbackQuery is not
 	// limited). Calls wait for their slot instead of hitting 429.
 	TGMaxRPS int
@@ -292,7 +292,7 @@ const defaultDBMaxConns = 20
 const DefaultUpdateTimeout = 60 * time.Second
 
 // DefaultTGMaxRPS is the default TG_MAX_RPS.
-const DefaultTGMaxRPS = 20
+const DefaultTGMaxRPS = 25
 
 const (
 	// DefaultGenWorkers is the default size of the generation worker pool.

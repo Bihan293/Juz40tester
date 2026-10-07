@@ -52,9 +52,6 @@ func TestCleanupStaleTemplatesKeepsSharedQuestions(t *testing.T) {
 	if _, err := cl.DeleteOldTranslationJobs(ctx, 24*time.Hour, CleanupBatchSize); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := cl.DeleteOrphanPersonalDone(ctx, 0, CleanupBatchSize); err != nil {
-		t.Fatal(err)
-	}
 }
 
 // TestCleanupOldFinishedAttemptsKeepsBestAndLatest (A3): of four old

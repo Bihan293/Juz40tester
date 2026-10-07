@@ -177,12 +177,11 @@ func TestWeakTopicsSubjectsIsolated(t *testing.T) {
 // free clone.
 func TestWeakTopicsPracticeNewQuestions(t *testing.T) {
 	e := newFlowEnv(t)
-	e.genSvc.noBank = true // legacy clone/limit path (removed in B6)
+	e.genSvc.noBank = true // personal-generation path
 	ctx := context.Background()
-	u, other := e.user(t, "Practice"), e.user(t, "Other")
+	u := e.user(t, "Practice")
 	t1 := e.firstChainTest(t, 1)
 	e.play(t, u, t1, notIn("Тема 0", "Тема 1"))
-	e.play(t, other, t1, notIn("Тема 0", "Тема 1"))
 
 	if _, _, _, err := e.quiz.EnsurePersonalTest(ctx, u, e.sid); err != nil {
 		t.Fatal(err)
@@ -224,13 +223,6 @@ func TestWeakTopicsPracticeNewQuestions(t *testing.T) {
 	q2, _ := e.gen.PersonalTestQuestions(ctx, p2.ID)
 	if len(q2) == 0 || q2[0].Text == q1[0].Text {
 		t.Fatal("the new test must have new questions")
-	}
-
-	// Another user with the same profile still gets a free clone.
-	calls = atomic.LoadInt32(&e.ai.calls)
-	po, pending, _, err := e.quiz.EnsurePersonalTest(ctx, other, e.sid)
-	if err != nil || po == nil || pending || atomic.LoadInt32(&e.ai.calls) != calls {
-		t.Fatalf("other user must get a clone: test=%v pending=%v err=%v", po, pending, err)
 	}
 }
 

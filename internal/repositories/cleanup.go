@@ -154,27 +154,6 @@ func (r *CleanupRepository) DeleteStaleTemplates(ctx context.Context, olderThan 
 	return tag.RowsAffected(), tx.Commit(ctx)
 }
 
-// DeleteOrphanPersonalDone removes up to limit user_personal_done rows whose
-// lineage is gone entirely: neither the root test nor any clone of it
-// exists (A3). olderThan is unused. A row whose ROOT was deleted while
-// clones of the lineage remain is kept on purpose — it still stops the user
-// from getting those clones (the same questions) again; that is also why no
-// ON DELETE CASCADE foreign key to tests(id) is added.
-func (r *CleanupRepository) DeleteOrphanPersonalDone(ctx context.Context, _ time.Duration, limit int) (int64, error) {
-	tag, err := r.pool.Exec(ctx, `
-		DELETE FROM user_personal_done
-		WHERE (user_id, root_test_id) IN (
-			SELECT d.user_id, d.root_test_id FROM user_personal_done d
-			WHERE NOT EXISTS (
-				SELECT 1 FROM tests t
-				WHERE t.id = d.root_test_id OR t.origin_test_id = d.root_test_id)
-			LIMIT $1)`, limit)
-	if err != nil {
-		return 0, err
-	}
-	return tag.RowsAffected(), nil
-}
-
 // DeleteOldFinishedAttempts removes up to limit finished (completed /
 // abandoned) attempts last touched before olderThan (A3, ATTEMPT_TTL_DAYS).
 // The latest attempt and the best one (max correct_count) of every

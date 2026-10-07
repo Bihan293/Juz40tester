@@ -71,6 +71,8 @@ func (h *Handler) renderSummary(ctx context.Context, sum *services.AttemptSummar
 		if models.MeetsUnlockBar(green, yellow) {
 			if sum.Test.TestNumber+1 <= models.MaxVisibleTests {
 				fmt.Fprintf(&b, "\n\n🔓 Ты открыл «Тест %d»! Я уже начал его собирать по твоим результатам — обычно это занимает пару минут ⏳", sum.Test.TestNumber+1)
+				rows = append(rows, bot.Row(bot.Btn(fmt.Sprintf("➡️ Следующий тест (Тест %d)", sum.Test.TestNumber+1),
+					cbPendingID+strconv.FormatInt(sum.Test.SubjectID, 10)+":"+strconv.Itoa(sum.Test.TestNumber+1))))
 			} else {
 				b.WriteString("\n\n🏆 Это был последний тест цепочки — ты прошёл её целиком!")
 			}

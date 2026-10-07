@@ -161,35 +161,8 @@ func (r *GenerationRepository) FindPersonalTest(ctx context.Context, subjectID, 
 		subjectID, userID))
 }
 
-// FindPersonalTestByFingerprint returns any personal test generated for the
-// exact same weak-topics set (sha256 fingerprint), regardless of the owner —
-// including ownerless archived TEMPLATES left behind by «🏁 Закончить тест»
-// (see DeletePersonalTest), so the cache survives the original owner.
-// Users with identical weakness profiles share the same questions: the new
-// user gets a fresh CLONE of that test (zero AI cost, zero shared progress).
-//
-// forUserID: tests of a lineage (the root test and all its clones) that this
-// user has ALREADY finished are skipped — the same weak topics must be
-// trained with NEW questions, not by repeating the questions the user has
-// already seen. Other users still get the free clone.
-func (r *GenerationRepository) FindPersonalTestByFingerprint(ctx context.Context, subjectID int64, fingerprint string, forUserID int64) (*models.Test, error) {
-	if fingerprint == "" {
-		return nil, nil
-	}
-	return scanTest(r.pool.QueryRow(ctx, `
-		SELECT `+testColumns+`
-		FROM tests t
-		WHERE subject_id = $1 AND kind = 'personal' AND topics_fingerprint = $2
-		  AND NOT EXISTS (
-		      SELECT 1 FROM user_personal_done d
-		      WHERE d.user_id = $3 AND d.root_test_id = COALESCE(t.origin_test_id, t.id))
-		ORDER BY id
-		LIMIT 1`,
-		subjectID, fingerprint, forUserID))
-}
-
 // PersonalTestQuestions returns the seed-question payload of a personal test
-// (used to clone it for another user with the same weak-topics fingerprint).
+// (used by tests to compare the content of personal tests).
 func (r *GenerationRepository) PersonalTestQuestions(ctx context.Context, testID int64) ([]models.SeedQuestion, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT q.question_text, q.option_a, q.option_b, q.option_c, q.option_d,
@@ -226,16 +199,10 @@ func (r *GenerationRepository) PersonalTestQuestions(ctx context.Context, testID
 // Закончить тест", or a stale test whose topics are all mastered). The next
 // weak-topics run then builds a fresh test from the CURRENT weak topics.
 //
-// Sharing guarantee: the test content is the cache that lets the next
-// student with the SAME weak-topics fingerprint get the same test for free
-// (a clone, no AI call). Deleting the last copy used to throw that cache
-// away — after the first student finished, the next one with identical weak
-// topics paid for a brand-new generation. So when no other test of the
-// subject carries the same fingerprint, the test is ARCHIVED as an ownerless,
-// inactive TEMPLATE instead: the user's attempts and progress on it are
-// removed (their weak topics no longer count those questions), the
-// questions and their cached Kazakh translations stay for future clones.
-// Otherwise (another copy still exists) the test is deleted outright.
+// B6a: no templates / fingerprint cache any more — weak-topics tests are
+// assembled from the shared question bank; "already seen" is a row in
+// user_question_progress. A generated (non-bank) personal test is deleted
+// with its questions that no other test references.
 //
 // subjectID pins the operation to the subject the caller resolved the test
 // in, so a stale callback can never touch a test of another subject.
@@ -248,13 +215,11 @@ func (r *GenerationRepository) DeletePersonalTest(ctx context.Context, userID, t
 
 	// Ownership + kind + subject guard: only the owner can finish their own
 	// personal test of THIS subject.
-	var fingerprint sql.NullString
-	var rootID int64
 	var fromBank bool
 	err = tx.QueryRow(ctx, `
-		SELECT topics_fingerprint, COALESCE(origin_test_id, id), from_bank FROM tests
+		SELECT from_bank FROM tests
 		WHERE id = $1 AND owner_user_id = $2 AND kind = 'personal' AND subject_id = $3
-		FOR UPDATE`, testID, userID, subjectID).Scan(&fingerprint, &rootID, &fromBank)
+		FOR UPDATE`, testID, userID, subjectID).Scan(&fromBank)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -271,54 +236,6 @@ func (r *GenerationRepository) DeletePersonalTest(ctx context.Context, userID, t
 		}
 		return tx.Commit(ctx)
 	}
-	// The user has seen this content: their next weak-topics test must get
-	// NEW questions even when the weak-topics set is the same (see
-	// FindPersonalTestByFingerprint). The per-topic statistics of the
-	// practice stay in user_topic_stats — they are never deleted here.
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO user_personal_done (user_id, root_test_id, subject_id)
-		VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, userID, rootID, subjectID); err != nil {
-		return err
-	}
-
-	keepTemplate := false
-	if fingerprint.Valid && fingerprint.String != "" {
-		var others bool
-		if err := tx.QueryRow(ctx, `
-			SELECT EXISTS (
-				SELECT 1 FROM tests
-				WHERE subject_id = $1 AND kind = 'personal'
-				  AND topics_fingerprint = $2 AND id <> $3
-				  AND COALESCE(origin_test_id, id) = $4
-			)`, subjectID, fingerprint.String, testID, rootID).Scan(&others); err != nil {
-			return err
-		}
-		keepTemplate = !others
-	}
-
-	if keepTemplate {
-		// The user's own trace of the test goes away (attempts cascade to
-		// attempt_questions; per-question progress rows are dropped). The
-		// per-TOPIC statistics are kept in user_topic_stats ...
-		if _, err := tx.Exec(ctx, `
-			DELETE FROM test_attempts WHERE test_id = $1 AND user_id = $2`, testID, userID); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `
-			DELETE FROM user_question_progress
-			WHERE user_id = $2
-			  AND question_id IN (SELECT question_id FROM test_questions WHERE test_id = $1)`,
-			testID, userID); err != nil {
-			return err
-		}
-		// ... while the content stays as an ownerless, hidden template.
-		if _, err := tx.Exec(ctx, `
-			UPDATE tests SET owner_user_id = NULL, is_active = FALSE WHERE id = $1`, testID); err != nil {
-			return err
-		}
-		return tx.Commit(ctx)
-	}
-
 	// Collect the questions of THIS test before the test row (and with it,
 	// via ON DELETE CASCADE, its test_questions links) goes away. Only these
 	// questions may become orphans — the old full-table
@@ -420,18 +337,14 @@ func (r *GenerationRepository) EnqueueChainJobNow(ctx context.Context, subjectID
 }
 
 // EnqueuePersonalJob registers an URGENT job to generate the user's personal
-// weak-topics test of the subject. The fingerprint pins the exact weak-topics
-// set the test is generated for (so identical profiles share one generation).
-// Idempotent via the partial unique index.
-func (r *GenerationRepository) EnqueuePersonalJob(ctx context.Context, subjectID, userID int64, fingerprint string) error {
-	var fp any
-	if fingerprint != "" {
-		fp = fingerprint
-	}
+// weak-topics test of the subject (fallback when the question bank and topic
+// batches can not cover the weak topics). Idempotent via the partial unique
+// index.
+func (r *GenerationRepository) EnqueuePersonalJob(ctx context.Context, subjectID, userID int64) error {
 	tag, err := r.pool.Exec(ctx, `
-		INSERT INTO generation_jobs (kind, subject_id, owner_user_id, topics_fingerprint, not_before, urgent)
-		VALUES ('personal', $1, $2, $3, now(), TRUE)
-		ON CONFLICT DO NOTHING`, subjectID, userID, fp)
+		INSERT INTO generation_jobs (kind, subject_id, owner_user_id, not_before, urgent)
+		VALUES ('personal', $1, $2, now(), TRUE)
+		ON CONFLICT DO NOTHING`, subjectID, userID)
 	if err == nil && tag.RowsAffected() > 0 {
 		notifyQueue(ctx, r.pool, ChannelGenJobs)
 	}
@@ -934,50 +847,6 @@ func (r *GenerationRepository) createTest(ctx context.Context, test *models.Test
 	}
 	test.ID = testID
 	return test, nil
-}
-
-// ClonePersonalTest creates a copy of an existing personal test for another
-// owner (same subject, same questions payload incl. the quality_checked_at
-// state — see PersonalTestQuestions).
-//
-// R-8b: when EVERY question of the source has passed the quality audit, the
-// clone links the SAME question rows (no new questions; progress is per
-// (user_id, question_id) anyway, translations live on the question). Checked
-// questions are never picked by the quality sweep, so ReplaceQuestionContent
-// can not reset progress of other owners. A source with unchecked questions
-// is copied into fresh rows as before. This is how users with IDENTICAL weak-topic
-// fingerprints get the SAME test content without a paid AI generation.
-// Returns the new test, or the already-existing one when the owner already
-// has a personal test (unique index race).
-func (r *GenerationRepository) ClonePersonalTest(ctx context.Context, src *models.Test, questions []models.SeedQuestion, ownerUserID int64) (*models.Test, error) {
-	if len(questions) == 0 {
-		return nil, errors.New("clone source test has no questions")
-	}
-	clone := &models.Test{
-		SubjectID:         src.SubjectID,
-		TestNumber:        0, // next free personal number (assigned inside)
-		Title:             src.Title,
-		Kind:              models.TestKindPersonal,
-		Topics:            src.Topics,
-		OwnerUserID:       ownerUserID,
-		TopicsFingerprint: src.TopicsFingerprint,
-	}
-	// Lineage: every clone points at the ROOT (originally generated) test.
-	if err := r.pool.QueryRow(ctx, `
-		SELECT COALESCE(origin_test_id, id) FROM tests WHERE id = $1`, src.ID).Scan(&clone.OriginTestID); err != nil {
-		return nil, err
-	}
-	allChecked := true
-	for _, sq := range questions {
-		if !sq.QualityChecked {
-			allChecked = false
-			break
-		}
-	}
-	if allChecked {
-		return r.createTest(ctx, clone, questions, src.ID)
-	}
-	return r.CreateGeneratedTest(ctx, clone, questions)
 }
 
 // UncheckedQuestions returns questions that have not passed the quality

@@ -202,25 +202,6 @@ func TestChainGenPromptCompact(t *testing.T) {
 	}
 }
 
-func TestTopicsFingerprintSharing(t *testing.T) {
-	// The whole point of the fingerprint: the SAME weak-topic set must map
-	// to the SAME fingerprint regardless of order, case or whitespace —
-	// two users with identical weakness profiles then share one generated
-	// test (a clone, zero AI cost for the second one).
-	a := topicsFingerprint([]string{"Генетика", "Микроорганизмы", "Обмен веществ"})
-	b := topicsFingerprint([]string{"микроорганизмы", " Обмен   веществ ", "генетика"})
-	if a == "" || a != b {
-		t.Fatalf("fingerprints must match for the same topic set: %q vs %q", a, b)
-	}
-	c := topicsFingerprint([]string{"Генетика", "Микроорганизмы"})
-	if c == a {
-		t.Fatal("different topic sets must produce different fingerprints")
-	}
-	if len(a) != 64 {
-		t.Fatalf("sha256 hex must be 64 chars, got %d", len(a))
-	}
-}
-
 func TestValidatePersonalCoverage(t *testing.T) {
 	topics := []string{"Генетика", "Микроорганизмы"}
 

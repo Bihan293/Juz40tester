@@ -29,8 +29,6 @@ package services
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -118,7 +116,7 @@ type GeneratorService struct {
 	// failed (R-7): the bot's generation watchers deliver the result to
 	// the waiting users at once instead of waiting for their next poll.
 	onJobFinished func(job *models.GenerationJob)
-	// noBank disables B3 bank assembly (tests of the legacy clone path only).
+	// noBank disables B3 bank assembly (tests of the personal-generation path only).
 	noBank bool
 }
 
@@ -225,28 +223,6 @@ func (g *GeneratorService) acquireDeepSeek(ctx context.Context) (release func(),
 func (g *GeneratorService) WithTranslator(t *TranslatorService) *GeneratorService {
 	g.translator = t
 	return g
-}
-
-// carryTranslations copies the cached Kazakh translations of a clone source
-// test onto the clone's fresh question ids. Pure DB work — zero API cost.
-// Failures are logged and ignored: the worst case is the translation being
-// produced on first Kazakh open of the clone (the previous behaviour).
-func (g *GeneratorService) carryTranslations(ctx context.Context, srcTestID, dstTestID int64) {
-	if g.translator == nil || !g.translator.Enabled() || dstTestID == srcTestID {
-		return
-	}
-	dstIDs, err := g.translator.QuestionIDsForTest(ctx, dstTestID)
-	if err != nil || len(dstIDs) == 0 {
-		return
-	}
-	n, err := g.translator.CopyTranslationsToTest(ctx, srcTestID, dstIDs)
-	if err != nil {
-		log.Printf("generator: carry kk translations %d -> %d: %v", srcTestID, dstTestID, err)
-		return
-	}
-	if n > 0 {
-		log.Printf("generator: carried %d cached kk translation(s) to cloned test %d (no AI call)", n, dstTestID)
-	}
 }
 
 // WithGroq wires the free Groq provider (GPT-OSS 120B primary, Qwen 3.8
@@ -514,24 +490,6 @@ func personalGenPrompt(subjectName string, topics []string) string {
 // normalizeTopic canonicalises a topic string for comparison (the model may
 // differ in case or surrounding whitespace even when told to copy verbatim).
 func normalizeTopic(t string) string { return models.NormalizeTopic(t) }
-
-// topicsFingerprint is the stable sha256 of the sorted weak-topic set. Two
-// users with the SAME weak topics get the SAME fingerprint — and therefore
-// share one generated test (a clone, zero AI cost for the second user).
-func topicsFingerprint(topics []string) string {
-	norm := make([]string, 0, len(topics))
-	seen := map[string]bool{}
-	for _, t := range topics {
-		n := normalizeTopic(t)
-		if n != "" && !seen[n] {
-			seen[n] = true
-			norm = append(norm, n)
-		}
-	}
-	sort.Strings(norm)
-	sum := sha256.Sum256([]byte(strings.Join(norm, "\n")))
-	return hex.EncodeToString(sum[:])
-}
 
 // validatePersonalCoverage enforces the weak-topics contract server-side:
 // every question must be tagged with one of the REQUESTED topics and every
@@ -845,7 +803,7 @@ func (g *GeneratorService) EnsurePersonalTest(ctx context.Context, userID, subje
 	// B3: assemble the test from the question bank — audited questions of
 	// the weak topics the user has not seen (or still has 🔴). One tests
 	// row + links, no new questions, no AI call. Not enough questions —
-	// the old path below (clone / generation) keeps the bot working.
+	// topic batches / a personal generation below keep the bot working.
 	var banked *models.Test
 	var missing []repositories.BankShortage
 	if !g.noBank {
@@ -867,7 +825,7 @@ func (g *GeneratorService) EnsurePersonalTest(ctx context.Context, userID, subje
 	// every short topic has an active batch; the watcher re-runs the
 	// assembly when a batch finishes. A topic whose batch has just finished
 	// (cooldown) or is not in the catalog can not be filled that way — then
-	// the legacy path below (clone / personal generation) is the fallback.
+	// a personal generation below is the fallback.
 	if len(missing) > 0 {
 		short := repositories.ShortageKeys(missing)
 		created, active, berr := g.gen.EnqueueShortTopicBatches(ctx, subjectID, short, repositories.TopicBatchCooldown)
@@ -882,27 +840,6 @@ func (g *GeneratorService) EnsurePersonalTest(ctx context.Context, userID, subje
 				return nil, true, topics, nil
 			}
 		}
-	}
-
-	fp := topicsFingerprint(topics)
-	// Reuse path: someone else (or a previous run) already generated a test
-	// for exactly this weak-topics set — clone it instead of calling the AI.
-	shared, err := g.gen.FindPersonalTestByFingerprint(ctx, subjectID, fp, userID)
-	if err != nil {
-		return nil, false, nil, err
-	}
-	if shared != nil {
-		qs, err := g.gen.PersonalTestQuestions(ctx, shared.ID)
-		if err != nil {
-			return nil, false, nil, err
-		}
-		cloned, err := g.gen.ClonePersonalTest(ctx, shared, qs, userID)
-		if err != nil {
-			return nil, false, nil, err
-		}
-		g.carryTranslations(ctx, shared.ID, cloned.ID)
-		log.Printf("generator: cloned personal test %d -> %d for user %d (fingerprint %s, no AI call)", shared.ID, cloned.ID, userID, fp[:12])
-		return cloned, false, topics, nil
 	}
 
 	// R-9: a NEW paid-capable generation (not a clone, not an already
@@ -925,7 +862,7 @@ func (g *GeneratorService) EnsurePersonalTest(ctx context.Context, userID, subje
 			return nil, false, topics, ErrPersonalGenLimit
 		}
 	}
-	if err := g.gen.EnqueuePersonalJob(ctx, subjectID, userID, fp); err != nil {
+	if err := g.gen.EnqueuePersonalJob(ctx, subjectID, userID); err != nil {
 		return nil, false, nil, err
 	}
 	g.notifyWorkers()
@@ -1430,24 +1367,6 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 		if len(topics) == 0 {
 			return 0, fmt.Errorf("user %d has no weak topics in subject %d", ownerUserID, job.SubjectID)
 		}
-		// Before paying for a model call, check the fingerprint cache once
-		// more — the same weak-topics set may have been generated for another
-		// user (or by a concurrent job) while this job waited in the queue.
-		if shared, err := g.gen.FindPersonalTestByFingerprint(ctx, job.SubjectID, topicsFingerprint(topics), ownerUserID); err != nil {
-			return 0, err
-		} else if shared != nil {
-			qs, err := g.gen.PersonalTestQuestions(ctx, shared.ID)
-			if err != nil {
-				return 0, err
-			}
-			cloned, err := g.gen.ClonePersonalTest(ctx, shared, qs, ownerUserID)
-			if err != nil {
-				return 0, err
-			}
-			g.carryTranslations(ctx, shared.ID, cloned.ID)
-			log.Printf("generator: personal job %d resolved by cloning test %d -> %d (no AI call)", job.ID, shared.ID, cloned.ID)
-			return cloned.ID, nil
-		}
 		testNumber = 0 // assigned by the DB: next free personal number (9000+)
 		title = personalTestTitle
 		promptTopics = topics
@@ -1547,11 +1466,6 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 		Kind:        kind,
 		Topics:      testTopics,
 		OwnerUserID: ownerUserID,
-	}
-	// Personal tests are stamped with the weak-topics fingerprint so the next
-	// user with the SAME weakness profile reuses this test (clone, no AI call).
-	if kind == models.TestKindPersonal {
-		test.TopicsFingerprint = topicsFingerprint(promptTopics)
 	}
 	stored, err := g.gen.CreateGeneratedTest(ctx, test, final.toSeed())
 	if err != nil {
