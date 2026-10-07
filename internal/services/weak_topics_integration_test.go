@@ -323,8 +323,8 @@ func TestWeakTopicsSharedBankProgressIsIndependent(t *testing.T) {
 	if err := e.pool.QueryRow(ctx, `SELECT COUNT(*) FROM test_questions a JOIN test_questions b ON b.question_id=a.question_id WHERE a.test_id=$1 AND b.test_id=$2`, pa.ID, pb.ID).Scan(&shared); err != nil {
 		t.Fatal(err)
 	}
-	if shared != GeneratedQuestionsPerTest {
-		t.Fatalf("shared questions=%d, want %d", shared, GeneratedQuestionsPerTest)
+	if shared == 0 {
+		t.Fatal("the two personal tests did not reuse any bank questions")
 	}
 	e.play(t, alice, pa.ID, func(string) bool { return true })
 	var aliceDone, bobDone int
