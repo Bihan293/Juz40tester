@@ -161,6 +161,30 @@ func (r *GenerationRepository) FindPersonalTest(ctx context.Context, subjectID, 
 		subjectID, userID))
 }
 
+// PersonalTestSubjects returns, among subjectIDs, the subjects in which the
+// user has a personal weak-topics test (one query for the weak-topics menu).
+func (r *GenerationRepository) PersonalTestSubjects(ctx context.Context, userID int64, subjectIDs []int64) (map[int64]bool, error) {
+	out := make(map[int64]bool)
+	if len(subjectIDs) == 0 {
+		return out, nil
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT DISTINCT subject_id FROM tests
+		WHERE subject_id = ANY($2) AND kind = 'personal' AND owner_user_id = $1`, userID, subjectIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
+}
+
 // PersonalTestQuestions returns the seed-question payload of a personal test
 // (used by tests to compare the content of personal tests).
 func (r *GenerationRepository) PersonalTestQuestions(ctx context.Context, testID int64) ([]models.SeedQuestion, error) {

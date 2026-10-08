@@ -32,6 +32,12 @@ type AnswerResult struct {
 // question of the attempt (stale callback, forged client, race).
 var ErrAnswerOutOfOrder = errors.New("answer is not for the current question")
 
+// ErrAttemptClosed: the attempt is no longer in progress (completed by an
+// earlier answer, or abandoned by «🔄 Пройти ещё раз» / the stale-attempt
+// reaper) — a late or stale answer callback must be told so, not reported
+// as a failure to save the answer.
+var ErrAttemptClosed = errors.New("attempt is not in progress")
+
 // AttemptRepository manages test attempts, answers and knowledge progress.
 type AttemptRepository struct {
 	pool *pgxpool.Pool
@@ -467,7 +473,7 @@ func (r *AttemptRepository) SubmitAnswer(ctx context.Context, userID, attemptID 
 		return nil, err
 	}
 	if a.Status != models.AttemptInProgress {
-		return nil, errors.New("attempt is not in progress")
+		return nil, ErrAttemptClosed
 	}
 
 	// 2. ONE query (A4): the attempt question at this position (locked) JOINed

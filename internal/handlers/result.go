@@ -30,7 +30,8 @@ func (h *Handler) showResult(ctx context.Context, cb *bot.CallbackQuery, user *m
 	if cb != nil && cb.Message != nil {
 		target = cb.Message.Chat.ID
 	}
-	h.renderSummary(ctx, sum, user, attemptID, target, "")
+	// Re-showing a finished attempt unlocks nothing new and starts nothing.
+	h.renderSummary(ctx, sum, user, attemptID, target, "", services.CompletionOutcome{})
 }
 
 // renderSummary sends the attempt summary as a NEW message. It is separated
@@ -38,7 +39,9 @@ func (h *Handler) showResult(ctx context.Context, cb *bot.CallbackQuery, user *m
 // (needed to decide whether the next test starts generating) without
 // querying the database twice.
 // extra (optional) is appended under the score (the quota charge line).
-func (h *Handler) renderSummary(ctx context.Context, sum *services.AttemptSummary, user *models.User, attemptID, chatID int64, extra string) {
+// outcome is what the completion of the attempt did (a new unlock, the next
+// test's generation) — the text never claims more than that.
+func (h *Handler) renderSummary(ctx context.Context, sum *services.AttemptSummary, user *models.User, attemptID, chatID int64, extra string, outcome services.CompletionOutcome) {
 	target := chatID
 	var b strings.Builder
 	b.WriteString("🎉 Тест завершён!\n\n")
@@ -73,10 +76,19 @@ func (h *Handler) renderSummary(ctx context.Context, sum *services.AttemptSummar
 		// Say it here so the user knows the next test is on its way — but
 		// only when a next test actually exists (the chain is capped).
 		if models.MeetsUnlockBar(green, yellow) {
-			if sum.Test.TestNumber+1 <= models.MaxVisibleTests {
-				fmt.Fprintf(&b, "\n\n🔓 Ты открыл «Тест %d»! Я уже начал его собирать по твоим результатам — обычно это занимает пару минут ⏳", sum.Test.TestNumber+1)
-				rows = append(rows, bot.Row(bot.Btn(fmt.Sprintf("➡️ Следующий тест (Тест %d)", sum.Test.TestNumber+1),
-					cbPendingID+strconv.FormatInt(sum.Test.SubjectID, 10)+":"+strconv.Itoa(sum.Test.TestNumber+1))))
+			if next := sum.Test.TestNumber + 1; next <= models.MaxVisibleTests {
+				// Only what actually happened is announced: a retry of an
+				// earlier test opens nothing new, and «я уже начал его
+				// собирать» is said only while the next test is really being
+				// generated (not when it already exists or generation is off).
+				switch {
+				case outcome.NewUnlock && outcome.NextGenerating:
+					fmt.Fprintf(&b, "\n\n🔓 Ты открыл «Тест %d»! Я уже начал его собирать по твоим результатам — обычно это занимает пару минут ⏳", next)
+				case outcome.NewUnlock:
+					fmt.Fprintf(&b, "\n\n🔓 Ты открыл «Тест %d»!", next)
+				}
+				rows = append(rows, bot.Row(bot.Btn(fmt.Sprintf("➡️ Следующий тест (Тест %d)", next),
+					cbPendingID+strconv.FormatInt(sum.Test.SubjectID, 10)+":"+strconv.Itoa(next))))
 			} else {
 				b.WriteString("\n\n🏆 Это был последний тест цепочки — ты прошёл её целиком!")
 			}

@@ -68,6 +68,14 @@ func lbName(e *models.LeaderboardEntry) string {
 	return "Участник"
 }
 
+// lbLevel is the displayed chain level of a leaderboard row. After the last
+// chain test is passed the raw level is MaxVisibleTests+1 (the unlock
+// watermark), which is not a real test — the bot shows at most
+// MaxVisibleTests everywhere else («Открыто тестов»), so does the board.
+func lbLevel(e *models.LeaderboardEntry) int {
+	return models.ClampVisibleTests(e.UnlockedTests)
+}
+
 // flame renders the streak suffix of a leaderboard row (" 🔥5"), empty when
 // the streak has not lit up yet (day one).
 func flame(e *models.LeaderboardEntry) string {
@@ -141,7 +149,7 @@ func (h *Handler) showSubjectLeaderboard(ctx context.Context, cb *bot.CallbackQu
 	} else {
 		for i := range byLevels {
 			e := &byLevels[i]
-			fmt.Fprintf(&b, "%d. %s — %d ур.%s\n", i+1, lbName(e), e.UnlockedTests, flame(e))
+			fmt.Fprintf(&b, "%d. %s — %d ур.%s\n", i+1, lbName(e), lbLevel(e), flame(e))
 		}
 	}
 	b.WriteString("\nПо закреплённым вопросам 🟢:\n")

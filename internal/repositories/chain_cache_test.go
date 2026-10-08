@@ -33,3 +33,23 @@ func TestChainCacheTTLAndInvalidate(t *testing.T) {
 		t.Fatal("disabled cache served")
 	}
 }
+
+// A read that started before a chain test was created (and the cache
+// invalidated) must not put the OLD chain back afterwards.
+func TestChainCacheStaleReadNotStoredAfterInvalidate(t *testing.T) {
+	SetChainCacheTTL(time.Minute)
+	defer SetChainCacheTTL(0)
+
+	ver := chainCache.version(9) // reader: before its DB query
+	InvalidateChainCache(9)      // writer: new chain test committed
+	chainCache.putIfVersion(9, ver, []models.Test{{ID: 1, SubjectID: 9, TestNumber: 1}})
+	if _, ok := chainCache.get(9); ok {
+		t.Fatal("stale chain (read before the invalidation) was cached")
+	}
+
+	ver = chainCache.version(9) // a read after the invalidation is fresh
+	chainCache.putIfVersion(9, ver, []models.Test{{ID: 1}, {ID: 2}})
+	if got, ok := chainCache.get(9); !ok || len(got) != 2 {
+		t.Fatal("fresh chain not cached")
+	}
+}

@@ -53,13 +53,26 @@ func (r *StateRepository) SavePage(ctx context.Context, userID, subjectID int64,
 // touching the remembered page. The legacy requested_up_to column is no
 // longer read or written (it was always 0 → GREATEST no-op).
 func (r *StateRepository) SaveProgress(ctx context.Context, userID, subjectID int64, lastTestNumber int) error {
-	_, err := r.pool.Exec(ctx, `
+	_, err := r.RaiseWatermark(ctx, userID, subjectID, lastTestNumber)
+	return err
+}
+
+// RaiseWatermark is SaveProgress that also reports whether the watermark
+// actually went up (false: it was already at or above lastTestNumber —
+// e.g. a retry of an earlier test), so the caller can tell a NEW unlock
+// from a repeated pass.
+func (r *StateRepository) RaiseWatermark(ctx context.Context, userID, subjectID int64, lastTestNumber int) (bool, error) {
+	tag, err := r.pool.Exec(ctx, `
 		INSERT INTO user_subject_state (user_id, subject_id, last_test_number)
 		VALUES ($1, $2, $3)
 		ON CONFLICT (user_id, subject_id) DO UPDATE SET
-			last_test_number = GREATEST(user_subject_state.last_test_number, EXCLUDED.last_test_number),
-			updated_at = now()`, userID, subjectID, lastTestNumber)
-	return err
+			last_test_number = EXCLUDED.last_test_number,
+			updated_at = now()
+		WHERE user_subject_state.last_test_number < EXCLUDED.last_test_number`, userID, subjectID, lastTestNumber)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 // Watermarks returns the permanent unlock watermark (last_test_number) of

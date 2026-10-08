@@ -145,8 +145,26 @@ func (h *Handler) showCurrentQuestion(ctx context.Context, cb *bot.CallbackQuery
 		h.showResult(ctx, cb, user, attemptID, 0)
 		return
 	}
+	if view.Attempt != nil && view.Attempt.Status != models.AttemptInProgress {
+		// A stale button («↩️ Нет, продолжить» of an attempt that was
+		// restarted or reaped meanwhile) must not show a question that can
+		// no longer be answered.
+		h.editMessage(ctx, cb, closedAttemptText, closedAttemptKeyboard(view.Attempt.TestID))
+		return
+	}
 	admin := h.isAdminTG(user.TelegramID)
 	h.editMessage(ctx, cb, renderQuestionFor(view, admin), questionKeyboardFor(view, admin))
+}
+
+// closedAttemptText is shown instead of a question of an attempt that is no
+// longer in progress.
+const closedAttemptText = "⏹ Эта попытка уже закрыта — тест был начат заново или попытка устарела.\n\nОткрой тест, чтобы продолжить."
+
+func closedAttemptKeyboard(testID int64) *bot.InlineKeyboardMarkup {
+	return &bot.InlineKeyboardMarkup{InlineKeyboard: [][]bot.InlineKeyboardButton{
+		bot.Row(bot.Btn("▶️ Открыть тест", cbOpenTest+strconv.FormatInt(testID, 10))),
+		bot.Row(bot.Btn("⬅️ Главное меню", cbMainMenu)),
+	}}
 }
 
 // sendCurrentQuestion sends the next unanswered question as a NEW message
@@ -269,6 +287,13 @@ func (h *Handler) handleAnswer(ctx context.Context, cb *bot.CallbackQuery, user 
 		h.answerCallback(ctx, cb, "Этот вопрос уже неактуален")
 		return
 	}
+	if errors.Is(err, repositories.ErrAttemptClosed) {
+		// Late duplicate of the final answer, or a stale question of an
+		// attempt that was closed meanwhile (restarted / reaped): nothing
+		// failed — the answer simply belongs to a finished attempt.
+		h.answerCallback(ctx, cb, "Эта попытка уже завершена — открой тест заново")
+		return
+	}
 	if err != nil {
 		logf("submit answer: %v", err)
 		h.answerCallback(ctx, cb, "Не удалось сохранить ответ")
@@ -301,13 +326,13 @@ func (h *Handler) handleAnswer(ctx context.Context, cb *bot.CallbackQuery, user 
 			h.sendText(ctx, chatID, "Ошибка загрузки результата 😔")
 			return
 		}
-		h.quiz.OnTestCompleted(ctx, user.ID, sum.Test,
+		outcome := h.quiz.OnTestCompleted(ctx, user.ID, sum.Test,
 			sum.StatusCounts[models.StatusMastered], sum.StatusCounts[models.StatusPartial])
 		extra := ""
 		if res.Charged {
 			extra = h.chargedLine(ctx, user)
 		}
-		h.renderSummary(ctx, sum, user, attemptID, chatID, extra)
+		h.renderSummary(ctx, sum, user, attemptID, chatID, extra, outcome)
 		return
 	}
 	// The next question is sent as a NEW message right below the answered
