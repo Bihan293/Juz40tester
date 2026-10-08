@@ -24,12 +24,14 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Bihan293/Juz40tester/internal/config"
@@ -576,6 +578,12 @@ func (g *GeneratorService) generateBatched(ctx context.Context, job *models.Gene
 
 	bs, par := g.batchSize(), g.batchParallel()
 	alt := 0
+	// budgetHit: a batch failed because the paid fallback hit the daily
+	// DeepSeek cap. The error is surfaced (wrapped) when the test can not be
+	// completed, so executeJob DEFERS the job instead of failing it — the
+	// same R-9 behaviour as the full strategy (whose runSteps error already
+	// wraps ErrBudgetExceeded).
+	var budgetHit atomic.Bool
 	for round := 0; round < batchMaxRounds && ctx.Err() == nil; round++ {
 		var missing []int
 		for i, q := range filled {
@@ -611,6 +619,9 @@ func (g *GeneratorService) generateBatched(ctx context.Context, job *models.Gene
 				mu.Unlock()
 				got, provider, err := g.runBatch(ctx, job, spec, grp, avoid, myAlt)
 				if err != nil {
+					if errors.Is(err, deepseek.ErrBudgetExceeded) {
+						budgetHit.Store(true)
+					}
 					log.Printf("generator: job %d: batch %v failed: %v", job.ID, grp, err)
 					return
 				}
@@ -648,6 +659,9 @@ func (g *GeneratorService) generateBatched(ctx context.Context, job *models.Gene
 		gt.Questions = append(gt.Questions, *q)
 	}
 	if missing > 0 {
+		if budgetHit.Load() {
+			return nil, fmt.Errorf("batch: %d of %d questions could not be generated: %w", missing, n, deepseek.ErrBudgetExceeded)
+		}
 		return nil, fmt.Errorf("batch: %d of %d questions could not be generated", missing, n)
 	}
 	rebalanceAnswerKeys(gt)
