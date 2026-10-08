@@ -20,7 +20,7 @@ import (
 // a weak topic, and offering it led to an endless «generating…» state. No
 // generation is triggered here — a test is created only on an explicit tap.
 func (h *Handler) renderWeakMenu(ctx context.Context, user *models.User) (string, *bot.InlineKeyboardMarkup, error) {
-	subjects, weak, err := h.quiz.WeakMenu(ctx, user.ID, weakMenuTopics)
+	subjects, weak, withTest, err := h.quiz.WeakMenu(ctx, user.ID, weakMenuTopics)
 	if err != nil {
 		return "", nil, err
 	}
@@ -40,6 +40,9 @@ func (h *Handler) renderWeakMenu(ctx context.Context, user *models.User) (string
 		for _, st := range weak[s.ID] {
 			n, c := st.WindowCounts()
 			fmt.Fprintf(&b, "%s %s — верно %d из %d\n", models.TopicLevelEmoji(st.Level()), st.Topic, c, n)
+		}
+		if len(weak[s.ID]) == 0 && withTest[s.ID] {
+			b.WriteString("Слабых тем больше нет 🎉 Твой персональный тест ещё здесь — можно его пройти и закончить.\n")
 		}
 	}
 	b.WriteString("\nВыбери предмет — я соберу персональный тест из 20 НОВЫХ вопросов по самым слабым темам")
@@ -113,7 +116,7 @@ func (h *Handler) openWeakSubjectFree(ctx context.Context, cb *bot.CallbackQuery
 		h.answerCallback(ctx, cb, "Ошибка загрузки теста")
 		return
 	}
-	if len(topics) == 0 {
+	if test == nil && len(topics) == 0 {
 		// Stale button (the topics got mastered meanwhile) — refresh the
 		// picker so the subject disappears from the list.
 		h.answerAlert(ctx, cb, "В этом предмете у тебя больше нет слабых тем 🎉 Пройди обычные тесты в «📚 Предметы» — новые слабые темы появятся здесь.")

@@ -524,26 +524,39 @@ func (s *QuizService) ChainTestOrRevive(ctx context.Context, subjectID int64, te
 	return nil, nil
 }
 
-// WeakMenu returns, in ONE topic-stats query (+ the subject list), the
-// subjects with weak topics and their weak topics (worst first, at most
-// limit each) for the «🎯 Слабые темы» picker (R-10a: no N+1).
-func (s *QuizService) WeakMenu(ctx context.Context, userID int64, limit int) ([]models.Subject, map[int64][]models.TopicStat, error) {
+// WeakMenu returns, in ONE topic-stats query (+ the subject list and one
+// personal-tests query), the subjects for the «🎯 Слабые темы» picker and
+// their weak topics (worst first, at most limit each) (R-10a: no N+1).
+//
+// A subject is listed when it has weak topics OR the user already has a
+// personal test there (withTest): answering the personal test improves its
+// topics, so they often leave the weak list before the test is finished —
+// the started (maybe paid) test must stay reachable from the menu.
+func (s *QuizService) WeakMenu(ctx context.Context, userID int64, limit int) (subjects []models.Subject, weak map[int64][]models.TopicStat, withTest map[int64]bool, err error) {
 	all, err := s.subjects.List(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	stats, err := s.gen.AllTopicStats(ctx, userID)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	weak := models.WeakTopicStatsBySubject(stats, limit)
-	out := make([]models.Subject, 0, len(weak))
+	ids := make([]int64, 0, len(all))
 	for _, subj := range all {
-		if len(weak[subj.ID]) > 0 {
-			out = append(out, subj)
+		ids = append(ids, subj.ID)
+	}
+	withTest, err = s.gen.PersonalTestSubjects(ctx, userID, ids)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	weak = models.WeakTopicStatsBySubject(stats, limit)
+	subjects = make([]models.Subject, 0, len(weak)+len(withTest))
+	for _, subj := range all {
+		if len(weak[subj.ID]) > 0 || withTest[subj.ID] {
+			subjects = append(subjects, subj)
 		}
 	}
-	return out, weak, nil
+	return subjects, weak, withTest, nil
 }
 
 // ChainTestStatus reports whether chain test #number of the subject already
@@ -596,9 +609,16 @@ func (s *QuizService) PersonalTestStatus(ctx context.Context, userID, subjectID 
 // topic is kept as is (deleting it would waste the money already spent).
 func (s *QuizService) EnsurePersonalTest(ctx context.Context, userID, subjectID int64) (test *models.Test, pending bool, topics []string, err error) {
 	if s.genSvc == nil {
-		return nil, false, nil, nil
+		return s.existingPersonalTest(ctx, userID, subjectID)
 	}
 	test, pending, topics, err = s.genSvc.EnsurePersonalTest(ctx, userID, subjectID)
+	if err == nil && test == nil && !pending && len(topics) == 0 {
+		// No weak topics left (often BECAUSE of this very personal test —
+		// its answers improve the topic statistics): a test built earlier
+		// must still open, otherwise a half-done (or paid) test becomes
+		// unreachable.
+		return s.existingPersonalTest(ctx, userID, subjectID)
+	}
 	if err != nil || test == nil || len(topics) == 0 {
 		return test, pending, topics, err
 	}
@@ -631,6 +651,17 @@ func (s *QuizService) EnsurePersonalTest(ctx context.Context, userID, subjectID 
 		return test, false, topics, nil // deletion failed — keep the old test
 	}
 	return s.genSvc.EnsurePersonalTest(ctx, userID, subjectID)
+}
+
+// existingPersonalTest returns the user's personal test of the subject as
+// EnsurePersonalTest does (topics = the topics the test was built for), or
+// nothing when there is none. Nothing is generated or deleted.
+func (s *QuizService) existingPersonalTest(ctx context.Context, userID, subjectID int64) (*models.Test, bool, []string, error) {
+	test, err := s.gen.FindPersonalTest(ctx, subjectID, userID)
+	if err != nil || test == nil {
+		return nil, false, nil, err
+	}
+	return test, false, test.Topics, nil
 }
 
 // FinishPersonalTest deletes the user's personal weak-topics test (and its
