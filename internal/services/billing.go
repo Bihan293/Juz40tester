@@ -136,6 +136,7 @@ const (
 	errPayDowngrade = "Сейчас активен более дорогой план. Перейти на этот можно после его окончания."
 	errPayNoTopics  = "Слабых тем в этом предмете больше нет — оплата не нужна."
 	errPayInternal  = "Не удалось проверить оплату. Попробуй через минуту."
+	errPayInFlight  = "Тест по слабым темам этого предмета уже оплачен и собирается — я пришлю его, как только он будет готов."
 )
 
 // PreCheckout validates a payment before Telegram charges the user. ok =
@@ -179,6 +180,17 @@ func (s *BillingService) PreCheckout(ctx context.Context, userID int64, currency
 		}
 		if o.UserID != userID || o.Status != repositories.OrderCreated || o.Amount != amount {
 			return false, errPayStale
+		}
+		// Another order of this subject is already paid and being built
+		// (an older invoice / «Купить новый тест» tapped meanwhile): a
+		// second payment could only be refunded — do not take it at all.
+		inflight, err := s.repo.PaidWeakOrder(ctx, userID, o.SubjectID)
+		if err != nil {
+			log.Printf("billing: pre-checkout order %d in-flight lookup: %v", o.ID, err)
+			return false, errPayInternal
+		}
+		if inflight != nil {
+			return false, errPayInFlight
 		}
 		keys, err := s.tests.WeakTopicKeys(ctx, userID, o.SubjectID, 1)
 		if err != nil {
@@ -430,15 +442,18 @@ func (s *BillingService) PaidWeakOrder(ctx context.Context, userID, subjectID in
 // --- Refunds / external events -------------------------------------------------------
 
 // OnRefundedPayment handles Telegram's refunded_payment service message.
-func (s *BillingService) OnRefundedPayment(ctx context.Context, chargeID string) {
+// An error (database unavailable) is returned so the update is retried —
+// otherwise a refunded subscription would stay active.
+func (s *BillingService) OnRefundedPayment(ctx context.Context, chargeID string) error {
 	p, err := s.repo.OnExternalRefund(ctx, chargeID)
 	if err != nil {
 		log.Printf("billing: refunded_payment %s: %v", chargeID, err)
-		return
+		return fmt.Errorf("refunded_payment %s: %w", chargeID, err)
 	}
 	if p != nil {
 		log.Printf("billing: payment %s (user %d, %s) refunded by Telegram", chargeID, p.UserID, p.Kind)
 	}
+	return nil
 }
 
 func (s *BillingService) processRefund(ctx context.Context, p repositories.Payment) {
