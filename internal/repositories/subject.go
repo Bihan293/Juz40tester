@@ -67,11 +67,12 @@ func (r *SubjectRepository) ListChainTests(ctx context.Context, subjectID int64)
 	if tests, ok := chainCache.get(subjectID); ok {
 		return tests, nil
 	}
+	ver := chainCache.version(subjectID) // before the query — see chainCacheT.versions
 	tests, err := r.listTests(ctx, subjectID, models.TestKindChain)
 	if err != nil {
 		return nil, err
 	}
-	chainCache.put(subjectID, tests)
+	chainCache.putIfVersion(subjectID, ver, tests)
 	return tests, nil
 }
 
