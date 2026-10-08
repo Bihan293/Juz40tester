@@ -1,5 +1,12 @@
 // Package services — AI test generation pipeline.
 //
+// NOTE (scale update): by default (GEN_STRATEGY=batch) a test is assembled
+// from batches of 5 questions validated one by one (batchgen.go); the
+// single-call description below is the "full" strategy, still available
+// and A/B-testable (strategy.go). Identical weak-topic inputs are served by
+// fingerprint templates (templates.go); the chain validators live in
+// chain_validate.go.
+//
 // Cost discipline (the pipeline was redesigned after burning ~$0.10 per
 // test; a generated 20-question test costs roughly $0.002–0.006 now):
 //   - ONE model call per test: deepseek-flash (V4.1-Flash) IN THINKING MODE
@@ -43,6 +50,7 @@ import (
 	"github.com/Bihan293/Juz40tester/internal/config"
 	"github.com/Bihan293/Juz40tester/internal/deepseek"
 	"github.com/Bihan293/Juz40tester/internal/groq"
+	"github.com/Bihan293/Juz40tester/internal/metrics"
 	"github.com/Bihan293/Juz40tester/internal/models"
 	"github.com/Bihan293/Juz40tester/internal/repositories"
 )
@@ -72,18 +80,21 @@ const (
 	// (and the repair round after it) — the free Groq steps never use it.
 	deepseekGenReserve = 4 * time.Minute
 	// genMaxTokens caps the model output INCLUDING the hidden thinking
-	// tokens — the hard cost limiter of one generation. 20 questions with
-	// 4 options each need ~3000–3800 visible tokens, leaving ~4000 for the
-	// thinking pass; the worst-case spend of one call at peak flash pricing
-	// is ~$0.0096.
-	genMaxTokens = 8000
+	// tokens — the hard cost limiter of one FULL (20-question) generation
+	// (strategy "full" and the 10-question topic batches). 20 questions
+	// with 4 options need ~3000–3800 visible tokens; 6000 (was 8000) leaves
+	// a short thinking pass — a model that needs more is cut off and the
+	// next step runs instead of burning the budget. The batch strategy uses
+	// genBatchMaxTokens per 5 questions. Worst case of one call at peak
+	// flash pricing ≈ $0.0072.
+	genMaxTokens = 6000
 
-	// groqGenMinTokens is the smallest output budget a Groq generation
-	// request may run with: 20 Russian questions need ~3000–3800 visible
-	// tokens plus some reasoning. If the prompt leaves less than that under
-	// the free-tier per-request ceiling (TPM 8000), the Groq step is skipped
-	// without an HTTP call and the next provider runs.
-	groqGenMinTokens = 4500
+	// groqGenMinTokens is the smallest output budget a full Groq generation
+	// request may run with (was 4500). If the prompt leaves less than that
+	// under the free-tier per-request ceiling (TPM 8000), the Groq step is
+	// skipped without an HTTP call and the next provider runs; a reply cut
+	// off by the cap fails fast as truncated.
+	groqGenMinTokens = 3000
 	// groqGenMaxWait: the worker is a background process, so it may wait
 	// for the per-minute window (TPM 8000 ≈ one test per minute per model)
 	// instead of paying DeepSeek. Daily-quota exhaustion never waits.
@@ -148,6 +159,18 @@ func (g *GeneratorService) WithBudget(b *DailyBudget) *GeneratorService {
 // ErrPersonalGenLimit: the user already requested PersonalGenPerUserDay new
 // personal weak-topics generations today (R-9).
 var ErrPersonalGenLimit = errors.New("daily personal generation limit reached")
+
+// ErrGenQueueBusy: too many personal generations are queued right now
+// (GEN_MAX_ACTIVE_PERSONAL backpressure) — the user should retry later.
+var ErrGenQueueBusy = errors.New("personal generation queue is full")
+
+// maxActivePersonal is the backpressure limit (0 = none).
+func (g *GeneratorService) maxActivePersonal() int {
+	if g.cfg == nil {
+		return 0
+	}
+	return g.cfg.GenMaxActivePersonal
+}
 
 // personalGenLimit returns the configured per-user daily limit (0 = none).
 func (g *GeneratorService) personalGenLimit() int {
@@ -279,6 +302,22 @@ const genSystemPrompt = `Ты — автор тестов ЕНТ/УБТ (Каз�
 // difficulty of THIS chain position, target the weak topics and never repeat
 // questions.
 func chainGenPrompt(subjectName string, testNumber int, prev []models.Question, marks []float64) string {
+	return chainGenContext(subjectName, testNumber, prev, marks, nil) + chainOutputLine
+}
+
+// chainOutputLine is the output instruction of a FULL (one-call) chain
+// prompt; the batch strategy replaces it with the per-batch spec.
+var chainOutputLine = "\nВыдай строго JSON по схеме, ровно " + fmt.Sprint(GeneratedQuestionsPerTest) + " вопросов."
+
+// chainGenContext is the chain prompt WITHOUT the output instruction: the
+// stable prefix shared by every call of one job (prompt caching).
+//
+// Besides the previous test (per question: topic — stem — average mark of
+// all students) it carries the per-TOPIC aggregate of the previous test and
+// the weak topics the test must train (weak topics of the previous test
+// merged with the subject-wide weak topics of the active students), and
+// demands a harder test without repeats.
+func chainGenContext(subjectName string, testNumber int, prev []models.Question, marks []float64, weak []string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Предмет: «%s». Составь Тест №%d из ровно %d вопросов.\n\n", subjectName, testNumber, GeneratedQuestionsPerTest)
 	b.WriteString(languageSubjectRule(subjectName))
@@ -313,14 +352,26 @@ func chainGenPrompt(subjectName string, testNumber int, prev []models.Question, 
 			}
 			fmt.Fprintf(&b, "%d. [%s] %s — %s\n", i+1, q.Topic, stem, mark)
 		}
+		if tm := prevTopicMarks(prev, marks); len(tm) > 0 {
+			b.WriteString("Средний уровень учеников по темам прошлого теста: ")
+			parts := make([]string, 0, len(tm))
+			for _, m := range tm {
+				parts = append(parts, fmt.Sprintf("%s — %.1f", m.Topic, m.Mark))
+			}
+			b.WriteString(strings.Join(parts, "; "))
+			b.WriteString(".\n")
+		}
 		fmt.Fprintf(&b, "\nТвой Тест №%d ОБЯЗАН:\n", testNumber)
-		b.WriteString("— быть немного сложнее прошлого: сложность растёт плавно от теста к тесту, без резких скачков;\n")
+		b.WriteString("— быть немного сложнее прошлого: сложность растёт плавно от теста к тесту, без резких скачков, и НЕ НИЖЕ прошлого теста;\n")
 		b.WriteString("— подтягивать слабые места: темы с уровнем ниже 1.5 повтори через НОВЫЕ формулировки и другие аспекты, хорошо усвоенные темы почти не трогай — вместо них бери новые разделы программы;\n")
-		b.WriteString("— НЕ ПОВТОРЯТЬ ни одного вопроса прошлого теста: другие формулировки, подтемы, числа и примеры.\n")
+		b.WriteString("— НЕ ПОВТОРЯТЬ ни одного вопроса прошлого теста: другие формулировки, подтемы, числа и примеры (повторы отбраковываются автоматически).\n")
 	}
-	fmt.Fprintf(&b, "\nСЛОЖНОСТЬ Теста №%d: средняя difficulty ≈ %.1f. Распределение 20 вопросов по уровням: %s. Поле difficulty каждого вопроса ставь честно по шкале выше.\n",
+	if len(weak) > 0 {
+		fmt.Fprintf(&b, "\nСЛАБЫЕ ТЕМЫ учеников (по прошлому тесту и общей статистике предмета) — ОБЯЗАТЕЛЬНО включи вопросы минимум по %d из них, поле topic — дословно: %s.\n",
+			min(weakCoverageNeed, len(weak)), strings.Join(weak, "; "))
+	}
+	fmt.Fprintf(&b, "\nСЛОЖНОСТЬ Теста №%d: средняя difficulty ≈ %.1f. Распределение 20 вопросов по уровням: %s. Поле difficulty каждого вопроса ставь честно по шкале выше (тест с другой средней сложностью отклоняется автоматически).\n",
 		testNumber, target, mixString(mix))
-	b.WriteString("\nВыдай строго JSON по схеме, ровно " + fmt.Sprint(GeneratedQuestionsPerTest) + " вопросов.")
 	return b.String()
 }
 
@@ -425,22 +476,31 @@ func meanDifficulty(qs []models.Question) float64 {
 // chainDifficultyTolerance: how far the mean difficulty of a generated chain
 // test may drift from the target before the reply is rejected (the model
 // ignored the level instruction — e.g. wrote a beginner test for Тест 40).
-const chainDifficultyTolerance = 1.0
+// Tightened from 1.0 to 0.75: with 1.0 a Тест 30 (target 3.5) written
+// entirely at level 3 with a few 2s still passed as «2.6».
+const chainDifficultyTolerance = 0.75
 
 // validateChainDifficulty checks that the mean difficulty of a generated
-// chain test is close to the target of its chain position.
+// chain test is close to the target of its chain position, and that the
+// requested distribution was not faked by extremes (≤ 20% of the questions
+// may be ≥ 2 levels away from the target).
 func validateChainDifficulty(gt *generatedTest, testNumber int) error {
 	if len(gt.Questions) == 0 {
 		return nil
 	}
-	sum := 0
-	for _, q := range gt.Questions {
-		sum += q.Difficulty
-	}
-	mean := float64(sum) / float64(len(gt.Questions))
+	mean := genMeanDifficulty(gt)
 	target := chainDifficultyTarget(testNumber)
 	if math.Abs(mean-target) > chainDifficultyTolerance {
-		return fmt.Errorf("difficulty: mean %.2f is too far from the target %.1f of test %d", mean, target, testNumber)
+		return rejectf(rejectDifficulty, "difficulty: mean %.2f is too far from the target %.1f of test %d (tolerance ±%.2f)", mean, target, testNumber, chainDifficultyTolerance)
+	}
+	outliers := 0
+	for _, q := range gt.Questions {
+		if math.Abs(float64(q.Difficulty)-target) >= chainDifficultyOutlierGap {
+			outliers++
+		}
+	}
+	if float64(outliers) > chainDifficultyMaxOutliers*float64(len(gt.Questions)) {
+		return rejectf(rejectDifficulty, "difficulty: %d of %d questions are ≥ %.0f levels away from the target %.1f of test %d", outliers, len(gt.Questions), chainDifficultyOutlierGap, target, testNumber)
 	}
 	return nil
 }
@@ -472,6 +532,15 @@ func languageSubjectRule(subjectName string) string {
 // the prompt stays tiny and cheap, and the model must tag every question
 // with one of THESE topics verbatim (validated server-side afterwards).
 func personalGenPrompt(subjectName string, topics []string) string {
+	return personalGenContext(subjectName, topics) + personalOutputLine
+}
+
+// personalOutputLine is the output instruction of a full personal prompt.
+const personalOutputLine = "\nВыдай строго JSON по схеме."
+
+// personalGenContext is the personal prompt without the output instruction
+// (stable prefix of every batch call of the job).
+func personalGenContext(subjectName string, topics []string) string {
 	var b strings.Builder
 	b.WriteString(languageSubjectRule(subjectName))
 	fmt.Fprintf(&b, "Предмет: «%s». Составь тренировочный тест из ровно %d вопросов ТОЛЬКО по этим слабым темам ученика:\n", subjectName, GeneratedQuestionsPerTest)
@@ -483,7 +552,6 @@ func personalGenPrompt(subjectName string, topics []string) string {
 	b.WriteString("— поле topic каждого вопроса ДОСЛОВНО равно одной из перечисленных тем (скопируй строку из списка);\n")
 	b.WriteString("— от базовых аспектов к сложным (difficulty 2–4): закрыть пробел, а не завалить;\n")
 	b.WriteString("— уровень и формат реального ЕНТ/УБТ для 9–11 классов, без повторов.\n")
-	b.WriteString("\nВыдай строго JSON по схеме.")
 	return b.String()
 }
 
@@ -689,6 +757,16 @@ func parseQuestionsJSON(raw string, want int) (*generatedTest, error) {
 // Scheduling (off-peak vs urgent)
 // ---------------------------------------------------------------------------
 
+// pregenMinDelay: a non-urgent (pre-generated) chain job never starts
+// earlier than this after it was queued.
+const pregenMinDelay = 2 * time.Hour
+
+// PregenAhead reports whether locked chain tests are pre-generated one test
+// ahead in the off-peak window (GEN_PREGEN_AHEAD=1).
+func (g *GeneratorService) PregenAhead() bool {
+	return g != nil && g.cfg != nil && g.cfg.GenPregenAhead > 0
+}
+
 // deferredUntil returns when a non-urgent newly enqueued job may start:
 // immediately during off-peak hours, otherwise at the next off-peak window
 // start — the cheaper API pricing window (see config.IsOffPeak).
@@ -715,7 +793,13 @@ func (g *GeneratorService) EnsureChainTest(ctx context.Context, subjectID int64,
 	}
 	notBefore := time.Now()
 	if !urgent {
+		// Pre-generation (GEN_PREGEN_AHEAD): the cheaper off-peak window,
+		// but never earlier than pregenMinDelay — the previous test should
+		// collect some knowledge marks first.
 		notBefore = g.deferredUntil()
+		if earliest := g.now().Add(pregenMinDelay); notBefore.Before(earliest) {
+			notBefore = earliest
+		}
 	}
 	inserted, err := g.gen.EnqueueChainJob(ctx, subjectID, testNumber, notBefore, urgent, ownerUserID)
 	if err != nil {
@@ -817,6 +901,13 @@ func (g *GeneratorService) EnsurePersonalTest(ctx context.Context, userID, subje
 	} else if len(missing) > 0 {
 		log.Printf("generator: bank short for user %d subject %d on %d topic(s): %v", userID, subjectID, len(missing), missing)
 	}
+	// Fingerprint template: a test was already GENERATED for exactly this
+	// weak-topic set (another user) — clone it right away: identical
+	// content, new question rows, no AI call, no waiting, no daily-limit
+	// charge. Works even when AI generation is disabled.
+	if t := g.clonePersonalForUser(ctx, userID, subjectID, keys); t != nil {
+		return t, false, topics, nil
+	}
 	if !g.Enabled() {
 		return nil, false, topics, nil
 	}
@@ -860,6 +951,29 @@ func (g *GeneratorService) EnsurePersonalTest(ctx context.Context, userID, subje
 		if n >= limit {
 			log.Printf("generator: user %d hit the daily personal generation limit (%d)", userID, limit)
 			return nil, false, topics, ErrPersonalGenLimit
+		}
+	}
+	// Backpressure (thousands of users vs a free AI quota of a few hundred
+	// tests a day): beyond GEN_MAX_ACTIVE_PERSONAL queued/running personal
+	// generations a new one is refused instead of growing the queue (and
+	// the wait of everybody in it) without bound. An already queued job of
+	// this user was handled above.
+	if maxActive := g.maxActivePersonal(); maxActive > 0 {
+		n, err := g.gen.CountActiveJobs(ctx, models.TestKindPersonal)
+		if err != nil {
+			return nil, false, nil, err
+		}
+		if n >= maxActive {
+			already, err := g.gen.HasPendingOrRunningPersonalJob(ctx, subjectID, userID)
+			if err != nil {
+				return nil, false, nil, err
+			}
+			if !already {
+				metrics.Inc(metrics.QueueBackpressure, "kind", models.TestKindPersonal)
+				log.Printf("generator: personal queue full (%d active) — user %d asked to retry later", n, userID)
+				return nil, false, topics, ErrGenQueueBusy
+			}
+			return nil, true, topics, nil
 		}
 	}
 	if err := g.gen.EnqueuePersonalJob(ctx, subjectID, userID); err != nil {
@@ -1166,16 +1280,23 @@ func (g *GeneratorService) executeJob(ctx context.Context, job *models.Generatio
 	go g.jobHeartbeat(ctx, job.ID, heartbeatDone)
 	defer close(heartbeatDone)
 
+	// Per-job outcome (strategy, AI calls, rejects, difficulty violations,
+	// tokens) — filled by runJob/runSteps, recorded below for A/B analysis.
+	run := &genRun{kind: job.Kind}
+	started := g.now()
 	testID, runErr := func() (testID int64, err error) {
 		defer func() {
 			if r := recover(); r != nil {
 				err = fmt.Errorf("job %d panicked: %v", job.ID, r)
 			}
 		}()
-		jobCtx, cancel := context.WithTimeout(ctx, jobTimeout)
+		jobCtx, cancel := context.WithTimeout(withGenRun(ctx, run), jobTimeout)
 		defer cancel()
 		return g.runJob(jobCtx, job)
 	}()
+	if run.strategy == "" {
+		run.strategy = "none" // resolved without generation (test already existed)
+	}
 	if runErr != nil && ctx.Err() != nil {
 		// Shutdown (SIGTERM / deploy) interrupted the job: it did not fail.
 		// Hand it back to the queue right away (pending, not_before = now(),
@@ -1208,6 +1329,7 @@ func (g *GeneratorService) executeJob(ctx context.Context, job *models.Generatio
 		}
 		return
 	}
+	g.recordOutcome(ctx, run, runErr == nil, g.now().Sub(started))
 	if runErr != nil {
 		log.Printf("generator: job %d failed: %v", job.ID, runErr)
 		if ferr := g.gen.FailJob(ctx, job.ID, runErr, retryDelay, maxJobAttempts); ferr != nil {
@@ -1294,6 +1416,13 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 	if err != nil {
 		return 0, err
 	}
+	if job.Kind == models.JobKindTopicBatch {
+		// B4: bank questions on one catalog topic, no test row (test_id 0).
+		if r := genRunFrom(ctx); r != nil {
+			r.strategy = strategyTopicBatch
+		}
+		return 0, g.runTopicBatch(ctx, job, subject.Name)
+	}
 	// B1: topic catalog of the subject — the model picks topics from it, the
 	// validators map aliases to canonical titles.
 	catalog, err := g.gen.TopicCatalog(ctx, job.SubjectID)
@@ -1301,34 +1430,34 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 		return 0, err
 	}
 
-	var prompt string
-	var title string
-	var testNumber int
+	spec := &genSpec{kind: job.Kind, subjectName: subject.Name, catalog: catalog}
+	var title, fingerprint string
 	var ownerUserID int64
-	var promptTopics []string // weak topics of a personal job (for validation)
-	kind := job.Kind
+	var topicKeys []string
 
-	switch kind {
+	switch job.Kind {
 	case models.TestKindChain:
-		testNumber = job.TestNumber
+		spec.testNumber = job.TestNumber
 		// Never pay for a test that already exists. The enqueue path is
 		// guarded, but a retried job may have actually succeeded on a
 		// previous attempt (crash between the DB write and the job update).
-		if existing, err := g.findChainTest(ctx, job.SubjectID, testNumber); err != nil {
+		if existing, err := g.findChainTest(ctx, job.SubjectID, spec.testNumber); err != nil {
 			return 0, err
 		} else if existing != nil {
-			log.Printf("generator: chain test %d of subject %d already exists (id %d) — job %d resolved with no AI call", testNumber, job.SubjectID, existing.ID, job.ID)
+			log.Printf("generator: chain test %d of subject %d already exists (id %d) — job %d resolved with no AI call", spec.testNumber, job.SubjectID, existing.ID, job.ID)
 			return existing.ID, nil
 		}
-		title = fmt.Sprintf("Тест %d", testNumber)
+		title = fmt.Sprintf("Тест %d", spec.testNumber)
 		var prev []models.Question
 		var marks []float64
-		if testNumber > 1 {
-			prevTest, err := g.findChainTest(ctx, job.SubjectID, testNumber-1)
+		var prevTestID int64
+		if spec.testNumber > 1 {
+			prevTest, err := g.findChainTest(ctx, job.SubjectID, spec.testNumber-1)
 			if err != nil {
 				return 0, err
 			}
 			if prevTest != nil {
+				prevTestID = prevTest.ID
 				prev, err = g.subjects.TestQuestions(ctx, prevTest.ID)
 				if err != nil {
 					return 0, err
@@ -1343,7 +1472,20 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 				}
 			}
 		}
-		prompt = chainGenPrompt(subject.Name, testNumber, prev, marks) + topicListPrompt(catalog)
+		spec.prevStems = questionStems(prev)
+		spec.prevMean = meanDifficulty(prev)
+		// Weak topics: of the previous test (average mark per topic) +
+		// subject-wide (aggregated user_topic_stats of active students).
+		spec.weak = chainWeakTopics(prevTopicMarks(prev, marks), g.subjectWeakTitles(ctx, job.SubjectID), chainWeakLimit)
+		for _, w := range spec.weak {
+			if k, ok := catalog.Resolve(w); ok {
+				topicKeys = append(topicKeys, k)
+			} else {
+				topicKeys = append(topicKeys, models.NormalizeTopic(w))
+			}
+		}
+		fingerprint = models.ChainFingerprint(job.SubjectID, spec.testNumber, prevTestID, topicKeys)
+		spec.basePrompt = chainGenContext(subject.Name, spec.testNumber, prev, marks, spec.weak) + topicListPrompt(catalog)
 
 	case models.TestKindPersonal:
 		ownerUserID = job.OwnerUserID
@@ -1360,77 +1502,67 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 			log.Printf("generator: user %d already has personal test %d in subject %d — job %d resolved with no AI call", ownerUserID, existing.ID, job.SubjectID, job.ID)
 			return existing.ID, nil
 		}
-		topics, err := g.gen.WeakTopics(ctx, ownerUserID, job.SubjectID, weakTopicsCount)
+		weak, err := g.gen.WeakTopicStats(ctx, ownerUserID, job.SubjectID, weakTopicsCount)
 		if err != nil {
 			return 0, err
 		}
-		if len(topics) == 0 {
+		if len(weak) == 0 {
 			return 0, fmt.Errorf("user %d has no weak topics in subject %d", ownerUserID, job.SubjectID)
 		}
-		testNumber = 0 // assigned by the DB: next free personal number (9000+)
+		for _, w := range weak {
+			spec.personalTopics = append(spec.personalTopics, w.Topic)
+			topicKeys = append(topicKeys, w.Key)
+		}
 		title = personalTestTitle
-		promptTopics = topics
-		prompt = personalGenPrompt(subject.Name, topics)
-
-	case models.JobKindTopicBatch:
-		// B4: bank questions on one catalog topic, no test row (test_id 0).
-		return 0, g.runTopicBatch(ctx, job, subject.Name)
+		fingerprint = models.WeakTopicsFingerprint(job.SubjectID, topicKeys)
+		spec.basePrompt = personalGenContext(subject.Name, spec.personalTopics)
 
 	default:
-		return 0, fmt.Errorf("unknown job kind %q", kind)
+		return 0, fmt.Errorf("unknown job kind %q", job.Kind)
 	}
 
-	// --- Provider route (cheapest first, every reply strictly validated):
-	//   1. Groq GPT-OSS 120B — free tier, reasoning medium for shared chain
-	//      tests, low for personal tests and retries;
-	//   2. Groq GPT-OSS 120B at low effort (a medium pass that blew the
-	//      token budget usually fits at low) — chain tests only;
-	//   3. Groq Qwen 3.8 27B — its own independent free quota bucket;
-	//   4. DeepSeek flash thinking — the paid last resort (old behaviour).
-	// A Groq step whose free-tier quota is exhausted is skipped instantly.
-	messages := []deepseek.Message{
-		{Role: "system", Content: genSystemPrompt},
-		{Role: "user", Content: prompt},
+	// Fingerprint templates: the same input was already generated (for
+	// another user / a previous run of this chain slot) — clone it, no AI.
+	if id, ok := g.cloneFromTemplate(ctx, job, fingerprint, title, ownerUserID); ok {
+		return id, nil
 	}
+
+	strategy := g.chooseStrategy(job)
+	run := &genRun{strategy: strategy, kind: job.Kind}
+	if r := genRunFrom(ctx); r != nil {
+		run = r
+		run.strategy, run.kind = strategy, job.Kind
+	} else {
+		ctx = withGenRun(ctx, run)
+	}
+	if job.ID > 0 {
+		if err := g.gen.SetJobStrategy(ctx, job.ID, strategy); err != nil {
+			log.Printf("generator: job %d: record strategy: %v", job.ID, err)
+		}
+	}
+	log.Printf("generator: job %d (%s) strategy=%s weak=%v", job.ID, job.Kind, strategy, append(spec.weak, spec.personalTopics...))
+
 	var final *generatedTest
-	validate := func(raw string) error {
-		gt, err := parseTestJSON(raw)
+	task := fmt.Sprintf("gen %s job %d", job.Kind, job.ID)
+	if strategy == strategyBatch {
+		if job.Kind == models.TestKindChain {
+			spec.slots = planChainSlots(spec.testNumber, spec.weak, GeneratedQuestionsPerTest, g.batchSize())
+		} else {
+			spec.slots = planPersonalSlots(spec.personalTopics, GeneratedQuestionsPerTest, g.batchSize())
+		}
+		final, err = g.generateBatched(ctx, job, spec)
 		if err != nil {
-			return err
+			return 0, fmt.Errorf("generate (batch): %w", err)
 		}
-		// Weak-topics tests carry a strict contract: only the requested
-		// topics, all of them covered — a sloppy reply never reaches the DB.
-		if kind == models.TestKindPersonal {
-			if err := validatePersonalCoverage(gt, promptTopics, catalog); err != nil {
-				return fmt.Errorf("personal test: %w", err)
-			}
+		// The batches were validated question by question; the whole test
+		// still has to pass the test-level contract below.
+	} else {
+		final, err = g.generateFull(ctx, job, spec, task)
+		if err != nil {
+			return 0, err
 		}
-		// Chain tests must match the difficulty of their chain position:
-		// a model that writes a beginner test for Тест 40 (or an olympiad
-		// for Тест 2) is rejected and the next provider writes it.
-		if kind == models.TestKindChain {
-			if err := validateChainDifficulty(gt, testNumber); err != nil {
-				return err
-			}
-			if err := validateChainTopics(gt, catalog); err != nil {
-				return err
-			}
-		}
-		// Quality gate: a reply where many questions give the answer away
-		// by the options' format (only the key has the dash, the key is the
-		// only filled-in gap, duplicate options, «все ответы верны»…) is
-		// sloppy as a whole — let the next provider write it from scratch.
-		// A few flagged questions are rewritten below (targeted repair).
-		if n := countHard(auditGenerated(gt)); n > maxHardFlaggedPerReply {
-			return fmt.Errorf("quality audit: %d of %d questions reveal the answer or have broken options", n, len(gt.Questions))
-		}
-		final = gt
-		return nil
 	}
-	task := fmt.Sprintf("gen %s job %d", kind, job.ID)
-	if _, _, err := runSteps(ctx, task, g.generationSteps(messages, kind, job.Attempts), validate); err != nil {
-		return 0, fmt.Errorf("generate: %w", err)
-	}
+
 	// Post-validation: every flagged question is rewritten by the model and
 	// re-audited before the test is stored; a test that still contains a
 	// giveaway question is NEVER shown to a student (the job is retried).
@@ -1438,14 +1570,15 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 		return 0, fmt.Errorf("quality: %w", err)
 	}
 	// The rewrites keep topics, but re-check the whole contract anyway
-	// (duplicates across questions, key balance, weak-topic coverage).
-	if err := validateTest(final); err != nil {
-		return 0, fmt.Errorf("after repair: %w", err)
-	}
-	if kind == models.TestKindPersonal {
-		if err := validatePersonalCoverage(final, promptTopics, catalog); err != nil {
-			return 0, fmt.Errorf("after repair: personal test: %w", err)
+	// (duplicates across questions, key balance, weak-topic coverage,
+	// difficulty, repeats of the previous test).
+	if err := g.validateFinal(final, spec); err != nil {
+		noteReject(ctx, "final", err)
+		if strategy == strategyBatch && job.ID > 0 {
+			// Do not let a retry reuse a combination that fails as a whole.
+			_ = g.gen.DeleteJobBatches(ctx, job.ID)
 		}
+		return 0, fmt.Errorf("after repair: %w", err)
 	}
 
 	// Collect the topic list of the final test for weak-topic analysis.
@@ -1460,51 +1593,168 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 	sort.Strings(testTopics)
 
 	test := &models.Test{
-		SubjectID:   job.SubjectID,
-		TestNumber:  testNumber,
-		Title:       title,
-		Kind:        kind,
-		Topics:      testTopics,
-		OwnerUserID: ownerUserID,
+		SubjectID:         job.SubjectID,
+		TestNumber:        spec.testNumber,
+		Title:             title,
+		Kind:              job.Kind,
+		Topics:            testTopics,
+		OwnerUserID:       ownerUserID,
+		TopicsFingerprint: fingerprint,
 	}
-	stored, err := g.gen.CreateGeneratedTest(ctx, test, final.toSeed())
+	if job.Kind == models.TestKindPersonal {
+		test.TestNumber = 0 // assigned by the DB: next personal number
+	}
+	seed := final.toSeed()
+	stored, err := g.gen.CreateGeneratedTest(ctx, test, seed)
 	if err != nil {
 		return 0, err
 	}
+	g.saveTemplate(ctx, job, fingerprint, spec.testNumber, testTopics, seed, stored.ID, ownerUserID, strategy)
 	return stored.ID, nil
 }
 
-// generationSteps returns the ordered provider route for one generation.
+// generateFull is the original one-call strategy: the model writes all 20
+// questions; the reply is validated as a whole (and rejected as a whole).
+// A rejected reply's reason is fed back to the next provider step.
+func (g *GeneratorService) generateFull(ctx context.Context, job *models.GenerationJob, spec *genSpec, task string) (*generatedTest, error) {
+	var prompt string
+	if job.Kind == models.TestKindChain {
+		prompt = spec.basePrompt + chainOutputLine
+	} else {
+		prompt = spec.basePrompt + personalOutputLine
+	}
+	var feedback string
+	messages := func() []deepseek.Message {
+		m := []deepseek.Message{
+			{Role: "system", Content: genSystemPrompt},
+			{Role: "user", Content: prompt},
+		}
+		if feedback != "" {
+			m[1].Content += "\nВНИМАНИЕ: предыдущий вариант этого теста ОТКЛОНЁН проверкой: " + feedback + ". Напиши тест заново и исправь именно это."
+		}
+		return m
+	}
+	var final *generatedTest
+	validate := func(raw string) error {
+		gt, err := parseTestJSON(raw)
+		if err != nil {
+			return err
+		}
+		if err := g.validateReply(gt, spec); err != nil {
+			return err
+		}
+		// Quality gate: a reply where many questions give the answer away
+		// by the options' format (only the key has the dash, the key is the
+		// only filled-in gap, duplicate options, «все ответы верны»…) is
+		// sloppy as a whole — let the next provider write it from scratch.
+		// A few flagged questions are rewritten afterwards (targeted repair).
+		if n := countHard(auditGenerated(gt)); n > maxHardFlaggedPerReply {
+			return rejectf(rejectQuality, "quality audit: %d of %d questions reveal the answer or have broken options", n, len(gt.Questions))
+		}
+		final = gt
+		return nil
+	}
+	if _, _, err := runStepsFeedback(ctx, task, g.generationStepsDyn(messages, job.Kind, job.Attempts), validate,
+		func(e error) { feedback = e.Error() }); err != nil {
+		return nil, fmt.Errorf("generate: %w", err)
+	}
+	return final, nil
+}
+
+// validateReply runs the kind-specific contract on a model reply (full
+// strategy: at every step, not only at the end).
+func (g *GeneratorService) validateReply(gt *generatedTest, spec *genSpec) error {
+	switch spec.kind {
+	case models.TestKindPersonal:
+		// Weak-topics tests carry a strict contract: only the requested
+		// topics, all of them covered — a sloppy reply never reaches the DB.
+		if err := validatePersonalCoverage(gt, spec.personalTopics, spec.catalog); err != nil {
+			return rejectf(rejectTopics, "personal test: %v", err)
+		}
+	case models.TestKindChain:
+		// Chain tests must match the difficulty of their chain position:
+		// a model that writes a beginner test for Тест 40 (or an olympiad
+		// for Тест 2) is rejected and the next provider writes it.
+		if err := validateChainDifficulty(gt, spec.testNumber); err != nil {
+			return err
+		}
+		if err := validateChainProgression(gt, spec.testNumber, spec.prevMean); err != nil {
+			return err
+		}
+		if err := validateNoRepeats(gt, spec.prevStems); err != nil {
+			return err
+		}
+		if err := validateChainTopics(gt, spec.catalog); err != nil {
+			return rejectf(rejectTopics, "%v", err)
+		}
+		if err := validateWeakCoverage(gt, spec.weak, spec.catalog); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateFinal is the test-level contract of the assembled/repaired test.
+func (g *GeneratorService) validateFinal(gt *generatedTest, spec *genSpec) error {
+	if err := validateTest(gt); err != nil {
+		return rejectf(rejectFormat, "%v", err)
+	}
+	// Repairs may introduce a near-duplicate or move a topic; re-check
+	// every rule of the kind.
+	return g.validateReply(gt, spec)
+}
+
+// subjectWeakTitles returns the subject-wide weak topics (titles) of the
+// active students, cached briefly per subject (one aggregate query per
+// subject per few minutes, however many chain jobs run).
+func (g *GeneratorService) subjectWeakTitles(ctx context.Context, subjectID int64) []string {
+	if g.gen == nil {
+		return nil
+	}
+	if v, ok := subjectWeakCache.get(subjectID); ok {
+		return v
+	}
+	rows, err := g.gen.SubjectWeakTopics(ctx, subjectID, subjectWeakWindow, subjectWeakMinUsers, chainWeakLimit)
+	if err != nil {
+		log.Printf("generator: subject %d weak topics: %v", subjectID, err)
+		return nil
+	}
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.Title)
+	}
+	subjectWeakCache.put(subjectID, out)
+	return out
+}
+
+// generationSteps returns the ordered provider route for one generation
+// with fixed messages (topic batches, tests).
 func (g *GeneratorService) generationSteps(messages []deepseek.Message, kind string, attempts int) []aiStep {
+	return g.generationStepsDyn(func() []deepseek.Message { return messages }, kind, attempts)
+}
+
+// generationStepsDyn returns the provider route; messages is evaluated when
+// a step runs (so a rejected reply's feedback reaches the next step).
+//
+// Route (audit: at most TWO Groq attempts, then the paid DeepSeek):
+//
+//	chain, first attempt: GPT-OSS 120B (medium) → Qwen 3.8 27B → DeepSeek (high)
+//	chain retry / personal / topic batch: GPT-OSS 120B (low) → Qwen → DeepSeek (low)
+//
+// Qwen is the second attempt (not GPT-OSS at a lower effort): it has its
+// own free quota and fails differently, so a bad GPT-OSS reply is not
+// followed by a near-identical one.
+func (g *GeneratorService) generationStepsDyn(messages func() []deepseek.Message, kind string, attempts int) []aiStep {
 	retry := attempts > 1
 	var steps []aiStep
 	if g.gq != nil {
-		gm := toGroqMessages(messages)
-		base := groq.Request{
-			Messages:   gm,
-			MaxTokens:  genMaxTokens,
-			MinTokens:  groqGenMinTokens,
-			Schema:     testJSONSchema,
-			SchemaName: "ent_test",
-			MaxWait:    groqGenMaxWait,
-		}
-		oss := base
-		oss.Model = groq.ModelGPTOSS120B
+		ossEffort := groq.EffortLow
 		if kind == models.TestKindChain && !retry {
-			oss.Effort = groq.EffortMedium
-			steps = append(steps, groqStep(g.gq, oss))
-			oss.Effort = groq.EffortLow
-			steps = append(steps, groqStep(g.gq, oss))
-		} else {
-			oss.Effort = groq.EffortLow
-			steps = append(steps, groqStep(g.gq, oss))
+			ossEffort = groq.EffortMedium
 		}
-		qw := base
-		qw.Model = groq.ModelQwen27B
-		qw.Effort = groq.EffortNone // instruct mode: no reasoning tokens, whole budget for JSON
-		qw.Temperature = 0.7
-		qw.TopP = 0.8
-		steps = append(steps, groqStep(g.gq, qw))
+		oss := groqFullStep(g.gq, groq.ModelGPTOSS120B, ossEffort, 0, 0, messages)
+		qw := groqFullStep(g.gq, groq.ModelQwen27B, groq.EffortNone, 0.7, 0.8, messages) // instruct mode: no reasoning tokens
+		steps = append(steps, oss, qw)
 	}
 	if g.ds != nil {
 		effort := deepseek.ThinkingEffortHigh
@@ -1523,11 +1773,38 @@ func (g *GeneratorService) generationSteps(messages []deepseek.Message, kind str
 					return "", err
 				}
 				defer release()
-				return ds.GenerateJSON(ctx, messages, genMaxTokens, effort)
+				return ds.GenerateJSON(ctx, messages(), genMaxTokens, effort)
 			},
 		})
 	}
 	return steps
+}
+
+// groqFullStep is a Groq step of a full (20/10-question) generation.
+func groqFullStep(gc *groq.Client, model, effort string, temp, topP float64, messages func() []deepseek.Message) aiStep {
+	name := "groq/" + model
+	if effort != "" {
+		name += "(" + effort + ")"
+	}
+	return aiStep{name: name, timeout: groqStepTimeout, run: func(ctx context.Context) (string, error) {
+		res, err := gc.ChatJSON(ctx, groq.Request{
+			Model:       model,
+			Messages:    toGroqMessages(messages()),
+			MaxTokens:   genMaxTokens,
+			MinTokens:   groqGenMinTokens,
+			Effort:      effort,
+			Temperature: temp,
+			TopP:        topP,
+			Schema:      testJSONSchema,
+			SchemaName:  "ent_test",
+			MaxWait:     groqGenMaxWait,
+		})
+		if err != nil {
+			return "", err
+		}
+		noteTokens(ctx, res.PromptTokens, res.CompletionTokens)
+		return res.Content, nil
+	}}
 }
 
 // testJSONSchema is the Structured Outputs schema of a generated test

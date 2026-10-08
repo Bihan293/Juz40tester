@@ -90,6 +90,10 @@ func (h *Handler) openWeakSubject(ctx context.Context, cb *bot.CallbackQuery, us
 		h.answerAlert(ctx, cb, "На сегодня лимит новых персональных тестов исчерпан 🙏 Пройди уже готовые тесты в «📚 Предметы» — завтра соберу новый тест по слабым темам.")
 		return
 	}
+	if errors.Is(err, services.ErrGenQueueBusy) {
+		h.answerAlert(ctx, cb, "Сейчас очень много желающих — очередь генерации заполнена 🙏 Попробуй через пару минут, а пока пройди тесты в «📚 Предметы».")
+		return
+	}
 	if err != nil {
 		logf("personal test %d/%d: %v", user.ID, subjectID, err)
 		h.answerCallback(ctx, cb, "Ошибка загрузки теста")
@@ -115,7 +119,7 @@ func (h *Handler) openWeakSubject(ctx context.Context, cb *bot.CallbackQuery, us
 		key := bankWatchKey(subjectID, user.ID)
 		check := func(ctx context.Context) (*models.Test, bool, error) {
 			test, pending, _, err := h.quiz.EnsurePersonalTest(ctx, user.ID, subjectID)
-			if errors.Is(err, services.ErrPersonalGenLimit) {
+			if errors.Is(err, services.ErrPersonalGenLimit) || errors.Is(err, services.ErrGenQueueBusy) {
 				return nil, false, nil
 			}
 			return test, pending, err

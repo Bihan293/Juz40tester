@@ -63,7 +63,10 @@ type Result struct {
 	PromptTokens     int
 	CompletionTokens int
 	ReasoningTokens  int
-	Model            string
+	// CachedTokens: prompt tokens served from Groq's prompt cache (the
+	// stable prefix of batch prompts); 0 when the API does not report it.
+	CachedTokens int
+	Model        string
 }
 
 // ErrTooLarge means the request cannot fit into ONE free-tier request
@@ -213,6 +216,9 @@ type chatResponse struct {
 		CompletionTokensDetails *struct {
 			ReasoningTokens int `json:"reasoning_tokens"`
 		} `json:"completion_tokens_details,omitempty"`
+		PromptTokensDetails *struct {
+			CachedTokens int `json:"cached_tokens"`
+		} `json:"prompt_tokens_details,omitempty"`
 	} `json:"usage,omitempty"`
 	Error *struct {
 		Message string `json:"message"`
@@ -429,6 +435,9 @@ func (c *Client) do(ctx context.Context, r Request, maxTokens int, useSchema boo
 		if cr.Usage.CompletionTokensDetails != nil {
 			res.ReasoningTokens = cr.Usage.CompletionTokensDetails.ReasoningTokens
 		}
+		if cr.Usage.PromptTokensDetails != nil {
+			res.CachedTokens = cr.Usage.PromptTokensDetails.CachedTokens
+		}
 		resv.commit(cr.Usage.PromptTokens + cr.Usage.CompletionTokens)
 	}
 	c.mu.Lock()
@@ -438,8 +447,8 @@ func (c *Client) do(ctx context.Context, r Request, maxTokens int, useSchema boo
 	c.mu.Unlock()
 	rm, tm, rd, td := lim.snapshot()
 	soft := lim.lim
-	log.Printf("groq: %s effort=%q in=%d out=%d (reasoning %d) max=%d %.1fs | quota min %d/%d req %d/%d tok, day %d/%d req %d/%d tok | session %d req %d tok ($0 — free tier)",
-		r.Model, r.Effort, res.PromptTokens, res.CompletionTokens, res.ReasoningTokens, maxTokens,
+	log.Printf("groq: %s effort=%q in=%d (cached %d) out=%d (reasoning %d) max=%d %.1fs | quota min %d/%d req %d/%d tok, day %d/%d req %d/%d tok | session %d req %d tok ($0 — free tier)",
+		r.Model, r.Effort, res.PromptTokens, res.CachedTokens, res.CompletionTokens, res.ReasoningTokens, maxTokens,
 		time.Since(started).Seconds(), rm, soft.RPM, tm, soft.TPM, rd, soft.RPD, td, soft.TPD, totReq, totTok)
 
 	if cr.Choices[0].FinishReason == "length" {

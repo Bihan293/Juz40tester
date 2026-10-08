@@ -172,3 +172,43 @@ func TestGenWorkersConfig(t *testing.T) {
 		}
 	}
 }
+
+func TestGenerationScaleSettings(t *testing.T) {
+	t.Setenv("BOT_TOKEN", "x")
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("WEBHOOK_URL", "https://example.onrender.com")
+	t.Setenv("WEBHOOK_SECRET", "s")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GenStrategy != GenStrategyBatch || cfg.GenBatchSize != 5 || !cfg.GenTemplateReuse || cfg.GenMaxActivePersonal != DefaultGenMaxActivePersonal || cfg.GenPregenAhead != 0 {
+		t.Fatalf("defaults: %+v", cfg)
+	}
+	if cfg.BackgroundConns() != DBConnsReserved {
+		t.Fatalf("4 gen workers need the minimum reserve, got %d", cfg.BackgroundConns())
+	}
+	t.Setenv("GEN_STRATEGY", "AB")
+	t.Setenv("GEN_AB_BATCH_PERCENT", "30")
+	t.Setenv("GEN_TEMPLATE_REUSE", "false")
+	t.Setenv("GEN_WORKERS", "16")
+	t.Setenv("DB_CONN_MAX_LIFETIME", "10m")
+	t.Setenv("DB_CONN_MAX_IDLE_TIME", "90")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GenStrategy != GenStrategyAB || cfg.GenABBatchPercent != 30 || cfg.GenTemplateReuse {
+		t.Fatalf("overrides: %+v", cfg)
+	}
+	if cfg.DBConnMaxLifetime != 10*time.Minute || cfg.DBConnMaxIdleTime != 90*time.Second {
+		t.Fatalf("pool durations: %v %v", cfg.DBConnMaxLifetime, cfg.DBConnMaxIdleTime)
+	}
+	if cfg.BackgroundConns() != 16+TranslationWorkers+2 {
+		t.Fatalf("16 gen workers reserve %d", cfg.BackgroundConns())
+	}
+	t.Setenv("GEN_STRATEGY", "magic")
+	if _, err := Load(); err == nil {
+		t.Fatal("an unknown strategy must fail the start")
+	}
+}

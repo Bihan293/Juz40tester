@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Bihan293/Juz40tester/internal/bot"
+	"github.com/Bihan293/Juz40tester/internal/metrics"
 )
 
 // updateDispatcher receives Telegram webhook requests and processes the
@@ -48,7 +49,50 @@ type updateDispatcher struct {
 
 	rejected atomic.Int64 // updates refused with 503 because the queue was full
 	lastWarn atomic.Int64 // unix seconds of the last overflow log line
+
+	// seen remembers recently accepted update_ids: Telegram re-delivers an
+	// update when our 200 got lost (timeout, deploy) — the duplicate is
+	// acknowledged without processing it twice (idempotency).
+	seen *recentIDs
 }
+
+// recentIDs is a bounded set of the last N update ids (ring buffer + map).
+type recentIDs struct {
+	mu   sync.Mutex
+	set  map[int64]struct{}
+	ring []int64
+	pos  int
+}
+
+func newRecentIDs(n int) *recentIDs {
+	return &recentIDs{set: make(map[int64]struct{}, n), ring: make([]int64, n)}
+}
+
+// add records id and reports whether it was NEW (false = duplicate).
+func (r *recentIDs) add(id int64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, dup := r.set[id]; dup {
+		return false
+	}
+	if old := r.ring[r.pos]; old != 0 {
+		delete(r.set, old)
+	}
+	r.ring[r.pos] = id
+	r.set[id] = struct{}{}
+	r.pos = (r.pos + 1) % len(r.ring)
+	return true
+}
+
+// forget removes id (an update that was NOT accepted must stay deliverable).
+func (r *recentIDs) forget(id int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.set, id)
+}
+
+// recentUpdateIDs is how many update ids the dedupe window remembers.
+const recentUpdateIDs = 10000
 
 // defaultUpdateQueueSize is the bounded webhook queue (R-3).
 const defaultUpdateQueueSize = 1000
@@ -68,6 +112,7 @@ func newUpdateDispatcher(secret string, workers, queueSize int, timeout time.Dur
 		base:       base,
 		cancelBase: cancel,
 		queue:      make(chan *bot.Update, queueSize),
+		seen:       newRecentIDs(recentUpdateIDs),
 	}
 	d.wg.Add(workers)
 	for i := 0; i < workers; i++ {
@@ -99,7 +144,16 @@ func (d *updateDispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	switch d.enqueue(&upd) {
+	if upd.UpdateID != 0 && !d.seen.add(int64(upd.UpdateID)) {
+		metrics.Inc(metrics.DuplicateUpdates)
+		w.WriteHeader(http.StatusOK) // already accepted once — do not process twice
+		return
+	}
+	res := d.enqueue(&upd)
+	if res != enqueued && upd.UpdateID != 0 {
+		d.seen.forget(int64(upd.UpdateID)) // 503: Telegram re-delivers it, it must be processed then
+	}
+	switch res {
 	case enqueued:
 		// Respond to Telegram immediately; processing continues asynchronously.
 		w.WriteHeader(http.StatusOK)

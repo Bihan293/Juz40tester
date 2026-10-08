@@ -660,9 +660,12 @@ func (r *GenerationRepository) ClaimNextJob(ctx context.Context) (*models.Genera
 	return &j, nil
 }
 
-// CompleteJob marks the job done and links the produced test.
+// CompleteJob marks the job done and links the produced test. The job's
+// stored batches (gen_job_batches) are no longer needed and go away in the
+// same statement. (A FAILED job keeps them: a revived job reuses them.)
 func (r *GenerationRepository) CompleteJob(ctx context.Context, jobID, testID int64) error {
 	_, err := r.pool.Exec(ctx, `
+		WITH d AS (DELETE FROM gen_job_batches WHERE job_id = $1)
 		UPDATE generation_jobs
 		SET status = 'done', test_id = NULLIF($2::bigint, 0), last_error = '', updated_at = now()
 		WHERE id = $1`, jobID, testID)
@@ -816,27 +819,36 @@ func (r *GenerationRepository) createTest(ctx context.Context, test *models.Test
 		return nil, err
 	}
 
+	// One round trip for all questions (pgx.Batch) instead of 2×20
+	// sequential statements: every question row + its link is ONE
+	// statement (a data-modifying CTE), and all of them are pipelined.
 	labels := []string{"A", "B", "C", "D"}
+	batch := &pgx.Batch{}
 	for i, sq := range questions {
 		if sq.Correct < 0 || sq.Correct > 3 {
 			return nil, fmt.Errorf("question %d: invalid correct index %d", i+1, sq.Correct)
 		}
-		var qid int64
-		if err := tx.QueryRow(ctx, `
-			INSERT INTO questions (subject_id, question_text, option_a, option_b, option_c, option_d,
-			                       correct_answer, topic, difficulty, quality_checked_at, topic_key)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CASE WHEN $10 THEN now() END, NULLIF($11, ''))
-			RETURNING id`,
+		batch.Queue(`
+			WITH q AS (
+				INSERT INTO questions (subject_id, question_text, option_a, option_b, option_c, option_d,
+				                       correct_answer, topic, difficulty, quality_checked_at, topic_key)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CASE WHEN $10 THEN now() END, NULLIF($11, ''))
+				RETURNING id)
+			INSERT INTO test_questions (test_id, question_id, position)
+			SELECT $12, q.id, $13 FROM q`,
 			test.SubjectID, sq.Text, sq.Options[0], sq.Options[1], sq.Options[2], sq.Options[3],
 			labels[sq.Correct], sq.Topic, sq.Difficulty, sq.QualityChecked,
-			topicKeys[models.NormalizeTopic(sq.Topic)]).Scan(&qid); err != nil {
-			return nil, err
+			topicKeys[models.NormalizeTopic(sq.Topic)], testID, i+1)
+	}
+	br := tx.SendBatch(ctx, batch)
+	for i := range questions {
+		if _, err := br.Exec(); err != nil {
+			_ = br.Close()
+			return nil, fmt.Errorf("insert question %d: %w", i+1, err)
 		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO test_questions (test_id, question_id, position)
-			VALUES ($1, $2, $3)`, testID, qid, i+1); err != nil {
-			return nil, err
-		}
+	}
+	if err := br.Close(); err != nil {
+		return nil, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {

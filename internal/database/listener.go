@@ -2,6 +2,8 @@ package database
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"time"
 
@@ -13,6 +15,13 @@ const (
 	listenRetryMin = 2 * time.Second
 	listenRetryMax = time.Minute
 )
+
+// listenKeepalive: an idle LISTEN connection is pinged this often. Without
+// it a half-open TCP connection (NAT/LB idle timeout, a Neon compute
+// restart without a FIN) blocked WaitForNotification forever: the listener
+// looked alive while no NOTIFY ever arrived, and jobs of other instances
+// waited for the 3-minute fallback poll. A failed ping reconnects.
+var listenKeepalive = 60 * time.Second
 
 // Listen keeps ONE dedicated connection to databaseURL (must be a DIRECT,
 // non-pooler URL: LISTEN does not work behind a transaction-mode pooler),
@@ -62,8 +71,23 @@ func listenOnce(ctx context.Context, databaseURL string, channels []string, onNo
 		onNotify(ch)
 	}
 	for {
-		n, err := conn.WaitForNotification(ctx)
+		wctx, cancel := context.WithTimeout(ctx, listenKeepalive)
+		n, err := conn.WaitForNotification(wctx)
+		cancel()
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if errors.Is(err, context.DeadlineExceeded) || wctx.Err() != nil {
+				// Idle period: prove the connection is still alive.
+				pctx, pcancel := context.WithTimeout(ctx, 10*time.Second)
+				perr := conn.Ping(pctx)
+				pcancel()
+				if perr != nil {
+					return fmt.Errorf("keepalive ping: %w", perr)
+				}
+				continue
+			}
 			return err
 		}
 		onNotify(n.Channel)

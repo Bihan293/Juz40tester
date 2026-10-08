@@ -32,13 +32,21 @@ func BankQuota(topicKeys []string, total int) map[string]int {
 
 // bankCandidatesSQL picks, per requested topic_key, up to its quota of
 // quality-checked bank questions the user has not seen (no progress row) or
-// still has 🔴, in random order.
+// still has 🔴.
+//
+// The order is a stable pseudo-random permutation seeded by the weak-topics
+// FINGERPRINT ($5, models.WeakTopicsFingerprint) instead of random(): two
+// users with the same weak topics and the same history get the SAME test
+// (identical questions — the same shared rows, zero AI calls, zero new
+// rows), while different weak-topic sets still get differently shuffled
+// selections. Users who have already seen some questions simply get the
+// next unseen ones of the same permutation.
 const bankCandidatesSQL = `
 	WITH quota AS (
 		SELECT * FROM unnest($3::text[], $4::int[]) AS t(topic_key, n)
 	), c AS (
 		SELECT q.id, q.topic_key,
-		       row_number() OVER (PARTITION BY q.topic_key ORDER BY random()) AS rn
+		       row_number() OVER (PARTITION BY q.topic_key ORDER BY md5($5::text || ':' || q.id::text)) AS rn
 		FROM questions q
 		JOIN quota ON quota.topic_key = q.topic_key
 		LEFT JOIN user_question_progress p ON p.user_id = $2 AND p.question_id = q.id
@@ -48,7 +56,7 @@ const bankCandidatesSQL = `
 	)
 	SELECT c.id, c.topic_key FROM c JOIN quota ON quota.topic_key = c.topic_key
 	WHERE c.rn <= quota.n
-	ORDER BY random()`
+	ORDER BY md5($5::text || '/' || c.id::text)`
 
 // BankShortage is a topic whose bank quota could not be filled for the user
 // (B4b): Missing questions are lacking.
@@ -69,14 +77,20 @@ func ShortageKeys(s []BankShortage) []string {
 // BankCandidates returns the bank questions selected for the quotas
 // (question ids in display order) and the topics whose quota could not be
 // filled with the number of lacking questions (in the order of topicKeys).
-func (r *GenerationRepository) BankCandidates(ctx context.Context, subjectID, userID int64, topicKeys []string, quota map[string]int) (ids []int64, missing []BankShortage, err error) {
+//
+// seed is the weak-topics fingerprint (identical selection for identical
+// weak-topic sets); "" falls back to a per-subject seed.
+func (r *GenerationRepository) BankCandidates(ctx context.Context, subjectID, userID int64, topicKeys []string, quota map[string]int, seed string) (ids []int64, missing []BankShortage, err error) {
+	if seed == "" {
+		seed = models.WeakTopicsFingerprint(subjectID, topicKeys)
+	}
 	keys := make([]string, 0, len(topicKeys))
 	ns := make([]int32, 0, len(topicKeys))
 	for _, k := range topicKeys {
 		keys = append(keys, k)
 		ns = append(ns, int32(quota[k]))
 	}
-	rows, err := r.pool.Query(ctx, bankCandidatesSQL, subjectID, userID, keys, ns)
+	rows, err := r.pool.Query(ctx, bankCandidatesSQL, subjectID, userID, keys, ns, seed)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -109,6 +123,12 @@ func (r *GenerationRepository) BankCandidates(ctx context.Context, subjectID, us
 // subject (concurrent creation, unique index idx_tests_personal_owner),
 // that test is returned instead.
 func (r *GenerationRepository) CreateBankPersonalTest(ctx context.Context, subjectID, userID int64, title string, topics []string, questionIDs []int64) (*models.Test, error) {
+	return r.createBankPersonalTest(ctx, subjectID, userID, title, topics, questionIDs, "")
+}
+
+// createBankPersonalTest is CreateBankPersonalTest that also records the
+// weak-topics fingerprint of the test (tests.topics_fingerprint).
+func (r *GenerationRepository) createBankPersonalTest(ctx context.Context, subjectID, userID int64, title string, topics []string, questionIDs []int64, fingerprint string) (*models.Test, error) {
 	if userID <= 0 || len(questionIDs) == 0 {
 		return nil, errors.New("bank test: owner and questions are required")
 	}
@@ -125,11 +145,11 @@ func (r *GenerationRepository) CreateBankPersonalTest(ctx context.Context, subje
 	var testID int64
 	var number int
 	err = tx.QueryRow(ctx, `
-		INSERT INTO tests (subject_id, test_number, title, is_active, kind, topics, owner_user_id, from_bank)
-		VALUES ($1, nextval('personal_test_number_seq'), $2, TRUE, 'personal', $3, $4, TRUE)
+		INSERT INTO tests (subject_id, test_number, title, is_active, kind, topics, owner_user_id, from_bank, topics_fingerprint)
+		VALUES ($1, nextval('personal_test_number_seq'), $2, TRUE, 'personal', $3, $4, TRUE, NULLIF($5, ''))
 		ON CONFLICT DO NOTHING
 		RETURNING id, test_number`,
-		subjectID, title, topicsJSON, userID).Scan(&testID, &number)
+		subjectID, title, topicsJSON, userID, fingerprint).Scan(&testID, &number)
 	if errors.Is(err, pgx.ErrNoRows) {
 		_ = tx.Rollback(ctx)
 		existing, err := r.FindPersonalTest(ctx, subjectID, userID)
@@ -165,7 +185,7 @@ func (r *GenerationRepository) CreateBankPersonalTest(ctx context.Context, subje
 	return &models.Test{
 		ID: testID, SubjectID: subjectID, TestNumber: number, Title: title,
 		IsActive: true, Kind: models.TestKindPersonal, Topics: topics,
-		OwnerUserID: userID, FromBank: true,
+		OwnerUserID: userID, FromBank: true, TopicsFingerprint: fingerprint,
 	}, nil
 }
 
@@ -183,11 +203,12 @@ func (r *GenerationRepository) AssembleBankPersonalTest(ctx context.Context, sub
 		return nil, nil, nil
 	}
 	quota := BankQuota(topicKeys, total)
-	ids, missing, err := r.BankCandidates(ctx, subjectID, userID, topicKeys, quota)
+	fp := models.WeakTopicsFingerprint(subjectID, topicKeys)
+	ids, missing, err := r.BankCandidates(ctx, subjectID, userID, topicKeys, quota, fp)
 	if err != nil || len(missing) > 0 {
 		return nil, missing, err
 	}
-	test, err := r.CreateBankPersonalTest(ctx, subjectID, userID, title, titles, ids)
+	test, err := r.createBankPersonalTest(ctx, subjectID, userID, title, titles, ids, fp)
 	if errors.Is(err, errBankChanged) {
 		return nil, nil, nil
 	}

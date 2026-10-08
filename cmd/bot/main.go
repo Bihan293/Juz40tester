@@ -231,6 +231,11 @@ func main() {
 	mux := http.NewServeMux()
 	// R-5c: the DB ping result is cached for HEALTH_CACHE_SEC (default 45s).
 	mux.Handle("GET /health", newHealthCache(pool.Ping, cfg.HealthCacheTTL))
+	// Generation metrics (difficulty violations, rejected replies, strategy
+	// outcomes, template hits, …) in the Prometheus text format; protected by
+	// METRICS_TOKEN when it is set.
+	mux.Handle("GET /metrics", metricsHandler(cfg.MetricsToken))
+	go logMetrics(workerCtx, metricsLogEvery)
 	// Hidden keep-alive endpoint: used only by external uptime monitors and
 	// by the internal self-pinger below. Deliberately absent from the bot UI.
 	mux.HandleFunc("GET /ping", func(w http.ResponseWriter, r *http.Request) {
@@ -247,7 +252,7 @@ func main() {
 	// R-3: a fixed pool of maxConcurrentUpdates workers + a bounded queue of
 	// defaultUpdateQueueSize; overflow is answered with 503 (Telegram
 	// re-delivers later).
-	updates := newUpdateDispatcher(cfg.WebhookSecret, updateWorkers(cfg.DBMaxConns), defaultUpdateQueueSize, cfg.UpdateTimeout, h.HandleUpdate)
+	updates := newUpdateDispatcher(cfg.WebhookSecret, updateWorkersFor(cfg.DBMaxConns, cfg.BackgroundConns()), defaultUpdateQueueSize, cfg.UpdateTimeout, h.HandleUpdate)
 	mux.Handle("POST /telegram/webhook", updates)
 
 	srv := &http.Server{
@@ -338,20 +343,31 @@ func main() {
 // maxConcurrentUpdates bounds simultaneously processed Telegram updates.
 const maxConcurrentUpdates = 32
 
-// dbConnsReserved is the part of the pgx pool kept for the generation /
-// translation workers, reapers and cleanup, so update handlers can never
-// take every pooled connection.
-const dbConnsReserved = 8
+// dbConnsReserved is the MINIMUM part of the pgx pool kept for the
+// generation / translation workers, reapers and cleanup, so update handlers
+// can never take every pooled connection (config.DBConnsReserved).
+const dbConnsReserved = config.DBConnsReserved
 
 // updateWorkers caps maxConcurrentUpdates at DB_MAX_CONNS - 8 (at least 1):
 // more concurrent updates than free pool connections only queue on the
 // pool and starve the background workers.
 func updateWorkers(dbMaxConns int) int {
+	return updateWorkersFor(dbMaxConns, dbConnsReserved)
+}
+
+// updateWorkersFor caps maxConcurrentUpdates at DB_MAX_CONNS - reserve,
+// where reserve is what the background work can hold at once
+// (config.BackgroundConns: ≥ 8, more with GEN_WORKERS > 2 — with the old
+// fixed 8, GEN_WORKERS=16 could starve the update handlers or vice versa).
+func updateWorkersFor(dbMaxConns, reserve int) int {
+	if reserve < dbConnsReserved {
+		reserve = dbConnsReserved
+	}
 	n := maxConcurrentUpdates
-	if limit := dbMaxConns - dbConnsReserved; n > limit {
+	if limit := dbMaxConns - reserve; n > limit {
 		n = max(limit, 1)
-		log.Printf("WARNING: concurrent updates capped at %d (DB_MAX_CONNS=%d - %d reserved), was %d",
-			n, dbMaxConns, dbConnsReserved, maxConcurrentUpdates)
+		log.Printf("WARNING: concurrent updates capped at %d (DB_MAX_CONNS=%d - %d reserved for background work), was %d",
+			n, dbMaxConns, reserve, maxConcurrentUpdates)
 	}
 	return n
 }
