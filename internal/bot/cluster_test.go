@@ -18,6 +18,8 @@ func TestUpdateUserKey(t *testing.T) {
 		{&Update{Message: &Message{From: &TgUser{ID: 5}, Chat: Chat{ID: 9}}}, 5},
 		{&Update{Message: &Message{Chat: Chat{ID: 9}}}, 0},
 		{&Update{CallbackQuery: &CallbackQuery{From: &TgUser{ID: 7}}}, 7},
+		{&Update{PreCheckoutQuery: &PreCheckoutQuery{From: &TgUser{ID: 8}}}, 8},
+		{&Update{PreCheckoutQuery: &PreCheckoutQuery{}}, 0},
 	}
 	for i, c := range cases {
 		if got := c.u.UserKey(); got != c.want {

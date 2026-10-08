@@ -72,6 +72,9 @@ func (h *Handler) handleMessage(ctx context.Context, m *bot.Message) {
 	}
 
 	text := strings.TrimSpace(m.Text)
+	if strings.HasPrefix(text, "/") && h.handleAdmin(ctx, m, text) {
+		return
+	}
 	switch commandKey(text) {
 	case "/start":
 		h.sendMainMenu(ctx, m.Chat.ID, user, true)
@@ -85,6 +88,8 @@ func (h *Handler) handleMessage(ctx context.Context, m *bot.Message) {
 		h.showLeaderboardMenu(ctx, m.Chat.ID)
 	case kbSettings, "/settings":
 		h.showSettings(ctx, m.Chat.ID, user)
+	case kbPlans, "/plans", "/subscription", "/tariffs":
+		h.showPlans(ctx, m.Chat.ID, user)
 	default:
 		// Unknown text/command -> main menu.
 		h.sendMainMenu(ctx, m.Chat.ID, user, false)
@@ -163,6 +168,10 @@ func (h *Handler) handleCallback(ctx context.Context, cb *bot.CallbackQuery) {
 	case data == cbLeaderboard:
 		h.answerCallback(ctx, cb, "")
 		h.editLeaderboardMenu(ctx, cb)
+	case data == cbPlans:
+		h.editPlans(ctx, cb, user)
+	case strings.HasPrefix(data, cbBuyPlan):
+		h.buyPlan(ctx, cb, user, strings.TrimPrefix(data, cbBuyPlan))
 	case data == cbLbStreak:
 		h.answerCallback(ctx, cb, "")
 		h.showStreakLeaderboard(ctx, cb)
@@ -185,6 +194,7 @@ type idRoute struct {
 // prefixes overlap: cbExitYes / cbExitNo must precede cbExit.
 var idRoutes = []idRoute{
 	{cbWeakSubject, false, (*Handler).openWeakSubject},    // answers itself (toast / error / silent)
+	{cbWeakBuy, false, (*Handler).buyWeakTest},            // answers itself
 	{cbFinish, false, (*Handler).finishPersonalTest},      // answers itself
 	{cbSubject, true, (*Handler).openSubject},             //
 	{cbOpenTest, false, (*Handler).openTest},              // answers itself (unlock requirements toast)

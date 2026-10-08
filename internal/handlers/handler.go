@@ -43,6 +43,11 @@ type Handler struct {
 	limiter ActionLimiter
 	// gen is the registry of shared generation watchers (R-7).
 	gen *genWatchers
+	// billing (optional): Telegram Stars subscriptions, daily quota, paid
+	// weak-topics tests. nil = off (the old behaviour).
+	billing *services.BillingService
+	// isAdmin (optional) recognises administrators (ADMIN_IDS).
+	isAdmin func(tgUserID int64) bool
 }
 
 // New creates a Handler.
@@ -86,6 +91,16 @@ func (h *Handler) ProcessUpdate(ctx context.Context, upd *bot.Update) (err error
 		}
 	}()
 	switch {
+	case upd.PreCheckoutQuery != nil && upd.PreCheckoutQuery.From != nil:
+		// Payments are never throttled and answered before anything else
+		// (Telegram waits at most 10 seconds).
+		h.handlePreCheckout(ctx, upd.PreCheckoutQuery)
+	case upd.Message != nil && upd.Message.From != nil && upd.Message.SuccessfulPayment != nil:
+		return h.handleSuccessfulPayment(ctx, upd.Message)
+	case upd.Message != nil && upd.Message.From != nil && upd.Message.RefundedPayment != nil:
+		if h.billing != nil {
+			h.billing.OnRefundedPayment(ctx, upd.Message.RefundedPayment.TelegramPaymentChargeID)
+		}
 	case upd.Message != nil && upd.Message.From != nil:
 		h.handleMessage(ctx, upd.Message)
 	case upd.CallbackQuery != nil && upd.CallbackQuery.From != nil:

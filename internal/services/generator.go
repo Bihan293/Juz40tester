@@ -865,6 +865,18 @@ func (g *GeneratorService) reviveChainTest(ctx context.Context, subjectID int64,
 // weakness profiles get identical questions — the second one receives a
 // fresh CLONE of the already-generated test (no model call at all).
 func (g *GeneratorService) EnsurePersonalTest(ctx context.Context, userID, subjectID int64) (test *models.Test, pending bool, topics []string, err error) {
+	return g.ensurePersonalTest(ctx, userID, subjectID, false)
+}
+
+// EnsurePersonalTestPaid is EnsurePersonalTest for a PAID weak-topics
+// order (Telegram Stars): the per-user daily generation limit and the
+// personal-queue backpressure do not apply — the user has paid for this
+// one test, refusing it would only lead to a refund.
+func (g *GeneratorService) EnsurePersonalTestPaid(ctx context.Context, userID, subjectID int64) (test *models.Test, pending bool, topics []string, err error) {
+	return g.ensurePersonalTest(ctx, userID, subjectID, true)
+}
+
+func (g *GeneratorService) ensurePersonalTest(ctx context.Context, userID, subjectID int64, paid bool) (test *models.Test, pending bool, topics []string, err error) {
 	weak, err := g.gen.WeakTopicStats(ctx, userID, subjectID, weakTopicsCount)
 	if err != nil {
 		return nil, false, nil, err
@@ -936,7 +948,7 @@ func (g *GeneratorService) EnsurePersonalTest(ctx context.Context, userID, subje
 	// R-9: a NEW paid-capable generation (not a clone, not an already
 	// queued job) counts against the per-user daily limit. The count lives
 	// in the DB (generation_jobs), so it holds across instances/restarts.
-	if limit := g.personalGenLimit(); limit > 0 {
+	if limit := g.personalGenLimit(); limit > 0 && !paid {
 		already, err := g.gen.HasPendingOrRunningPersonalJob(ctx, subjectID, userID)
 		if err != nil {
 			return nil, false, nil, err
@@ -958,7 +970,7 @@ func (g *GeneratorService) EnsurePersonalTest(ctx context.Context, userID, subje
 	// generations a new one is refused instead of growing the queue (and
 	// the wait of everybody in it) without bound. An already queued job of
 	// this user was handled above.
-	if maxActive := g.maxActivePersonal(); maxActive > 0 {
+	if maxActive := g.maxActivePersonal(); maxActive > 0 && !paid {
 		n, err := g.gen.CountActiveJobs(ctx, models.TestKindPersonal)
 		if err != nil {
 			return nil, false, nil, err

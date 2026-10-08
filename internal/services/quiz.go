@@ -1044,3 +1044,32 @@ func (s *QuizService) TestNeedsTranslationFor(ctx context.Context, user *models.
 	}
 	return s.subjectTranslatable(ctx, test.SubjectID)
 }
+
+// PersonalTestState is the read-only look at the user's weak-topics test of
+// the subject used by the PAID weak-topics flow (nothing is generated or
+// deleted here): the current weak topics, the existing personal test and
+// whether it is stale (none of its topics is weak anymore).
+func (s *QuizService) PersonalTestState(ctx context.Context, userID, subjectID int64) (test *models.Test, stale bool, topics []string, err error) {
+	weak, err := s.gen.WeakTopicStats(ctx, userID, subjectID, weakTopicsCount)
+	if err != nil {
+		return nil, false, nil, err
+	}
+	topics = make([]string, len(weak))
+	norm := make(map[string]bool, len(weak))
+	for i, w := range weak {
+		topics[i] = w.Topic
+		norm[models.NormalizeTopic(w.Topic)] = true
+	}
+	test, err = s.gen.FindPersonalTest(ctx, subjectID, userID)
+	if err != nil || test == nil {
+		return nil, false, topics, err
+	}
+	stale = true
+	for _, t := range test.Topics {
+		if norm[models.NormalizeTopic(t)] {
+			stale = false
+			break
+		}
+	}
+	return test, stale, topics, nil
+}

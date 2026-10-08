@@ -30,14 +30,15 @@ func (h *Handler) showResult(ctx context.Context, cb *bot.CallbackQuery, user *m
 	if cb != nil && cb.Message != nil {
 		target = cb.Message.Chat.ID
 	}
-	h.renderSummary(ctx, sum, user, attemptID, target)
+	h.renderSummary(ctx, sum, user, attemptID, target, "")
 }
 
 // renderSummary sends the attempt summary as a NEW message. It is separated
 // from showResult so the answer flow can reuse the summary it already built
 // (needed to decide whether the next test starts generating) without
 // querying the database twice.
-func (h *Handler) renderSummary(ctx context.Context, sum *services.AttemptSummary, user *models.User, attemptID, chatID int64) {
+// extra (optional) is appended under the score (the quota charge line).
+func (h *Handler) renderSummary(ctx context.Context, sum *services.AttemptSummary, user *models.User, attemptID, chatID int64, extra string) {
 	target := chatID
 	var b strings.Builder
 	b.WriteString("🎉 Тест завершён!\n\n")
@@ -45,6 +46,9 @@ func (h *Handler) renderSummary(ctx context.Context, sum *services.AttemptSummar
 	fmt.Fprintf(&b, "🟡 В процессе: %d\n", sum.StatusCounts[models.StatusPartial])
 	fmt.Fprintf(&b, "🔴 Требует повторения: %d\n\n", sum.StatusCounts[models.StatusNone])
 	fmt.Fprintf(&b, "Результат: %d/%d", sum.Attempt.CorrectCount, sum.Total)
+	if extra != "" {
+		b.WriteString("\n\n" + extra)
+	}
 
 	green := sum.StatusCounts[models.StatusMastered]
 	yellow := sum.StatusCounts[models.StatusPartial]

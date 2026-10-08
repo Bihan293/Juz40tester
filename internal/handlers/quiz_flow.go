@@ -51,8 +51,10 @@ func (h *Handler) openTest(ctx context.Context, cb *bot.CallbackQuery, user *mod
 	}
 
 	// The callback is acknowledged right away (a silent ack stops the
-	// spinner); every further notice goes to the chat as a normal message.
-	h.answerCallback(ctx, cb, "")
+	// spinner; with subscriptions on it shows «Осталось прохождений
+	// сегодня: X/Y»); every further notice goes to the chat as a normal
+	// message.
+	h.answerCallback(ctx, cb, h.quotaToast(ctx, user, test))
 
 	// Kazakh users: the test content must have a Kazakh version. A cached
 	// translation is used right away (ZERO API calls). Otherwise (R-4) a
@@ -91,6 +93,10 @@ func (h *Handler) startOrResume(ctx context.Context, cb *bot.CallbackQuery, user
 
 	// The test row is already loaded above — no second GetTest (R-2).
 	attempt, err := h.quiz.StartTestFor(ctx, user.ID, test)
+	if errors.Is(err, repositories.ErrQuotaExceeded) {
+		h.sendQuotaExceeded(ctx, cb.Message.Chat.ID, user)
+		return
+	}
 	if errors.Is(err, repositories.ErrNotFound) {
 		h.failOpenTest(ctx, cb, "Тест не найден")
 		return
@@ -255,7 +261,11 @@ func (h *Handler) handleAnswer(ctx context.Context, cb *bot.CallbackQuery, user 
 		}
 		h.quiz.OnTestCompleted(ctx, user.ID, sum.Test,
 			sum.StatusCounts[models.StatusMastered], sum.StatusCounts[models.StatusPartial])
-		h.renderSummary(ctx, sum, user, attemptID, chatID)
+		extra := ""
+		if res.Charged {
+			extra = h.chargedLine(ctx, user)
+		}
+		h.renderSummary(ctx, sum, user, attemptID, chatID, extra)
 		return
 	}
 	// The next question is sent as a NEW message right below the answered
@@ -328,6 +338,10 @@ func (h *Handler) restartRun(ctx context.Context, cb *bot.CallbackQuery, user *m
 	// Every retry is a brand-new attempt with fresh shuffled question and
 	// option orders.
 	newAttempt, err := h.quiz.RestartTest(ctx, user.ID, testID)
+	if errors.Is(err, repositories.ErrQuotaExceeded) {
+		h.sendQuotaExceeded(ctx, cb.Message.Chat.ID, user)
+		return
+	}
 	if err != nil {
 		logf("retry test: %v", err)
 		h.sendText(ctx, cb.Message.Chat.ID, "Не удалось начать тест 😔")

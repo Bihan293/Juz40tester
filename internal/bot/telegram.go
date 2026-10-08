@@ -33,6 +33,16 @@ type Client struct {
 	// cluster, not per process. When it fails (Redis unreachable) the call
 	// falls back to the local limiter, so sending never stalls.
 	shared SharedLimiter
+	// testEnv: requests go to the Telegram TEST environment
+	// (…/bot<token>/test/<method>) — Stars payments with test Stars.
+	testEnv bool
+}
+
+// WithTestEnvironment switches the client to the Telegram test
+// environment (TELEGRAM_TEST_ENV=1): test accounts, test Stars.
+func (c *Client) WithTestEnvironment(on bool) *Client {
+	c.testEnv = on
+	return c
 }
 
 // NewClient creates a client for the given bot token.
@@ -60,6 +70,9 @@ type Update struct {
 	UpdateID      int64          `json:"update_id"`
 	Message       *Message       `json:"message,omitempty"`
 	CallbackQuery *CallbackQuery `json:"callback_query,omitempty"`
+	// PreCheckoutQuery: Telegram asks whether a Stars payment may go
+	// through (must be answered within 10 seconds).
+	PreCheckoutQuery *PreCheckoutQuery `json:"pre_checkout_query,omitempty"`
 }
 
 // UserKey returns the key that serialises the processing of updates of
@@ -75,6 +88,8 @@ func (u *Update) UserKey() int64 {
 		return u.Message.From.ID
 	case u.CallbackQuery != nil && u.CallbackQuery.From != nil:
 		return u.CallbackQuery.From.ID
+	case u.PreCheckoutQuery != nil && u.PreCheckoutQuery.From != nil:
+		return u.PreCheckoutQuery.From.ID
 	}
 	return 0
 }
@@ -101,6 +116,45 @@ type Message struct {
 	From      *TgUser `json:"from,omitempty"`
 	Chat      Chat    `json:"chat"`
 	Text      string  `json:"text,omitempty"`
+	// SuccessfulPayment: service message about a received Stars payment.
+	SuccessfulPayment *SuccessfulPayment `json:"successful_payment,omitempty"`
+	// RefundedPayment: service message about a refunded payment.
+	RefundedPayment *RefundedPayment `json:"refunded_payment,omitempty"`
+}
+
+// PreCheckoutQuery is the last confirmation before a payment.
+type PreCheckoutQuery struct {
+	ID             string  `json:"id"`
+	From           *TgUser `json:"from"`
+	Currency       string  `json:"currency"`
+	TotalAmount    int     `json:"total_amount"`
+	InvoicePayload string  `json:"invoice_payload"`
+}
+
+// SuccessfulPayment describes a successful payment (Telegram Stars).
+type SuccessfulPayment struct {
+	Currency                   string `json:"currency"`
+	TotalAmount                int    `json:"total_amount"`
+	InvoicePayload             string `json:"invoice_payload"`
+	SubscriptionExpirationDate int64  `json:"subscription_expiration_date,omitempty"`
+	IsRecurring                bool   `json:"is_recurring,omitempty"`
+	IsFirstRecurring           bool   `json:"is_first_recurring,omitempty"`
+	TelegramPaymentChargeID    string `json:"telegram_payment_charge_id"`
+	ProviderPaymentChargeID    string `json:"provider_payment_charge_id,omitempty"`
+}
+
+// RefundedPayment describes a refunded payment.
+type RefundedPayment struct {
+	Currency                string `json:"currency"`
+	TotalAmount             int    `json:"total_amount"`
+	InvoicePayload          string `json:"invoice_payload"`
+	TelegramPaymentChargeID string `json:"telegram_payment_charge_id"`
+}
+
+// LabeledPrice is one price line of an invoice (Stars: amount in ⭐).
+type LabeledPrice struct {
+	Label  string `json:"label"`
+	Amount int    `json:"amount"`
 }
 
 // CallbackQuery is an inline-keyboard callback.
@@ -122,6 +176,14 @@ type InlineKeyboardMarkup struct {
 type InlineKeyboardButton struct {
 	Text         string `json:"text"`
 	CallbackData string `json:"callback_data,omitempty"`
+	URL          string `json:"url,omitempty"`
+	// Pay: the «Pay» button of an invoice message (must be the first one).
+	Pay bool `json:"pay,omitempty"`
+}
+
+// URLBtn is a helper to build a link button (e.g. an invoice link).
+func URLBtn(text, url string) InlineKeyboardButton {
+	return InlineKeyboardButton{Text: text, URL: url}
 }
 
 // Row is a helper to build a keyboard row.
@@ -373,6 +435,9 @@ func (c *Client) callOnce(ctx context.Context, method string, body []byte, out a
 		return 0, err
 	}
 	url := fmt.Sprintf("%s/bot%s/%s", c.baseURL, c.token, method)
+	if c.testEnv {
+		url = fmt.Sprintf("%s/bot%s/test/%s", c.baseURL, c.token, method)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return 0, c.safeErr(method, err)
@@ -529,10 +594,98 @@ func (c *Client) AnswerCallbackAlert(ctx context.Context, id, text string) error
 func (c *Client) SetWebhook(ctx context.Context, webhookURL, secretToken string) error {
 	payload := map[string]any{
 		"url":             webhookURL,
-		"allowed_updates": []string{"message", "callback_query"},
+		"allowed_updates": []string{"message", "callback_query", "pre_checkout_query"},
 	}
 	if secretToken != "" {
 		payload["secret_token"] = secretToken
 	}
 	return c.call(ctx, "setWebhook", payload, nil)
+}
+
+// --- Telegram Stars payments ------------------------------------------------
+
+// Invoice is the content of a Stars invoice (currency XTR, no provider
+// token). SubscriptionPeriod > 0 makes it a monthly subscription (only
+// createInvoiceLink supports it; Telegram requires exactly 2592000).
+type Invoice struct {
+	Title              string
+	Description        string
+	Payload            string
+	Prices             []LabeledPrice
+	SubscriptionPeriod int
+}
+
+func (inv Invoice) payload() map[string]any {
+	p := map[string]any{
+		"title":       truncateRunes(inv.Title, 32),
+		"description": truncateRunes(inv.Description, 255),
+		"payload":     inv.Payload,
+		"currency":    "XTR",
+		"prices":      inv.Prices,
+	}
+	if inv.SubscriptionPeriod > 0 {
+		p["subscription_period"] = inv.SubscriptionPeriod
+	}
+	return p
+}
+
+// CreateInvoiceLink creates a payment link for the invoice (Bot API
+// createInvoiceLink). The link is not bound to a user: whoever pays is the
+// From of the payment updates.
+func (c *Client) CreateInvoiceLink(ctx context.Context, inv Invoice) (string, error) {
+	var link string
+	if err := c.call(ctx, "createInvoiceLink", inv.payload(), &link); err != nil {
+		return "", err
+	}
+	return link, nil
+}
+
+// SendInvoice sends an invoice message to the chat (one-off payments).
+func (c *Client) SendInvoice(ctx context.Context, chatID int64, inv Invoice, kb *InlineKeyboardMarkup) (int64, error) {
+	p := inv.payload()
+	delete(p, "subscription_period") // not supported by sendInvoice
+	p["chat_id"] = chatID
+	if kb != nil {
+		p["reply_markup"] = kb
+	}
+	var msg Message
+	if err := c.call(ctx, "sendInvoice", p, &msg); err != nil {
+		return 0, err
+	}
+	return msg.MessageID, nil
+}
+
+// AnswerPreCheckoutQuery confirms (ok) or rejects a payment; errMsg is
+// shown to the user when rejected.
+func (c *Client) AnswerPreCheckoutQuery(ctx context.Context, id string, ok bool, errMsg string) error {
+	p := map[string]any{"pre_checkout_query_id": id, "ok": ok}
+	if !ok {
+		p["error_message"] = truncateRunes(errMsg, 255)
+	}
+	return c.call(ctx, "answerPreCheckoutQuery", p, nil)
+}
+
+// RefundStarPayment refunds a successful Stars payment.
+func (c *Client) RefundStarPayment(ctx context.Context, userID int64, chargeID string) error {
+	return c.call(ctx, "refundStarPayment", map[string]any{
+		"user_id":                    userID,
+		"telegram_payment_charge_id": chargeID,
+	}, nil)
+}
+
+// EditUserStarSubscription cancels (canceled = true) or re-enables the
+// auto-renewal of a user's Stars subscription.
+func (c *Client) EditUserStarSubscription(ctx context.Context, userID int64, chargeID string, canceled bool) error {
+	return c.call(ctx, "editUserStarSubscription", map[string]any{
+		"user_id":                    userID,
+		"telegram_payment_charge_id": chargeID,
+		"is_canceled":                canceled,
+	}, nil)
+}
+
+// IsAlreadyRefunded reports Telegram's answer for a payment that has
+// already been refunded (the refund is then done — not an error).
+func IsAlreadyRefunded(err error) bool {
+	var ae *APIError
+	return errors.As(err, &ae) && strings.Contains(strings.ToUpper(ae.Description), "ALREADY_REFUNDED")
 }

@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -30,6 +31,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/Bihan293/Juz40tester/internal/billing"
 	"github.com/Bihan293/Juz40tester/internal/bot"
 	"github.com/Bihan293/Juz40tester/internal/cluster"
 	"github.com/Bihan293/Juz40tester/internal/config"
@@ -95,7 +97,13 @@ func main() {
 		log.Println("redis: connected")
 	}
 
-	tg := bot.NewClient(cfg.BotToken).WithMaxRPS(cfg.TGMaxRPS)
+	tg := bot.NewClient(cfg.BotToken).WithMaxRPS(cfg.TGMaxRPS).WithTestEnvironment(cfg.TelegramTestEnv)
+	if cfg.TelegramAPIURL != "" {
+		tg.WithBaseURL(cfg.TelegramAPIURL)
+	}
+	if cfg.TelegramTestEnv {
+		log.Println("telegram: TEST environment (TELEGRAM_TEST_ENV=1) — test accounts / test Stars")
+	}
 	if cfg.RateLimitBackend == config.BackendRedis {
 		// One token bucket for the whole cluster (falls back to the local
 		// limiter while Redis is unreachable).
@@ -368,7 +376,41 @@ func startWorkerSide(ctx, workerCtx context.Context, bgWG *sync.WaitGroup, cfg *
 		// The per-user tap throttle holds across instances.
 		actions = cluster.NewRedisActionLimiter(rdb, cfg.RedisPrefix, cfg.UserActionInterval)
 	}
-	h := handlers.New(tg, userRepo, quiz).WithActionLimiter(actions)
+	// Telegram Stars subscriptions (docs/SUBSCRIPTIONS.md): the daily quota
+	// of completed tests is enforced inside the attempt transactions, the
+	// payments are applied idempotently by charge id, the paid weak-topics
+	// orders are advanced by the reconciler of every worker.
+	var billingSvc *services.BillingService
+	if cfg.Subscriptions.Enabled {
+		cat, cerr := cfg.Subscriptions.Catalog()
+		if cerr != nil {
+			log.Fatalf("subscriptions: %v", cerr)
+		}
+		loc := billing.LoadLocation(cfg.Subscriptions.QuotaTZ)
+		billRepo := repositories.NewBillingRepository(pool, cat, loc, cfg.Subscriptions.Grace)
+		attemptRepo.WithQuota(billRepo)
+		billingSvc = services.NewBillingService(billRepo, genRepo, genSvc, services.BillingSettings{
+			WeakTestPrice:     cfg.Subscriptions.WeakTestPrice,
+			OrderTimeout:      cfg.Subscriptions.WeakOrderTimeout,
+			MaxGenAttempts:    cfg.Subscriptions.WeakOrderMaxGen,
+			ReconcileInterval: cfg.Subscriptions.ReconcileInterval,
+		}).WithStars(tg)
+		var plans []string
+		for _, p := range cat.Plans() {
+			plans = append(plans, fmt.Sprintf("%s %d⭐ %d/day", p.Code, p.PriceStars, p.DailyLimit))
+		}
+		log.Printf("subscriptions: ON (quota day %s, plans: %s; weak test %d⭐; %d admin(s))",
+			loc, strings.Join(plans, ", "), cfg.Subscriptions.WeakTestPrice, len(cfg.Subscriptions.AdminIDs))
+	} else {
+		log.Println("subscriptions: OFF (SUBSCRIPTIONS_ENABLED=0) — no daily quota, free weak-topics tests")
+	}
+	h := handlers.New(tg, userRepo, quiz).WithActionLimiter(actions).
+		WithBilling(billingSvc).WithAdmins(cfg.Subscriptions.IsAdmin)
+	if billingSvc != nil {
+		billingSvc.WithNotifier(h)
+		bgWG.Add(1)
+		go func() { defer bgWG.Done(); billingSvc.Run(workerCtx) }()
+	}
 
 	// Cluster events: a generation / translation finished on ANY instance
 	// reaches the users waiting on THIS one at once (otherwise they would
@@ -396,6 +438,14 @@ func startWorkerSide(ctx, workerCtx context.Context, bgWG *sync.WaitGroup, cfg *
 	// at once (shared watcher per key) instead of waiting for their poll.
 	genSvc.WithJobFinishedHook(func(job *models.GenerationJob) {
 		h.NotifyJobFinished(job)
+		if billingSvc != nil && job != nil {
+			// A paid weak-topics order may be waiting for this job.
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				billingSvc.OnGenerationFinished(ctx, job)
+			}()
+		}
 		if events != nil && job != nil {
 			ev := cluster.Event{Type: cluster.EventGenFinished, JobID: job.ID, Kind: job.Kind, SubjectID: job.SubjectID, TestNumber: job.TestNumber}
 			go events.Publish(ev)
