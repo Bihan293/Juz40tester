@@ -59,9 +59,12 @@ func mainMenuKeyboardFor(plans bool) *bot.ReplyKeyboardMarkup {
 //     are deleted with ONE deleteMessages call (was 2 deleteMessage calls).
 //
 // The hidden state is per process (in memory): after a restart the state is
-// unknown and the menu is hidden again the normal way, never skipped.
+// unknown and the menu is hidden again the normal way, never skipped. In
+// cluster mode (WithSharedUpdates) it is never trusted: the menu may have
+// been restored by another worker, and skipping the hide left it visible
+// during the whole test.
 func (h *Handler) hideReplyKeyboard(ctx context.Context, chatID int64) {
-	if v, ok := h.kbHidden.Load(chatID); ok && v.(bool) {
+	if v, ok := h.kbHidden.Load(chatID); ok && v.(bool) && !h.sharedUpdates {
 		return
 	}
 	msgID, err := h.tg.SendMessage(ctx, chatID, "✍️ Идёт тест — меню скрыто до конца. Вопросы ниже 👇", bot.RemoveKeyboard)

@@ -405,7 +405,8 @@ func startWorkerSide(ctx, workerCtx context.Context, bgWG *sync.WaitGroup, cfg *
 		log.Println("subscriptions: OFF (SUBSCRIPTIONS_ENABLED=0) — no daily quota, free weak-topics tests")
 	}
 	h := handlers.New(tg, userRepo, quiz).WithActionLimiter(actions).
-		WithBilling(billingSvc).WithAdmins(cfg.Subscriptions.IsAdmin)
+		WithBilling(billingSvc).WithAdmins(cfg.Subscriptions.IsAdmin).
+		WithSharedUpdates(cfg.DurableQueue())
 	if billingSvc != nil {
 		billingSvc.WithNotifier(h)
 		bgWG.Add(1)
