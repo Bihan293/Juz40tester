@@ -278,3 +278,19 @@ func TestBackoff(t *testing.T) {
 		t.Fatal("unexpected backoff schedule")
 	}
 }
+
+// A second claim of the same update (after a reap) held by this process
+// must stay in flight — and keep being heart-beaten — when the first,
+// stale claim finishes.
+func TestConsumerInflightPerClaim(t *testing.T) {
+	q := miniQueue(t, 0)
+	c := NewConsumer(q, ConsumerConfig{Worker: "w"}, func(context.Context, *bot.Update) error { return nil })
+	second := Item{UpdateID: 9, UserKey: 1, Attempts: 2, Token: "w:b", Payload: []byte(`{"update_id":9}`)}
+	c.mu.Lock()
+	c.inflight[keyOf(second)] = second
+	c.mu.Unlock()
+	c.process(Item{UpdateID: 9, UserKey: 1, Attempts: 1, Token: "w:a", Payload: []byte(`{"update_id":9}`)})
+	if got := c.snapshot(); len(got) != 1 || got[0].Token != "w:b" {
+		t.Fatalf("in flight after the stale claim finished = %+v, want the second claim", got)
+	}
+}

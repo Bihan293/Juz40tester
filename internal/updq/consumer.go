@@ -56,7 +56,7 @@ type Consumer struct {
 	cancelBase context.CancelFunc
 
 	mu       sync.Mutex
-	inflight map[int64]Item
+	inflight map[claimKey]Item
 
 	wg       sync.WaitGroup
 	errLast  atomic.Int64
@@ -85,7 +85,7 @@ func NewConsumer(q Queue, cfg ConsumerConfig, handle HandleFunc) *Consumer {
 		q: q, cfg: cfg, handle: handle,
 		wake: make(chan struct{}, cfg.Workers),
 		base: base, cancelBase: cancel,
-		inflight: map[int64]Item{},
+		inflight: map[claimKey]Item{},
 		sleepFor: func(ctx context.Context, d time.Duration) {
 			select {
 			case <-ctx.Done():
@@ -174,14 +174,28 @@ func (c *Consumer) worker(ctx context.Context) {
 	}
 }
 
+// claimKey identifies one CLAIM of an update. The same update may be held
+// twice by this process for a moment (its lease expired, the reaper
+// returned it and another worker of this instance claimed it again while
+// the first handler was still running): keyed by update_id alone, the
+// first handler's cleanup deleted the second claim from inflight, its
+// heartbeats stopped and the update was reaped and handled once more.
+type claimKey struct {
+	id       int64
+	attempts int
+	token    string
+}
+
+func keyOf(it Item) claimKey { return claimKey{it.UpdateID, it.Attempts, it.Token} }
+
 // process handles one claimed update and records the outcome.
 func (c *Consumer) process(it Item) {
 	c.mu.Lock()
-	c.inflight[it.UpdateID] = it
+	c.inflight[keyOf(it)] = it
 	c.mu.Unlock()
 	defer func() {
 		c.mu.Lock()
-		delete(c.inflight, it.UpdateID)
+		delete(c.inflight, keyOf(it))
 		c.mu.Unlock()
 	}()
 
