@@ -435,9 +435,14 @@ func (t *TranslatorService) executeJob(ctx context.Context, job *repositories.Tr
 		}
 		return
 	}
+	// Detached from the worker context: a shutdown right after a finished
+	// run must still record it (otherwise the job stays 'running' until the
+	// reaper and is translated — and paid for — again).
+	bctx, bcancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer bcancel()
 	if errors.Is(runErr, errNotTranslatable) {
 		// Never retried: park the job as failed right away (maxAttempts 0).
-		if err := t.repo.FailTranslationJob(ctx, job.ID, runErr, 0, 0); err != nil {
+		if err := t.repo.FailTranslationJob(bctx, job.ID, runErr, 0, 0); err != nil {
 			log.Printf("translator: fail job %d: %v", job.ID, err)
 		}
 		t.publishOutcome(job.TestID, TranslationOutcome{Err: runErr.Error()})
@@ -447,13 +452,13 @@ func (t *TranslatorService) executeJob(ctx context.Context, job *repositories.Tr
 		// The test still opens — in the Russian master version; the error is
 		// logged and the job is retried with backoff.
 		log.Printf("translator: job %d (test %d) failed: %v", job.ID, job.TestID, runErr)
-		if err := t.repo.FailTranslationJob(ctx, job.ID, runErr, translationRetryDelay, translationMaxAttempts); err != nil {
+		if err := t.repo.FailTranslationJob(bctx, job.ID, runErr, translationRetryDelay, translationMaxAttempts); err != nil {
 			log.Printf("translator: fail job %d: %v", job.ID, err)
 		}
 		t.publishOutcome(job.TestID, TranslationOutcome{Err: runErr.Error()})
 		return
 	}
-	if err := t.repo.CompleteTranslationJob(ctx, job.ID); err != nil {
+	if err := t.repo.CompleteTranslationJob(bctx, job.ID); err != nil {
 		log.Printf("translator: complete job %d: %v", job.ID, err)
 	}
 	t.publishOutcome(job.TestID, TranslationOutcome{Ready: true})
