@@ -331,6 +331,12 @@ const (
 	DecisionRenewal    = "renewal"     // same plan, extended
 	DecisionUpgrade    = "upgrade"     // better plan, applies at once
 	DecisionStaleLower = "stale_lower" // cheaper plan while a better one is active
+	// DecisionDuplicate: a NEW Telegram subscription of the plan that is
+	// already active through another Stars subscription (two invoices of
+	// the same plan paid almost at once — pre_checkout passed for both
+	// before the first payment was applied). The second payment buys
+	// nothing: it is refunded and its subscription cancelled.
+	DecisionDuplicate = "duplicate"
 )
 
 // SubDecision is how a payment changes the subscription.
@@ -364,8 +370,10 @@ func (p SubPayment) isNewSubscription() bool { return !p.IsRecurring || p.IsFirs
 //   - nothing active (free / expired / unknown plan): the paid plan starts
 //     now, until the Telegram expiration date;
 //   - same plan: renewal — the expiry moves to the later of the two dates;
-//     a NEW subscription of the same plan replaces the old Telegram
-//     subscription (its auto-renewal is cancelled);
+//     a NEW Stars subscription of the plan that is already active through
+//     another Stars subscription is a double purchase: it is refunded and
+//     cancelled (DecisionDuplicate); a new subscription replacing an
+//     admin-granted plan takes it over;
 //   - better plan: upgrade at once; the old Telegram subscription is
 //     cancelled (its remaining days are not refunded — see docs);
 //   - cheaper plan while a better one is active: the payment is refunded
@@ -393,6 +401,13 @@ func (c *Catalog) ApplySubscriptionPayment(cur *SubState, p SubPayment, now time
 		}
 		return d
 	case paid.Rank == active.Rank:
+		if p.isNewSubscription() && cur.Source == SourceStars && cur.SubChargeID != "" && cur.SubChargeID != subID {
+			// The same plan bought twice: keep the current subscription,
+			// give the second payment back (otherwise the user pays twice
+			// for the same 30 days and the first subscription loses its
+			// auto-renewal).
+			return SubDecision{Kind: DecisionDuplicate, Refund: true, CancelChargeID: p.ChargeID}
+		}
 		ns := &SubState{Plan: paid.Code, ChargeID: p.ChargeID, Source: SourceStars, SubChargeID: cur.SubChargeID}
 		exp := expiryOf(p, cur.ExpiresAt)
 		if cur.ExpiresAt.After(exp) {

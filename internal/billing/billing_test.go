@@ -177,6 +177,13 @@ func TestApplySubscriptionPayment(t *testing.T) {
 	if !d.New.ExpiresAt.Equal(exp) {
 		t.Fatalf("renewal shortened: %s", d.New.ExpiresAt)
 	}
+	// The same plan bought twice (two invoices paid before the first
+	// payment was applied): the second NEW subscription is refunded and
+	// cancelled, the current one keeps its auto-renewal and expiry.
+	d = c.ApplySubscriptionPayment(cur, SubPayment{Plan: "plus", ChargeID: "c4", ExpiresAt: exp.Add(time.Minute), IsRecurring: true, IsFirstRecurring: true}, now, 0)
+	if d.Kind != DecisionDuplicate || !d.Refund || d.CancelChargeID != "c4" || d.New != nil {
+		t.Fatalf("duplicate purchase: %+v", d)
+	}
 	// Upgrade: applies at once, the old subscription is cancelled.
 	d = c.ApplySubscriptionPayment(cur, SubPayment{Plan: "pro", ChargeID: "p1", ExpiresAt: exp.Add(48 * time.Hour)}, now, 0)
 	if d.Kind != DecisionUpgrade || d.New.Plan != "pro" || d.CancelChargeID != "c1" || d.New.SubChargeID != "p1" || d.Refund {

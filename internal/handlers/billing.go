@@ -498,6 +498,10 @@ func (h *Handler) sendPaymentOutcome(ctx context.Context, chatID int64, user *mo
 	case services.OutcomeWeakRefunded:
 		h.sendText(ctx, chatID, "😔 Не получилось собрать тест по слабым темам — звёзды вернутся на твой баланс в ближайшие минуты.")
 	case services.OutcomeRejected:
+		if out.Decision == billing.DecisionDuplicate {
+			h.sendText(ctx, chatID, fmt.Sprintf("План %s у тебя уже активен — повторный платёж вернётся автоматически, а лишняя подписка будет отменена.", out.Plan.Title))
+			return
+		}
 		h.sendText(ctx, chatID, "Этот платёж не может быть применён (план уже сменён или счёт устарел) — звёзды вернутся автоматически.")
 	}
 }
