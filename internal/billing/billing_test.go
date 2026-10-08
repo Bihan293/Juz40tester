@@ -177,6 +177,13 @@ func TestApplySubscriptionPayment(t *testing.T) {
 	if !d.New.ExpiresAt.Equal(exp) {
 		t.Fatalf("renewal shortened: %s", d.New.ExpiresAt)
 	}
+	// The same plan bought twice (two invoices paid before the first
+	// payment was applied): the second NEW subscription is refunded and
+	// cancelled, the current one keeps its auto-renewal and expiry.
+	d = c.ApplySubscriptionPayment(cur, SubPayment{Plan: "plus", ChargeID: "c4", ExpiresAt: exp.Add(time.Minute), IsRecurring: true, IsFirstRecurring: true}, now, 0)
+	if d.Kind != DecisionDuplicate || !d.Refund || d.CancelChargeID != "c4" || d.New != nil {
+		t.Fatalf("duplicate purchase: %+v", d)
+	}
 	// Upgrade: applies at once, the old subscription is cancelled.
 	d = c.ApplySubscriptionPayment(cur, SubPayment{Plan: "pro", ChargeID: "p1", ExpiresAt: exp.Add(48 * time.Hour)}, now, 0)
 	if d.Kind != DecisionUpgrade || d.New.Plan != "pro" || d.CancelChargeID != "c1" || d.New.SubChargeID != "p1" || d.Refund {
@@ -200,6 +207,46 @@ func TestApplySubscriptionPayment(t *testing.T) {
 	d = c.ApplySubscriptionPayment(adm, SubPayment{Plan: "pro", ChargeID: "s1", ExpiresAt: exp.Add(time.Hour)}, now, 0)
 	if d.Kind != DecisionRenewal || d.CancelChargeID != "" || d.New.Source != SourceStars || d.New.SubChargeID != "s1" {
 		t.Fatalf("admin -> stars: %+v %+v", d, d.New)
+	}
+	// Admin granted Premium over a Stars Plus subscription; a Plus renewal
+	// raced the cancellation: accepted, plan kept, no refund, cancel again.
+	admHi := &SubState{Plan: "premium", ExpiresAt: exp, SubChargeID: "c1", Source: SourceAdmin}
+	d = c.ApplySubscriptionPayment(admHi, SubPayment{Plan: "plus", ChargeID: "c7", IsRecurring: true}, now, 0)
+	if d.Kind != DecisionAdminKept || d.Refund || d.New != nil || d.CancelChargeID != "c1" {
+		t.Fatalf("renewal under an admin plan: %+v", d)
+	}
+	// … and a renewal of a MORE expensive plan does not override it either.
+	admLo := &SubState{Plan: "plus", ExpiresAt: exp, SubChargeID: "p1", Source: SourceAdmin}
+	d = c.ApplySubscriptionPayment(admLo, SubPayment{Plan: "pro", ChargeID: "p7", IsRecurring: true}, now, 0)
+	if d.Kind != DecisionAdminKept || d.Refund || d.New != nil {
+		t.Fatalf("higher renewal under an admin plan: %+v", d)
+	}
+	// A renewal of the SAME plan (the subscription was kept): extends.
+	d = c.ApplySubscriptionPayment(admLo, SubPayment{Plan: "plus", ChargeID: "c8", ExpiresAt: exp.Add(SubscriptionPeriod), IsRecurring: true}, now, 0)
+	if d.Kind != DecisionRenewal || d.Refund || d.New.SubChargeID != "p1" {
+		t.Fatalf("same-plan renewal under an admin plan: %+v %+v", d, d.New)
+	}
+	// The user subscribes to a cheaper plan himself (grace window): applies.
+	d = c.ApplySubscriptionPayment(admHi, SubPayment{Plan: "plus", ChargeID: "n9", ExpiresAt: exp, IsRecurring: true, IsFirstRecurring: true}, now, 0)
+	if d.Kind != DecisionNew || d.Refund || d.New.Plan != "plus" || d.CancelChargeID != "c1" {
+		t.Fatalf("new cheaper subscription after an admin plan: %+v", d)
+	}
+	// Admin set Free (revoked row): a late renewal keeps the user on Free.
+	rev := &SubState{Plan: "plus", ExpiresAt: exp, SubChargeID: "c1", Source: SourceAdmin, Revoked: true}
+	d = c.ApplySubscriptionPayment(rev, SubPayment{Plan: "plus", ChargeID: "c5", IsRecurring: true}, now, 0)
+	if d.Kind != DecisionAdminKept || d.Refund || d.New != nil || d.CancelChargeID != "c1" {
+		t.Fatalf("renewal after an admin revoke: %+v", d)
+	}
+	// … but a NEW subscription the user buys himself applies.
+	d = c.ApplySubscriptionPayment(rev, SubPayment{Plan: "plus", ChargeID: "c6", ExpiresAt: exp, IsRecurring: true, IsFirstRecurring: true}, now, 0)
+	if d.Kind != DecisionNew || d.New.Plan != "plus" {
+		t.Fatalf("new subscription after an admin revoke: %+v", d)
+	}
+	// A refunded (revoked, source stars) row is simply not in force.
+	refd := &SubState{Plan: "pro", ExpiresAt: exp, SubChargeID: "p1", Source: SourceStars, Revoked: true}
+	d = c.ApplySubscriptionPayment(refd, SubPayment{Plan: "plus", ChargeID: "c10", ExpiresAt: exp}, now, 0)
+	if d.Kind != DecisionNew || d.Refund {
+		t.Fatalf("payment after a refunded plan: %+v", d)
 	}
 	// Unknown plan in the payload: refund.
 	d = c.ApplySubscriptionPayment(nil, SubPayment{Plan: "gold", ChargeID: "g"}, now, 0)

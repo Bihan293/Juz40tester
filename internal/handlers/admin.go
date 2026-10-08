@@ -626,7 +626,7 @@ func (h *Handler) applyPlanChange(ctx context.Context, cb *bot.CallbackQuery, ar
 		h.answerCallback(ctx, cb, "")
 		return
 	}
-	until, err := h.admin.SetPlan(ctx, cb.From.ID, userID, plan, days)
+	g, err := h.admin.SetPlanDetailed(ctx, cb.From.ID, userID, plan, days)
 	switch {
 	case errors.Is(err, services.ErrNotAdmin):
 		h.answerCallback(ctx, cb, "")
@@ -641,10 +641,13 @@ func (h *Handler) applyPlanChange(ctx context.Context, cb *bot.CallbackQuery, ar
 	}
 	note := "✅ Пользователь переведён на Free"
 	if p, ok := h.billing.Catalog().Get(plan); ok && !p.IsFree() {
-		note = fmt.Sprintf("✅ Выдан %s до %s", p.Title, until.In(h.admin.Location()).Format("02.01.2006"))
+		note = fmt.Sprintf("✅ Выдан %s до %s", p.Title, g.Until.In(h.admin.Location()).Format("02.01.2006"))
 	}
 	h.answerCallback(ctx, cb, note)
 	h.showUserCard(ctx, cb, cb.Message.Chat.ID, userID)
+	if extra := strings.TrimSpace(grantStarsNote(g)); extra != "" {
+		h.sendText(ctx, cb.Message.Chat.ID, "🛠 "+extra)
+	}
 }
 
 // --- Broadcast wizard -------------------------------------------------------------------

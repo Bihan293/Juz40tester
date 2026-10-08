@@ -314,6 +314,12 @@ type SubState struct {
 	SubChargeID string
 	ChargeID    string // last payment
 	Source      string // stars | admin
+	// OfferPlan: an administrator granted the plan and no Telegram
+	// subscription renews it (the user is offered one when it ends).
+	OfferPlan string
+	// Revoked: the plan was taken away (an administrator set Free, or the
+	// payment was refunded). Such a row is not in force.
+	Revoked bool
 }
 
 // SubPayment is a successful_payment of a subscription invoice.
@@ -331,6 +337,19 @@ const (
 	DecisionRenewal    = "renewal"     // same plan, extended
 	DecisionUpgrade    = "upgrade"     // better plan, applies at once
 	DecisionStaleLower = "stale_lower" // cheaper plan while a better one is active
+	// DecisionDuplicate: a NEW Telegram subscription of the plan that is
+	// already active through another Stars subscription (two invoices of
+	// the same plan paid almost at once — pre_checkout passed for both
+	// before the first payment was applied). The second payment buys
+	// nothing: it is refunded and its subscription cancelled.
+	DecisionDuplicate = "duplicate"
+	// DecisionAdminKept: a renewal of a Telegram subscription of ANOTHER
+	// plan arrived while a plan granted by an administrator is in force
+	// (the bot cancels such auto-renewals when the admin changes the plan;
+	// this charge raced the cancellation or the cancellation failed). The
+	// payment is accepted as is — no refund — and the admin's plan stays;
+	// the auto-renewal is cancelled (again).
+	DecisionAdminKept = "admin_kept"
 )
 
 // SubDecision is how a payment changes the subscription.
@@ -364,24 +383,62 @@ func (p SubPayment) isNewSubscription() bool { return !p.IsRecurring || p.IsFirs
 //   - nothing active (free / expired / unknown plan): the paid plan starts
 //     now, until the Telegram expiration date;
 //   - same plan: renewal — the expiry moves to the later of the two dates;
-//     a NEW subscription of the same plan replaces the old Telegram
-//     subscription (its auto-renewal is cancelled);
+//     a NEW Stars subscription of the plan that is already active through
+//     another Stars subscription is a double purchase: it is refunded and
+//     cancelled (DecisionDuplicate); a new subscription replacing an
+//     admin-granted plan takes it over;
 //   - better plan: upgrade at once; the old Telegram subscription is
 //     cancelled (its remaining days are not refunded — see docs);
 //   - cheaper plan while a better one is active: the payment is refunded
 //     and that (cheaper) Telegram subscription is cancelled — it can only
-//     be a renewal of a subscription that was replaced by an upgrade.
+//     be a renewal of a subscription that was replaced by an upgrade;
+//   - a plan granted by an administrator is in force: a renewal of another
+//     plan is accepted without changing the plan (DecisionAdminKept, never
+//     refunded); a new subscription the user bought himself applies.
 func (c *Catalog) ApplySubscriptionPayment(cur *SubState, p SubPayment, now time.Time, grace time.Duration) SubDecision {
 	paid, ok := c.Get(p.Plan)
 	if !ok || paid.IsFree() {
 		// A payload for a plan that no longer exists: refund.
 		return SubDecision{Kind: DecisionStaleLower, Refund: true, CancelChargeID: p.ChargeID}
 	}
+	if cur != nil && cur.Revoked {
+		if cur.Source == SourceAdmin && !p.isNewSubscription() {
+			// An administrator set Free: a renewal that raced the
+			// cancellation is accepted, the user stays on Free.
+			cancel := cur.SubChargeID
+			if cancel == "" {
+				cancel = p.ChargeID
+			}
+			return SubDecision{Kind: DecisionAdminKept, CancelChargeID: cancel}
+		}
+		cur = nil // nothing in force
+	}
 	active := c.Free()
 	if cur != nil {
 		active = c.Effective(cur.Plan, cur.ExpiresAt, now, grace)
 	}
 	subID := p.ChargeID
+	if cur != nil && cur.Source == SourceAdmin && !active.IsFree() {
+		switch {
+		case !p.isNewSubscription() && paid.Code != active.Code:
+			// The administrator decided — keep the granted plan, take the
+			// payment, stop the next renewals of that subscription.
+			cancel := cur.SubChargeID
+			if cancel == "" {
+				cancel = p.ChargeID
+			}
+			return SubDecision{Kind: DecisionAdminKept, CancelChargeID: cancel}
+		case p.isNewSubscription() && paid.Rank < active.Rank:
+			// The user subscribed to a cheaper plan himself (allowed once
+			// the granted period is over, during the grace window): the new
+			// subscription replaces the granted plan from now on.
+			d := SubDecision{Kind: DecisionNew, New: &SubState{Plan: paid.Code, ExpiresAt: expiryOf(p, now), SubChargeID: subID, ChargeID: p.ChargeID, Source: SourceStars}}
+			if cur.SubChargeID != "" && cur.SubChargeID != subID {
+				d.CancelChargeID = cur.SubChargeID
+			}
+			return d
+		}
+	}
 	switch {
 	case active.IsFree():
 		ns := &SubState{Plan: paid.Code, ExpiresAt: expiryOf(p, now), SubChargeID: subID, ChargeID: p.ChargeID, Source: SourceStars}
@@ -393,6 +450,13 @@ func (c *Catalog) ApplySubscriptionPayment(cur *SubState, p SubPayment, now time
 		}
 		return d
 	case paid.Rank == active.Rank:
+		if p.isNewSubscription() && cur.Source == SourceStars && cur.SubChargeID != "" && cur.SubChargeID != subID {
+			// The same plan bought twice: keep the current subscription,
+			// give the second payment back (otherwise the user pays twice
+			// for the same 30 days and the first subscription loses its
+			// auto-renewal).
+			return SubDecision{Kind: DecisionDuplicate, Refund: true, CancelChargeID: p.ChargeID}
+		}
 		ns := &SubState{Plan: paid.Code, ChargeID: p.ChargeID, Source: SourceStars, SubChargeID: cur.SubChargeID}
 		exp := expiryOf(p, cur.ExpiresAt)
 		if cur.ExpiresAt.After(exp) {
@@ -401,7 +465,7 @@ func (c *Catalog) ApplySubscriptionPayment(cur *SubState, p SubPayment, now time
 		ns.ExpiresAt = exp
 		d := SubDecision{Kind: DecisionRenewal, New: ns}
 		if p.isNewSubscription() {
-			if cur.SubChargeID != "" && cur.SubChargeID != subID && cur.Source == SourceStars {
+			if cur.SubChargeID != "" && cur.SubChargeID != subID {
 				d.CancelChargeID = cur.SubChargeID
 			}
 			ns.SubChargeID = subID
@@ -412,7 +476,7 @@ func (c *Catalog) ApplySubscriptionPayment(cur *SubState, p SubPayment, now time
 	case paid.Rank > active.Rank:
 		ns := &SubState{Plan: paid.Code, ExpiresAt: expiryOf(p, now), SubChargeID: subID, ChargeID: p.ChargeID, Source: SourceStars}
 		d := SubDecision{Kind: DecisionUpgrade, New: ns}
-		if cur.SubChargeID != "" && cur.SubChargeID != subID && cur.Source == SourceStars {
+		if cur.SubChargeID != "" && cur.SubChargeID != subID {
 			d.CancelChargeID = cur.SubChargeID
 		}
 		return d

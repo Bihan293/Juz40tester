@@ -129,24 +129,34 @@ var ErrSubscriptionsOff = errors.New("subscriptions are off")
 // days from now, "free" = the current plan is revoked. The previous state
 // and the new one go to the admin action log.
 func (s *AdminService) SetPlan(ctx context.Context, adminTgID, userID int64, plan string, days int) (time.Time, error) {
+	g, err := s.SetPlanDetailed(ctx, adminTgID, userID, plan, days)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return g.Until, nil
+}
+
+// SetPlanDetailed is SetPlan that also reports what happened to the
+// user's Telegram Stars subscription (BillingService.GrantDetailed).
+func (s *AdminService) SetPlanDetailed(ctx context.Context, adminTgID, userID int64, plan string, days int) (*GrantResult, error) {
 	if !s.IsAdmin(adminTgID) {
-		return time.Time{}, ErrNotAdmin
+		return nil, ErrNotAdmin
 	}
 	if s.billing == nil {
-		return time.Time{}, ErrSubscriptionsOff
+		return nil, ErrSubscriptionsOff
 	}
 	p, ok := s.billing.Catalog().Get(plan)
 	if !ok {
-		return time.Time{}, ErrUnknownPlan
+		return nil, ErrUnknownPlan
 	}
 	if p.IsFree() {
 		days = 0
 	} else if days <= 0 || days > adminPlanMaxDays {
-		return time.Time{}, fmt.Errorf("days must be 1…%d", adminPlanMaxDays)
+		return nil, fmt.Errorf("days must be 1…%d", adminPlanMaxDays)
 	}
 	u, err := s.repo.UserBriefByID(ctx, userID)
 	if err != nil {
-		return time.Time{}, err
+		return nil, err
 	}
 	before := "?"
 	if us, err := s.billing.Usage(ctx, userID); err == nil {
@@ -155,16 +165,20 @@ func (s *AdminService) SetPlan(ctx context.Context, adminTgID, userID int64, pla
 			before += " до " + us.ExpiresAt.In(s.loc).Format("02.01.2006 15:04")
 		}
 	}
-	_, until, err := s.billing.Grant(ctx, u.TelegramID, p.Code, days)
+	g, err := s.billing.GrantDetailed(ctx, u.TelegramID, p.Code, days)
 	if err != nil {
-		return time.Time{}, err
+		return nil, err
 	}
+	until := g.Until
 	details := fmt.Sprintf("plan=%s days=%d (было: %s)", p.Code, days, before)
 	if !p.IsFree() {
 		details = fmt.Sprintf("plan=%s days=%d until=%s (было: %s)", p.Code, days, until.In(s.loc).Format("02.01.2006 15:04"), before)
 	}
+	if g.Stars != GrantStarsNone {
+		details += " stars=" + g.Stars
+	}
 	s.LogAction(ctx, adminTgID, ActionSetPlan, userID, details)
-	return until, nil
+	return g, nil
 }
 
 // LogAction appends to the admin audit log (errors are only logged — the

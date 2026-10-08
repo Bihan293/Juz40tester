@@ -29,6 +29,9 @@ type StarsAPI interface {
 type BillingNotifier interface {
 	WeakTestReady(ctx context.Context, tgUserID int64, test *models.Test)
 	PaymentRefunded(ctx context.Context, tgUserID int64, p repositories.Payment)
+	// RenewOffer: the plan an administrator granted has ended — offer the
+	// subscription of that plan.
+	RenewOffer(ctx context.Context, tgUserID int64, plan billing.Plan)
 }
 
 // paidPersonalBuilder builds a personal weak-topics test for a paid order
@@ -124,7 +127,25 @@ func (s *BillingService) CanBuy(ctx context.Context, userID int64, plan string) 
 		return billing.Plan{}, billing.BuyUnknownPlan, nil, err
 	}
 	p, v := s.Catalog().CanBuy(u.Plan, plan)
+	if GrantedWithoutRenewal(u) {
+		// A plan granted by an administrator does not renew by itself: the
+		// user may subscribe to it (it then renews through Telegram), and
+		// once the granted period is over (grace window) to any plan.
+		switch {
+		case v == billing.BuyAlreadyActive:
+			v = billing.BuyAllowed
+		case v == billing.BuyDowngrade && !s.Now().Before(u.Stored.ExpiresAt):
+			v = billing.BuyAllowed
+		}
+	}
 	return p, v, u, nil
+}
+
+// GrantedWithoutRenewal reports a plan in force that an administrator
+// granted and no Telegram subscription renews (not an admin-bypass test
+// purchase, not a kept Stars subscription of the same plan).
+func GrantedWithoutRenewal(u *repositories.Usage) bool {
+	return u != nil && u.Stored != nil && u.Stored.Source == billing.SourceAdmin && u.Stored.OfferPlan != "" && !u.Plan.IsFree()
 }
 
 // --- Pre-checkout ---------------------------------------------------------------
@@ -136,6 +157,7 @@ const (
 	errPayDowngrade = "Сейчас активен более дорогой план. Перейти на этот можно после его окончания."
 	errPayNoTopics  = "Слабых тем в этом предмете больше нет — оплата не нужна."
 	errPayInternal  = "Не удалось проверить оплату. Попробуй через минуту."
+	errPayInFlight  = "Тест по слабым темам этого предмета уже оплачен и собирается — я пришлю его, как только он будет готов."
 )
 
 // PreCheckout validates a payment before Telegram charges the user. ok =
@@ -179,6 +201,17 @@ func (s *BillingService) PreCheckout(ctx context.Context, userID int64, currency
 		}
 		if o.UserID != userID || o.Status != repositories.OrderCreated || o.Amount != amount {
 			return false, errPayStale
+		}
+		// Another order of this subject is already paid and being built
+		// (an older invoice / «Купить новый тест» tapped meanwhile): a
+		// second payment could only be refunded — do not take it at all.
+		inflight, err := s.repo.PaidWeakOrder(ctx, userID, o.SubjectID)
+		if err != nil {
+			log.Printf("billing: pre-checkout order %d in-flight lookup: %v", o.ID, err)
+			return false, errPayInternal
+		}
+		if inflight != nil {
+			return false, errPayInFlight
 		}
 		keys, err := s.tests.WeakTopicKeys(ctx, userID, o.SubjectID, 1)
 		if err != nil {
@@ -273,6 +306,8 @@ func (s *BillingService) applySubscription(ctx context.Context, tgUserID int64, 
 		if dec.CancelChargeID != "" && s.stars != nil && !IsAdminBypassCharge(dec.CancelChargeID) {
 			if err := s.stars.EditUserStarSubscription(ctx, tgUserID, dec.CancelChargeID, true); err != nil {
 				log.Printf("billing: cancel auto-renewal of subscription %s (tg %d): %v", dec.CancelChargeID, tgUserID, err)
+			} else if err := s.repo.MarkSubCanceled(ctx, rec.UserID, dec.CancelChargeID); err != nil {
+				log.Printf("billing: mark subscription %s cancelled: %v", dec.CancelChargeID, err)
 			}
 		}
 		if dec.Refund {
@@ -430,15 +465,18 @@ func (s *BillingService) PaidWeakOrder(ctx context.Context, userID, subjectID in
 // --- Refunds / external events -------------------------------------------------------
 
 // OnRefundedPayment handles Telegram's refunded_payment service message.
-func (s *BillingService) OnRefundedPayment(ctx context.Context, chargeID string) {
+// An error (database unavailable) is returned so the update is retried —
+// otherwise a refunded subscription would stay active.
+func (s *BillingService) OnRefundedPayment(ctx context.Context, chargeID string) error {
 	p, err := s.repo.OnExternalRefund(ctx, chargeID)
 	if err != nil {
 		log.Printf("billing: refunded_payment %s: %v", chargeID, err)
-		return
+		return fmt.Errorf("refunded_payment %s: %w", chargeID, err)
 	}
 	if p != nil {
 		log.Printf("billing: payment %s (user %d, %s) refunded by Telegram", chargeID, p.UserID, p.Kind)
 	}
+	return nil
 }
 
 func (s *BillingService) processRefund(ctx context.Context, p repositories.Payment) {
@@ -541,7 +579,19 @@ func (s *BillingService) ReconcileOnce(ctx context.Context) (full bool) {
 	for _, p := range refunds {
 		s.processRefund(ctx, p)
 	}
-	return len(orders) == reconcileBatch || len(refunds) == reconcileBatch
+	offers, err := s.repo.ClaimDueRenewOffers(ctx, reconcileBatch)
+	if err != nil {
+		log.Printf("billing: claim renew offers: %v", err)
+	}
+	for _, o := range offers {
+		p, ok := s.Catalog().Get(o.Plan)
+		if !ok || p.IsFree() || s.notify == nil {
+			continue
+		}
+		log.Printf("billing: admin plan of user %d ended — offering %s", o.UserID, p.Code)
+		s.notify.RenewOffer(ctx, o.TelegramUserID, p)
+	}
+	return len(orders) == reconcileBatch || len(refunds) == reconcileBatch || len(offers) == reconcileBatch
 }
 
 // usageRetention: daily_usage / test_completions rows are kept this long.
@@ -580,20 +630,82 @@ var ErrUnknownPlan = errors.New("unknown plan")
 
 // Grant sets a plan by hand (admin) for days days; plan "free" revokes.
 func (s *BillingService) Grant(ctx context.Context, tgUserID int64, plan string, days int) (int64, time.Time, error) {
-	p, ok := s.Catalog().Get(plan)
-	if !ok {
-		return 0, time.Time{}, ErrUnknownPlan
-	}
-	userID, err := s.repo.UserIDByTelegram(ctx, tgUserID)
+	g, err := s.GrantDetailed(ctx, tgUserID, plan, days)
 	if err != nil {
 		return 0, time.Time{}, err
 	}
-	until := s.Now().Add(time.Duration(days) * 24 * time.Hour)
-	if err := s.repo.GrantPlan(ctx, userID, p.Code, until); err != nil {
-		return 0, time.Time{}, err
+	return g.UserID, g.Until, nil
+}
+
+// Stars subscription handling of an admin plan change (GrantResult.Stars).
+const (
+	GrantStarsNone     = ""         // no Telegram subscription to handle
+	GrantStarsKept     = "kept"     // it renews the granted plan at its price — left alone
+	GrantStarsCanceled = "canceled" // its auto-renewal was cancelled
+	GrantStarsFailed   = "failed"   // cancelling failed (a late renewal is still accepted without changing the plan)
+)
+
+// GrantResult describes an admin plan change.
+type GrantResult struct {
+	UserID int64
+	Until  time.Time
+	// Stars: what happened to the user's Telegram Stars subscription.
+	Stars string
+	// OfferPlan: the plan whose subscription link the user gets when the
+	// granted period ends ("" = none).
+	OfferPlan string
+}
+
+// GrantDetailed sets a plan by hand (admin) for days days; plan "free"
+// revokes. The owner's rules for the user's Telegram Stars subscription
+// (nothing already paid is refunded or compensated):
+//   - free: the auto-renewal is cancelled — no further charges;
+//   - a paid plan: from the next period on the user pays the price of THIS
+//     plan. A Telegram subscription of the same plan at the same price
+//     keeps renewing; any other one (its price can not be changed) is
+//     cancelled, and when the granted period ends the user gets the
+//     subscription link of the granted plan.
+func (s *BillingService) GrantDetailed(ctx context.Context, tgUserID int64, plan string, days int) (*GrantResult, error) {
+	p, ok := s.Catalog().Get(plan)
+	if !ok {
+		return nil, ErrUnknownPlan
 	}
-	log.Printf("billing: admin grant: tg %d (user %d) → %s until %s", tgUserID, userID, p.Code, until.Format(time.RFC3339))
-	return userID, until, nil
+	userID, err := s.repo.UserIDByTelegram(ctx, tgUserID)
+	if err != nil {
+		return nil, err
+	}
+	sub, err := s.repo.StarsSubscription(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	g := &GrantResult{UserID: userID, Until: s.Now().Add(time.Duration(days) * 24 * time.Hour)}
+	live := sub.ChargeID != "" && !sub.Canceled && !IsAdminBypassCharge(sub.ChargeID)
+	keep := live && !p.IsFree() && sub.Plan == p.Code && sub.Amount == p.PriceStars
+	if !p.IsFree() && !keep {
+		g.OfferPlan = p.Code
+	}
+	if err := s.repo.GrantPlan(ctx, userID, p.Code, g.Until, g.OfferPlan); err != nil {
+		return nil, err
+	}
+	switch {
+	case keep:
+		g.Stars = GrantStarsKept
+	case live:
+		g.Stars = GrantStarsFailed
+		if s.stars != nil {
+			if err := s.stars.EditUserStarSubscription(ctx, tgUserID, sub.ChargeID, true); err != nil {
+				log.Printf("billing: admin grant: cancel auto-renewal of %s (tg %d): %v", sub.ChargeID, tgUserID, err)
+			} else {
+				g.Stars = GrantStarsCanceled
+				if err := s.repo.MarkSubCanceled(ctx, userID, sub.ChargeID); err != nil {
+					log.Printf("billing: admin grant: mark %s cancelled: %v", sub.ChargeID, err)
+				}
+			}
+		}
+	}
+	log.Printf("billing: admin grant: tg %d (user %d) → %s until %s (stars subscription: %q, offer at expiry: %q)",
+		tgUserID, userID, p.Code, g.Until.Format(time.RFC3339), g.Stars, g.OfferPlan)
+	return g, nil
 }
 
 // AdminInfo returns the quota picture and the latest payments of a user.
