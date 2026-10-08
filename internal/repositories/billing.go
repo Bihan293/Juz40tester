@@ -157,6 +157,13 @@ func (r *BillingRepository) CheckStartTx(ctx context.Context, tx pgx.Tx, userID,
 	return nil
 }
 
+// LockUserTx takes the per-user quota lock for the rest of the
+// transaction (re-entrant: CheckStartTx takes it again at no cost).
+func (r *BillingRepository) LockUserTx(ctx context.Context, tx pgx.Tx, userID int64) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, $2)`, quotaLockNS, int32(userID%2147483647))
+	return err
+}
+
 // ChargeCompletionTx records the completion of an attempt and charges one
 // test of today's quota — in the transaction of the final answer. The
 // attempt_id primary key makes it idempotent (a second call for the same
