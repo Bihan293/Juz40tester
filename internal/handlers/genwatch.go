@@ -116,12 +116,14 @@ func (w *genWatchers) kick(key string) {
 	}
 }
 
-// take removes the key and returns its subscribers.
-func (w *genWatchers) take(key string) []genSubscriber {
+// take removes the key and returns its subscribers — only while gw is
+// still the key's watch. A poller that already finished must never remove
+// (and orphan) a NEWER watch registered under the same key in the
+// meantime: its subscribers would never be told the result.
+func (w *genWatchers) take(key string, gw *genWatch) []genSubscriber {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	gw, ok := w.m[key]
-	if !ok {
+	if cur, ok := w.m[key]; !ok || cur != gw {
 		return nil
 	}
 	delete(w.m, key)
@@ -157,7 +159,7 @@ func (h *Handler) subscribeGeneration(key string, chatID, msgID int64, check gen
 func (h *Handler) pollGeneration(key string, gw *genWatch, check genCheck) {
 	w := h.gen
 	defer w.wg.Done()
-	defer w.take(key) // always unregister (result, timeout, shutdown, panic)
+	defer w.take(key, gw) // always unregister (result, timeout, shutdown, panic)
 	defer func() {
 		if r := recover(); r != nil {
 			logf("generation watcher %s panicked: %v", key, r)
@@ -195,7 +197,7 @@ func (h *Handler) pollGeneration(key string, gw *genWatch, check genCheck) {
 		case err != nil:
 			logf("generation watcher %s: %v", key, err)
 		case test != nil:
-			h.finishGeneration(ctx, key, readyText(test), &bot.InlineKeyboardMarkup{InlineKeyboard: [][]bot.InlineKeyboardButton{
+			h.finishGeneration(ctx, key, gw, readyText(test), &bot.InlineKeyboardMarkup{InlineKeyboard: [][]bot.InlineKeyboardButton{
 				bot.Row(bot.Btn("▶️ Начать тест", cbOpenTest+strconv.FormatInt(test.ID, 10))),
 			}})
 			return
@@ -205,7 +207,7 @@ func (h *Handler) pollGeneration(key string, gw *genWatch, check genCheck) {
 			// job being marked done and the test becoming visible.
 			misses++
 			if misses >= 2 {
-				h.finishGeneration(ctx, key, "😔 Не получилось сгенерировать тест. Нажми «🔄 Попробовать ещё раз» — я перезапущу генерацию.",
+				h.finishGeneration(ctx, key, gw, "😔 Не получилось сгенерировать тест. Нажми «🔄 Попробовать ещё раз» — я перезапущу генерацию.",
 					retryKeyboard("🔄 Попробовать ещё раз", gw.retryData))
 				return
 			}
@@ -213,7 +215,7 @@ func (h *Handler) pollGeneration(key string, gw *genWatch, check genCheck) {
 			misses = 0
 		}
 		if time.Now().After(deadline) {
-			h.finishGeneration(ctx, key, "⏳ Генерация идёт дольше обычного. Нажми «🔄 Обновить» чуть позже — если тест уже готов, он сразу откроется.",
+			h.finishGeneration(ctx, key, gw, "⏳ Генерация идёт дольше обычного. Нажми «🔄 Обновить» чуть позже — если тест уже готов, он сразу откроется.",
 				retryKeyboard("🔄 Обновить", gw.retryData))
 			return
 		}
@@ -249,8 +251,8 @@ func retryKeyboard(label, retryData string) *bot.InlineKeyboardMarkup {
 }
 
 // finishGeneration unregisters the key and edits every subscriber's note.
-func (h *Handler) finishGeneration(ctx context.Context, key, text string, kb *bot.InlineKeyboardMarkup) {
-	for _, s := range h.gen.take(key) {
+func (h *Handler) finishGeneration(ctx context.Context, key string, gw *genWatch, text string, kb *bot.InlineKeyboardMarkup) {
+	for _, s := range h.gen.take(key, gw) {
 		h.kbNotes.CompareAndDelete(s.chatID, s.msgID) // never a stale menu-note id
 		h.editNote(ctx, s.chatID, s.msgID, text, kb)
 	}
