@@ -15,7 +15,10 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	neturl "net/url"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -25,7 +28,9 @@ import (
 func NewRedisClient(ctx context.Context, url string) (*redis.Client, error) {
 	opt, err := redis.ParseURL(url)
 	if err != nil {
-		return nil, fmt.Errorf("REDIS_URL: %w", err)
+		// net/url errors quote the whole URL — password included — and this
+		// error ends up in log.Fatalf: never echo the URL back.
+		return nil, fmt.Errorf("REDIS_URL: %s", redactURLError(err, url))
 	}
 	if opt.DialTimeout == 0 {
 		opt.DialTimeout = 5 * time.Second
@@ -44,6 +49,25 @@ func NewRedisClient(ctx context.Context, url string) (*redis.Client, error) {
 		return nil, fmt.Errorf("redis ping: %w", err)
 	}
 	return rdb, nil
+}
+
+// redactURLError returns the error text with the raw URL (and its
+// password, if any) removed.
+func redactURLError(err error, rawURL string) string {
+	var ue *neturl.Error
+	if errors.As(err, &ue) {
+		return ue.Op + " REDIS_URL: " + ue.Err.Error()
+	}
+	msg := err.Error()
+	if rawURL != "" {
+		msg = strings.ReplaceAll(msg, rawURL, "<redacted>")
+	}
+	if u, perr := neturl.Parse(rawURL); perr == nil && u.User != nil {
+		if pw, ok := u.User.Password(); ok && pw != "" {
+			msg = strings.ReplaceAll(msg, pw, "<redacted>")
+		}
+	}
+	return msg
 }
 
 // key builds a key under the hash tag {prefix}.

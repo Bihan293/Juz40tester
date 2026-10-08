@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -225,6 +226,23 @@ func TestShareRPS(t *testing.T) {
 	for _, c := range cases {
 		if got := ShareRPS(c[0], c[1]); got != c[2] {
 			t.Errorf("ShareRPS(%d,%d) = %d, want %d", c[0], c[1], got, c[2])
+		}
+	}
+}
+
+// A malformed REDIS_URL must not leak its password into the (fatal) log.
+func TestNewRedisClientBadURLHidesPassword(t *testing.T) {
+	for _, u := range []string{
+		"redis://user:s3cretpw@ho st:6379/0",
+		"redis://:s3cretpw@host:port/0",
+		"redis://:s3cretpw@host:6379/notadb",
+	} {
+		_, err := NewRedisClient(context.Background(), u)
+		if err == nil {
+			t.Fatalf("%q: want an error", u)
+		}
+		if strings.Contains(err.Error(), "s3cretpw") {
+			t.Fatalf("error leaks the password: %v", err)
 		}
 	}
 }
