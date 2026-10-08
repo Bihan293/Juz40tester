@@ -7,10 +7,24 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	// Embedded tz database: QUOTA_TZ (Asia/Almaty) must resolve even in a
+	// minimal container without /usr/share/zoneinfo.
+	_ "time/tzdata"
+
+	"github.com/Bihan293/Juz40tester/internal/billing"
 )
 
 // Config holds all runtime configuration for the bot.
 type Config struct {
+	// Subscriptions: Telegram Stars plans, daily quota, paid weak tests.
+	Subscriptions Subscriptions
+	// TelegramAPIURL (TELEGRAM_API_URL, default https://api.telegram.org):
+	// another Bot API server (a local one). TelegramTestEnv
+	// (TELEGRAM_TEST_ENV=1): use the Telegram TEST environment (test
+	// accounts and test Stars — for checking payments).
+	TelegramAPIURL  string
+	TelegramTestEnv bool
+
 	BotToken    string
 	DatabaseURL string
 	WebhookURL  string
@@ -224,6 +238,118 @@ type Config struct {
 	OffPeakCustom    bool // true when a custom window is configured
 }
 
+// Subscriptions holds the Telegram Stars monetisation settings
+// (docs/SUBSCRIPTIONS.md). Every price / limit comes from the environment
+// with the owner's defaults — nothing is hard-coded in the handlers.
+type Subscriptions struct {
+	// Enabled (SUBSCRIPTIONS_ENABLED, default 1): the daily quota, the
+	// «⭐ Подписка» screen and the paid weak-topics tests. 0 = the bot
+	// behaves exactly as before (no limits, free weak-topics tests).
+	Enabled bool
+	// Plans: PLAN_FREE_DAILY (1), PLAN_PLUS_PRICE (10) / PLAN_PLUS_DAILY (4),
+	// PLAN_PRO_PRICE (40) / PLAN_PRO_DAILY (10), PLAN_PREMIUM_PRICE (50) /
+	// PLAN_PREMIUM_DAILY (20). A paid plan with price 0 is switched off.
+	Plans []billing.Plan
+	// QuotaTZ (QUOTA_TZ, default Asia/Almaty): the daily limit resets at
+	// local midnight of this zone.
+	QuotaTZ string
+	// WeakTestPrice (WEAK_TEST_PRICE_STARS, default 10, 0 = free as before):
+	// price of ONE generated weak-topics test.
+	WeakTestPrice int
+	// Grace (SUB_GRACE_MIN, default 60): a paid plan stays in force this
+	// long after its expiry date (renewal charges may arrive a bit late).
+	Grace time.Duration
+	// AdminIDs (ADMIN_IDS, comma-separated Telegram user ids): may use
+	// /grant, /revoke, /subinfo, /refund.
+	AdminIDs []int64
+	// WeakOrderTimeout (WEAK_ORDER_TIMEOUT_MIN, default 45): a paid order
+	// without a test after this long is refunded automatically.
+	WeakOrderTimeout time.Duration
+	// WeakOrderMaxGen (WEAK_ORDER_MAX_GEN, default 3): generation attempts
+	// of one paid order before it is refunded.
+	WeakOrderMaxGen int
+	// ReconcileInterval (BILLING_RECONCILE_SEC, default 60): how often the
+	// worker re-checks paid orders and pending refunds (payments and
+	// finished generations also wake it at once).
+	ReconcileInterval time.Duration
+}
+
+// Catalog builds the validated plan catalog.
+func (s Subscriptions) Catalog() (*billing.Catalog, error) { return billing.NewCatalog(s.Plans) }
+
+// IsAdmin reports whether the Telegram user is an administrator.
+func (s Subscriptions) IsAdmin(tgUserID int64) bool {
+	for _, id := range s.AdminIDs {
+		if id == tgUserID {
+			return true
+		}
+	}
+	return false
+}
+
+// loadSubscriptions reads the SUBSCRIPTIONS_* / PLAN_* settings.
+func loadSubscriptions() (Subscriptions, error) {
+	s := Subscriptions{
+		Enabled:           true,
+		QuotaTZ:           "Asia/Almaty",
+		WeakTestPrice:     10,
+		Grace:             time.Hour,
+		WeakOrderTimeout:  45 * time.Minute,
+		WeakOrderMaxGen:   3,
+		ReconcileInterval: time.Minute,
+	}
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("SUBSCRIPTIONS_ENABLED"))); v != "" {
+		s.Enabled = !(v == "0" || v == "false" || v == "no" || v == "off")
+	}
+	if v := strings.TrimSpace(os.Getenv("QUOTA_TZ")); v != "" {
+		if _, err := time.LoadLocation(v); err != nil {
+			return s, fmt.Errorf("QUOTA_TZ: unknown time zone %q", v)
+		}
+		s.QuotaTZ = v
+	}
+	if n, ok := envIntOpt("WEAK_TEST_PRICE_STARS"); ok && n >= 0 && n <= 10000 {
+		s.WeakTestPrice = n
+	}
+	if n, ok := envIntOpt("SUB_GRACE_MIN"); ok && n >= 0 {
+		s.Grace = time.Duration(n) * time.Minute
+	}
+	if n, ok := envIntOpt("WEAK_ORDER_TIMEOUT_MIN"); ok && n >= 5 {
+		s.WeakOrderTimeout = time.Duration(n) * time.Minute
+	}
+	if n, ok := envIntOpt("WEAK_ORDER_MAX_GEN"); ok && n >= 1 {
+		s.WeakOrderMaxGen = n
+	}
+	if n, ok := envIntOpt("BILLING_RECONCILE_SEC"); ok && n >= 5 {
+		s.ReconcileInterval = time.Duration(n) * time.Second
+	}
+	for _, f := range strings.FieldsFunc(os.Getenv("ADMIN_IDS"), func(r rune) bool { return r == ',' || r == ' ' || r == ';' }) {
+		id, err := strconv.ParseInt(strings.TrimSpace(f), 10, 64)
+		if err != nil || id <= 0 {
+			return s, fmt.Errorf("ADMIN_IDS: bad Telegram id %q", f)
+		}
+		s.AdminIDs = append(s.AdminIDs, id)
+	}
+	for _, p := range billing.DefaultPlans() {
+		up := strings.ToUpper(p.Code)
+		if n, ok := envIntOpt("PLAN_" + up + "_DAILY"); ok {
+			p.DailyLimit = n
+		}
+		if !p.IsFree() {
+			if n, ok := envIntOpt("PLAN_" + up + "_PRICE"); ok {
+				if n == 0 {
+					continue // plan switched off
+				}
+				p.PriceStars = n
+			}
+		}
+		s.Plans = append(s.Plans, p)
+	}
+	if _, err := s.Catalog(); err != nil {
+		return s, err
+	}
+	return s, nil
+}
+
 // Load reads configuration from environment variables and validates that
 // all required variables are set. No secrets are hardcoded in the codebase.
 func Load() (*Config, error) {
@@ -279,6 +405,15 @@ func Load() (*Config, error) {
 	}
 	if err := cfg.loadCluster(); err != nil {
 		return nil, err
+	}
+	subs, err := loadSubscriptions()
+	if err != nil {
+		return nil, err
+	}
+	cfg.Subscriptions = subs
+	cfg.TelegramAPIURL = strings.TrimRight(strings.TrimSpace(os.Getenv("TELEGRAM_API_URL")), "/")
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("TELEGRAM_TEST_ENV"))); v == "1" || v == "true" || v == "yes" {
+		cfg.TelegramTestEnv = true
 	}
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV"))) {
 	case "development", "dev", "local", "test":

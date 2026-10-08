@@ -212,3 +212,50 @@ func TestGenerationScaleSettings(t *testing.T) {
 		t.Fatal("an unknown strategy must fail the start")
 	}
 }
+
+func TestSubscriptionSettings(t *testing.T) {
+	t.Setenv("BOT_TOKEN", "x")
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("WEBHOOK_URL", "https://example.onrender.com")
+	t.Setenv("WEBHOOK_SECRET", "s")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := cfg.Subscriptions
+	if !s.Enabled || s.QuotaTZ != "Asia/Almaty" || s.WeakTestPrice != 10 || len(s.Plans) != 4 {
+		t.Fatalf("defaults: %+v", s)
+	}
+	t.Setenv("PLAN_PLUS_PRICE", "15")
+	t.Setenv("PLAN_FREE_DAILY", "2")
+	t.Setenv("PLAN_PRO_PRICE", "0") // switched off
+	t.Setenv("ADMIN_IDS", "111, 222")
+	t.Setenv("QUOTA_TZ", "Asia/Aqtobe")
+	t.Setenv("SUBSCRIPTIONS_ENABLED", "0")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s = cfg.Subscriptions
+	cat, err := s.Catalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	plus, _ := cat.Get("plus")
+	free, _ := cat.Get("free")
+	if _, pro := cat.Get("pro"); pro || plus.PriceStars != 15 || free.DailyLimit != 2 || s.Enabled || s.QuotaTZ != "Asia/Aqtobe" {
+		t.Fatalf("overrides: %+v", s)
+	}
+	if !s.IsAdmin(222) || s.IsAdmin(333) {
+		t.Fatal("ADMIN_IDS")
+	}
+	t.Setenv("QUOTA_TZ", "Mars/Olympus")
+	if _, err := Load(); err == nil {
+		t.Fatal("bad QUOTA_TZ must fail")
+	}
+	t.Setenv("QUOTA_TZ", "")
+	t.Setenv("ADMIN_IDS", "abc")
+	if _, err := Load(); err == nil {
+		t.Fatal("bad ADMIN_IDS must fail")
+	}
+}

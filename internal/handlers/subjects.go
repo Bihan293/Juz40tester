@@ -111,6 +111,9 @@ func (h *Handler) renderSubject(ctx context.Context, user *models.User, subjectI
 	b.WriteString("Чтобы открыть следующий тест, доведи предыдущий до ")
 	fmt.Fprintf(&b, "%d🟢 + %d🟡", models.UnlockGreen, models.UnlockYellow)
 	b.WriteString(" — тогда я сразу начну его собирать ⏳")
+	if line := h.quotaLine(ctx, user); line != "" {
+		b.WriteString("\n\n" + line)
+	}
 
 	// Tests grid: 3 per row.
 	buttons := make([]bot.InlineKeyboardButton, 0, len(scr.Slots))

@@ -22,6 +22,22 @@ const (
 // mainMenuKeyboard is the persistent Reply Keyboard at the bottom of the chat:
 // Предметы · Слабые темы / Статистика · Топ / Настройки.
 func mainMenuKeyboard() *bot.ReplyKeyboardMarkup {
+	return mainMenuKeyboardFor(false)
+}
+
+// mainMenuKeyboardFor adds «⭐ Подписка» next to «⚙️ Настройки» when the
+// subscriptions are on.
+func mainMenuKeyboardFor(plans bool) *bot.ReplyKeyboardMarkup {
+	if plans {
+		return &bot.ReplyKeyboardMarkup{
+			ResizeKeyboard: true,
+			Keyboard: [][]bot.KeyboardButton{
+				bot.ReplyRow(kbSubjects, kbWeak),
+				bot.ReplyRow(kbProgress, kbTop),
+				bot.ReplyRow(kbSettings, kbPlans),
+			},
+		}
+	}
 	return &bot.ReplyKeyboardMarkup{
 		ResizeKeyboard: true,
 		Keyboard: [][]bot.KeyboardButton{
@@ -81,7 +97,7 @@ func (h *Handler) hideReplyKeyboard(ctx context.Context, chatID int64) {
 // In the normal test cycle the previous note was already removed by
 // hideReplyKeyboard, so this is ONE Telegram call.
 func (h *Handler) restoreReplyKeyboard(ctx context.Context, chatID int64) {
-	msgID, err := h.tg.SendMessage(ctx, chatID, "🏠 Меню снова доступно 👇", mainMenuKeyboard())
+	msgID, err := h.tg.SendMessage(ctx, chatID, "🏠 Меню снова доступно 👇", mainMenuKeyboardFor(h.billing != nil))
 	if err != nil {
 		logf("restore reply keyboard: %v", err)
 		return
@@ -108,7 +124,7 @@ func (h *Handler) sendMainMenu(ctx context.Context, chatID int64, user *models.U
 		}
 		text = fmt.Sprintf("👋 Привет, %s! %s\n\nДобро пожаловать в JUZ40 Tester — бот для подготовки к ЕНТ.\nВыберите раздел кнопками ниже 👇", name, streakBadge(user))
 	}
-	if _, err := h.tg.SendMessage(ctx, chatID, text, mainMenuKeyboard()); err != nil {
+	if _, err := h.tg.SendMessage(ctx, chatID, text, mainMenuKeyboardFor(h.billing != nil)); err != nil {
 		logf("send main menu: %v", err)
 		return
 	}

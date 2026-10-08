@@ -51,6 +51,7 @@ var limitedMethods = map[string]bool{
 	"sendSticker":            true,
 	"copyMessage":            true,
 	"forwardMessage":         true,
+	"sendInvoice":            true,
 }
 
 // rateLimiter is a global token bucket (GCRA form, no extra dependencies).

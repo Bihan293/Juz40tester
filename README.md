@@ -130,7 +130,7 @@ Dockerfile        multi-stage сборка для Render
 
 Таблицы: `users`, `subjects`, `questions`, `tests` (+`kind`, `topics`, `owner_user_id`, `from_bank`), `test_questions`, `test_attempts`, `attempt_questions`, `user_question_progress`, `user_subject_state` (страница сетки тестов, водяные знаки цепочки), `generation_jobs` (очередь ИИ-генерации: `chain`, `personal`, `topic_batch`), `user_topic_stats`, `subject_topics`, `topic_aliases`, `question_translations`, `translation_jobs`, `ai_spend_daily`, `app_backfills`, `schema_migrations`.
 
-Миграции: `migrations/000001` … `000024` (последняя — `000024_generation_scale`: `test_templates`, `test_template_uses`, `gen_job_batches`, `gen_strategy_stats`, `generation_jobs.strategy`, индексы `idx_user_topic_stats_subject_updated`, `idx_genjobs_active_kind`). Номера уникальны и идут подряд — это проверяет `TestMigrationVersionsUniqueAndContiguous`, а `database.Migrate` отказывается стартовать при двух файлах с одним номером. Новая миграция получает следующий свободный номер (сейчас — `000025`). Применённые версии записываются в `schema_migrations` и повторно не выполняются; параллельный старт двух инстансов сериализуется `pg_advisory_lock`.
+Миграции: `migrations/000001` … `000024` (последняя — `000024_generation_scale`: `test_templates`, `test_template_uses`, `gen_job_batches`, `gen_strategy_stats`, `generation_jobs.strategy`, индексы `idx_user_topic_stats_subject_updated`, `idx_genjobs_active_kind`). Номера уникальны и идут подряд — это проверяет `TestMigrationVersionsUniqueAndContiguous`, а `database.Migrate` отказывается стартовать при двух файлах с одним номером. Новая миграция получает следующий свободный номер (сейчас — `000027`; `000025` — очередь апдейтов кластера, `000026` — подписки Stars). Применённые версии записываются в `schema_migrations` и повторно не выполняются; параллельный старт двух инстансов сериализуется `pg_advisory_lock`.
 
 **Seed предметов нет, папки с готовыми вопросами тоже нет.** На свежей базе таблица `subjects` пуста (миграция `000002` удаляет старые сид-предметы, `000004` — старые тесты-заглушки), бот при старте пишет в лог предупреждение, а «📚 Предметы» показывает «предметов пока нет». Все вопросы пишет ИИ.
 
@@ -177,6 +177,24 @@ UPDATE questions SET topic_key = 'генетика' WHERE subject_id = 1 AND top
 - Очередь апдейтов (`QUEUE_BACKEND=postgres`, таблица `tg_update_queue`): идемпотентность по `update_id` в БД, порядок апдейтов одного пользователя сохраняется (два апдейта одного пользователя никогда не обрабатываются параллельно), `FOR UPDATE SKIP LOCKED` + `NOTIFY`, lease/heartbeat/reaper для апдейтов умерших воркеров, ретраи с backoff и dead-letter, backpressure (`UPDATE_QUEUE_MAX` → 503).
 - Лимит Telegram между инстансами: `RATELIMIT_BACKEND=postgres` делит `TG_MAX_RPS` между живыми воркерами (`cluster_instances`), `redis` — один общий token bucket.
 - Redis опционален: пустой `REDIS_URL` → не используется; включается только явным `QUEUE_BACKEND=redis` / `RATELIMIT_BACKEND=redis` / `CACHE_BACKEND=redis`.
+
+## ⭐ Подписки Telegram Stars
+
+Подробно — [docs/SUBSCRIPTIONS.md](docs/SUBSCRIPTIONS.md). Кратко:
+
+- Тарифы:
+  - Free — 1 прохождение в день;
+  - Plus — 10⭐ в месяц, 4 в день;
+  - Pro — 40⭐ в месяц, 10 в день;
+  - Premium — 50⭐ в месяц, 20 в день.
+
+  Цены и лимиты задаются в env (`PLAN_*`). Новый день начинается в полночь по `QUOTA_TZ` (Asia/Almaty).
+- Прохождение списывается только в момент итогового результата: все вопросы отвечены. Списание атомарно и идемпотентно (`test_completions`, PK `attempt_id`). Брошенный тест ничего не списывает. Повторное прохождение — новое прохождение.
+- Когда лимит исчерпан, новый тест не начать: бот показывает, когда лимит сбросится, и кнопку «⭐ Улучшить план». Начатый ранее тест можно доделать.
+- Подписка оформляется через `createInvoiceLink` (`XTR`, `subscription_period=2592000`). Платёж применяется один раз по `telegram_payment_charge_id`. Продления приходят как `is_recurring`. Отмена или истечение — пользователь сам возвращается на Free, когда пройдёт `expires_at`. Апгрейд применяется сразу, даунгрейд — только после окончания текущего плана.
+- Тест по слабым темам стоит 10⭐ (`WEAK_TEST_PRICE_STARS`), дневной лимит не тратит. Генерация запускается только после `successful_payment`. Если она не удалась — повторная попытка без доплаты, затем автоматический `refundStarPayment`.
+- Админ-команды `/grant`, `/revoke`, `/subinfo`, `/refund` работают для Telegram id из `ADMIN_IDS`.
+- `SUBSCRIPTIONS_ENABLED=0` возвращает прежнее поведение без лимитов.
 
 ## Технический долг
 
@@ -262,6 +280,13 @@ UPDATE questions SET topic_key = 'генетика' WHERE subject_id = 1 AND top
 | `UPDATE_MAX_ATTEMPTS` / `UPDATE_LEASE_SEC` | (опционально) попыток до dead-letter (3) и lease взятого апдейта (45 с, heartbeat каждые lease/3) |
 | `UPDATE_DONE_TTL_HOURS` / `UPDATE_DEAD_TTL_DAYS` | (опционально) хранение обработанных апдейтов (48 ч, окно идемпотентности, минимум 25) и dead-letter (14 дн.) |
 | `DEEPSEEK_DAILY_CAP_USD` | (опционально) глобальный дневной лимит трат DeepSeek, USD, UTC-день; по умолчанию 2.0 (`0` — без лимита). Хранится в БД (`ai_spend_daily`) |
+| `SUBSCRIPTIONS_ENABLED` | (опционально) подписки Stars, дневной лимит прохождений, платные тесты по слабым темам; по умолчанию `1` (`0` — прежнее поведение) |
+| `PLAN_FREE_DAILY`, `PLAN_<PLUS/PRO/PREMIUM>_PRICE` / `_DAILY` | (опционально) тарифы: цена в ⭐ за 30 дней и прохождений в день; по умолчанию 1 / 10⭐·4 / 40⭐·10 / 50⭐·20; цена `0` отключает план |
+| `QUOTA_TZ` | (опционально) часовой пояс сброса лимита, по умолчанию `Asia/Almaty` |
+| `WEAK_TEST_PRICE_STARS` | (опционально) цена теста по слабым темам, по умолчанию 10 (`0` — бесплатно, как раньше) |
+| `ADMIN_IDS` | (опционально) Telegram id администраторов через запятую: `/grant`, `/revoke`, `/subinfo`, `/refund` |
+| `SUB_GRACE_MIN`, `WEAK_ORDER_TIMEOUT_MIN`, `WEAK_ORDER_MAX_GEN`, `BILLING_RECONCILE_SEC` | (опционально) запас после истечения плана (60 мин), автовозврат неготового заказа (45 мин / 3 попытки), тик сверки (60 с) |
+| `TELEGRAM_TEST_ENV` / `TELEGRAM_API_URL` | (опционально) тестовая среда Telegram (тестовые Stars) / другой Bot API server |
 
 Очереди генерации и перевода работают через LISTEN/NOTIFY: при постановке задачи шлётся `pg_notify` (`gen_jobs` / `tr_jobs`), а отдельная горутина держит ОДНО выделенное соединение с `LISTEN` и сразу будит воркеры; запасной опрос очереди — раз в 3 минуты. `LISTEN` не работает через transaction-mode pooler, поэтому слушатель использует ПРЯМУЮ строку подключения — ту же, что и миграции (`MIGRATION_DATABASE_URL`, иначе `DATABASE_URL` без `-pooler` у хоста Neon); при обрыве соединение переподключается с паузой.
 

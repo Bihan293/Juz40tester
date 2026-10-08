@@ -42,7 +42,11 @@ func (h *Handler) renderWeakMenu(ctx context.Context, user *models.User) (string
 			fmt.Fprintf(&b, "%s %s — верно %d из %d\n", models.TopicLevelEmoji(st.Level()), st.Topic, c, n)
 		}
 	}
-	b.WriteString("\nВыбери предмет — я соберу персональный тест из 20 НОВЫХ вопросов по самым слабым темам:")
+	b.WriteString("\nВыбери предмет — я соберу персональный тест из 20 НОВЫХ вопросов по самым слабым темам")
+	if h.paidWeakTests() {
+		fmt.Fprintf(&b, " (новый тест — %d⭐, дневной лимит прохождений не тратит)", h.billing.WeakTestPrice())
+	}
+	b.WriteString(":")
 	rows := bot.ChunkButtons(buttons, 1)
 	rows = append(rows, bot.Row(bot.Btn("⬅️ Главное меню", cbMainMenu)))
 	text := b.String()
@@ -85,6 +89,16 @@ func (h *Handler) editWeakMenu(ctx context.Context, cb *bot.CallbackQuery, user 
 // mastered one (15🟢+5🟡) can be finished — it is deleted and the next
 // visit generates a fresh test. Nothing is generated until the user taps.
 func (h *Handler) openWeakSubject(ctx context.Context, cb *bot.CallbackQuery, user *models.User, subjectID int64) {
+	if h.paidWeakTests() {
+		h.openWeakSubjectPaid(ctx, cb, user, subjectID)
+		return
+	}
+	h.openWeakSubjectFree(ctx, cb, user, subjectID)
+}
+
+// openWeakSubjectFree is the free weak-topics flow (WEAK_TEST_PRICE_STARS=0
+// or subscriptions off): the test is built on the first tap.
+func (h *Handler) openWeakSubjectFree(ctx context.Context, cb *bot.CallbackQuery, user *models.User, subjectID int64) {
 	test, pending, topics, err := h.quiz.EnsurePersonalTest(ctx, user.ID, subjectID)
 	if errors.Is(err, services.ErrPersonalGenLimit) {
 		h.answerAlert(ctx, cb, "На сегодня лимит новых персональных тестов исчерпан 🙏 Пройди уже готовые тесты в «📚 Предметы» — завтра соберу новый тест по слабым темам.")

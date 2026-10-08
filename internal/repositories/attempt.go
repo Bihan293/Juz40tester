@@ -23,6 +23,9 @@ type AnswerResult struct {
 	Finished        bool // attempt was completed by this answer
 	AlreadyAnswered bool
 	NewStatus       int // knowledge status of the question after this answer (0=🔴,1=🟡,2=🟢)
+	// Charged: this answer completed the attempt and one test of today's
+	// quota was charged (subscriptions on, non-personal test).
+	Charged bool
 }
 
 // ErrAnswerOutOfOrder: the answered position is not the first unanswered
@@ -32,6 +35,26 @@ var ErrAnswerOutOfOrder = errors.New("answer is not for the current question")
 // AttemptRepository manages test attempts, answers and knowledge progress.
 type AttemptRepository struct {
 	pool *pgxpool.Pool
+	// quota (optional) is the daily test quota (subscriptions): the start
+	// gate runs inside the attempt-creation transaction, the charge inside
+	// the final-answer transaction. nil = no quota (the old behaviour).
+	quota AttemptQuota
+}
+
+// AttemptQuota is the daily quota of completed tests (BillingRepository).
+type AttemptQuota interface {
+	// CheckStartTx refuses (ErrQuotaExceeded) a NEW attempt when the user
+	// has nothing left today. Runs in the creating transaction.
+	CheckStartTx(ctx context.Context, tx pgx.Tx, userID, testID int64) error
+	// ChargeCompletionTx charges one completion for the attempt (at most
+	// once per attempt). Runs in the final-answer transaction.
+	ChargeCompletionTx(ctx context.Context, tx pgx.Tx, userID, attemptID, testID int64) (bool, error)
+}
+
+// WithQuota installs the daily quota (nil = off).
+func (r *AttemptRepository) WithQuota(q AttemptQuota) *AttemptRepository {
+	r.quota = q
+	return r
 }
 
 func NewAttemptRepository(pool *pgxpool.Pool) *AttemptRepository {
@@ -68,7 +91,9 @@ func (r *AttemptRepository) createAttempt(ctx context.Context, userID, testID in
 		return nil, errors.New("questions and option orders length mismatch")
 	}
 	a, err := r.createAttemptTx(ctx, userID, testID, questionIDs, optionOrders, replace, lookup)
-	if isUniqueViolation(err) {
+	if isUniqueViolation(err) || (errors.Is(err, ErrQuotaExceeded) && !replace) {
+		// Lost a double-tap race (the other tap created the attempt — and
+		// may have taken the last quota slot with it): resume the winner.
 		existing, gerr := r.GetActiveAttempt(ctx, userID, testID)
 		if gerr != nil {
 			return nil, gerr
@@ -107,6 +132,12 @@ func (r *AttemptRepository) createAttemptTx(ctx context.Context, userID, testID 
 			return &a, tx.Commit(ctx)
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
+			return nil, err
+		}
+	}
+
+	if r.quota != nil {
+		if err := r.quota.CheckStartTx(ctx, tx, userID, testID); err != nil {
 			return nil, err
 		}
 	}
@@ -567,10 +598,20 @@ func (r *AttemptRepository) SubmitAnswer(ctx context.Context, userID, attemptID 
 		return nil, err
 	}
 
+	// 7. Subscriptions: the completed test is charged against today's quota
+	// in the SAME transaction (idempotent per attempt).
+	charged := false
+	if finished && r.quota != nil {
+		if charged, err = r.quota.ChargeCompletionTx(ctx, tx, userID, attemptID, a.TestID); err != nil {
+			return nil, err
+		}
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	return &AnswerResult{
+		Charged:        charged,
 		Question:       q,
 		Attempt:        &a,
 		SelectedAnswer: selected,

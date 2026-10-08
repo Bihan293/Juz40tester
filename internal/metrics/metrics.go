@@ -41,6 +41,13 @@ const (
 	QueueBackpressure = "gen_queue_backpressure_total"
 	// DuplicateUpdates: Telegram updates dropped as already seen (update_id).
 	DuplicateUpdates = "tg_duplicate_updates_total"
+	// Payments: Stars payments by kind / decision (new, renewal, upgrade,
+	// refund, refunded …).
+	Payments = "billing_payments_total"
+	// QuotaRefusals: test starts refused because the daily quota is used up.
+	QuotaRefusals = "billing_quota_refusals_total"
+	// QuotaCharges: completed tests charged against the daily quota.
+	QuotaCharges = "billing_quota_charges_total"
 )
 
 type registry struct {
