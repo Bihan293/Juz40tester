@@ -280,10 +280,20 @@ func TestSubscriptionFlowThroughHandler(t *testing.T) {
 	switch {
 	case findCall(after, "sendMessage", "Тест по слабым темам готов") != nil:
 	case findCall(after, "sendMessage", "Не получилось собрать тест") != nil:
+		// The shared test database may hold refunds of other tests: run the
+		// reconciler until OUR charge is refunded.
 		n = f.n()
-		billSvc.ReconcileOnce(ctx)
+		refunded := false
+		for i := 0; i < 50 && !refunded; i++ {
+			billSvc.ReconcileOnce(ctx)
+			for _, c := range f.since(n) {
+				if c.method == "refundStarPayment" && c.p["telegram_payment_charge_id"] == fmt.Sprintf("hw%d", tgID) {
+					refunded = true
+				}
+			}
+		}
 		after = f.since(n)
-		if c := findCall(after, "refundStarPayment", ""); c == nil || c.p["telegram_payment_charge_id"] != fmt.Sprintf("hw%d", tgID) {
+		if !refunded {
 			t.Fatalf("refund call:\n%s", dumpCalls(after))
 		}
 		if findCall(after, "sendMessage", "возвращены") == nil {

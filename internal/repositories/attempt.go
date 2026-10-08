@@ -49,6 +49,11 @@ type AttemptQuota interface {
 	// ChargeCompletionTx charges one completion for the attempt (at most
 	// once per attempt). Runs in the final-answer transaction.
 	ChargeCompletionTx(ctx context.Context, tx pgx.Tx, userID, attemptID, testID int64) (bool, error)
+	// LockUserTx serialises the attempt creation of one user. It is taken
+	// FIRST in the creating transaction (before the «replace» UPDATE): if
+	// the per-user lock were taken after row locks, two concurrent
+	// restarts of the same test would deadlock (row lock vs. advisory lock).
+	LockUserTx(ctx context.Context, tx pgx.Tx, userID int64) error
 }
 
 // WithQuota installs the daily quota (nil = off).
@@ -112,6 +117,11 @@ func (r *AttemptRepository) createAttemptTx(ctx context.Context, userID, testID 
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	if r.quota != nil {
+		if err := r.quota.LockUserTx(ctx, tx, userID); err != nil {
+			return nil, err
+		}
+	}
 	if replace {
 		if _, err := tx.Exec(ctx, `
 			UPDATE test_attempts SET status = 'abandoned', updated_at = now()
