@@ -452,7 +452,13 @@ func (c *Client) call(ctx context.Context, model string, messages []Message, tem
 		return "", fmt.Errorf("deepseek: %s (%s)", cr.Error.Message, cr.Error.Type)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("deepseek: HTTP %d: %s", resp.StatusCode, string(raw))
+		// Bounded, valid UTF-8 excerpt: the body may be large, and the
+		// error ends up in logs and in generation_jobs.last_error.
+		body := strings.ToValidUTF8(string(raw), "\uFFFD")
+		if r := []rune(body); len(r) > 500 {
+			body = string(r[:500]) + "…"
+		}
+		return "", fmt.Errorf("deepseek: HTTP %d: %s", resp.StatusCode, body)
 	}
 	if len(cr.Choices) == 0 {
 		return "", fmt.Errorf("deepseek: empty choices")

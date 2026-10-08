@@ -12,7 +12,7 @@ import (
 // capBudget is a DeepSeek ledger whose daily cap is always reached.
 type capBudget struct{}
 
-func (capBudget) Reserve(context.Context, float64) error { return deepseek.ErrBudgetExceeded }
+func (capBudget) Reserve(context.Context, float64) error   { return deepseek.ErrBudgetExceeded }
 func (capBudget) Settle(context.Context, float64, float64) {}
 
 // The batch strategy must surface the daily DeepSeek cap (wrapped
