@@ -82,7 +82,9 @@ func (r *UserRepository) upsertOnce(ctx context.Context, u *models.User, today t
 					WHEN users.last_active_date = $6::date - 1 THEN users.streak_days + 1
 					ELSE 1
 				END,
-				last_active_date = GREATEST(COALESCE(users.last_active_date, $6::date), $6::date)
+				last_active_date = GREATEST(COALESCE(users.last_active_date, $6::date), $6::date),
+				-- the user writes to the bot again: no longer «blocked».
+				blocked_at    = NULL
 			WHERE users.username      IS DISTINCT FROM EXCLUDED.username
 			   OR users.first_name    IS DISTINCT FROM EXCLUDED.first_name
 			   OR users.last_name     IS DISTINCT FROM EXCLUDED.last_name
@@ -90,6 +92,7 @@ func (r *UserRepository) upsertOnce(ctx context.Context, u *models.User, today t
 			   OR users.last_active_date IS NULL
 			   OR users.last_active_date < $6::date
 			   OR users.streak_days <= 0
+			   OR users.blocked_at IS NOT NULL
 			RETURNING id, telegram_id, username, first_name, last_name, language_code, created_at, updated_at,
 			          streak_days, COALESCE(last_active_date::text, ''), test_lang
 		)

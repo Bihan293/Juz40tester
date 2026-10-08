@@ -120,6 +120,27 @@ type Message struct {
 	SuccessfulPayment *SuccessfulPayment `json:"successful_payment,omitempty"`
 	// RefundedPayment: service message about a refunded payment.
 	RefundedPayment *RefundedPayment `json:"refunded_payment,omitempty"`
+	// Entities: formatting of Text (bold, links, …) — kept verbatim for
+	// admin broadcasts.
+	Entities json.RawMessage `json:"entities,omitempty"`
+	// Media messages (admin broadcasts): photo sizes (the last one is the
+	// largest), a video, their caption and its formatting.
+	Photo           []PhotoSize     `json:"photo,omitempty"`
+	Video           *Video          `json:"video,omitempty"`
+	Caption         string          `json:"caption,omitempty"`
+	CaptionEntities json.RawMessage `json:"caption_entities,omitempty"`
+}
+
+// PhotoSize is one size of a photo.
+type PhotoSize struct {
+	FileID string `json:"file_id"`
+	Width  int    `json:"width"`
+	Height int    `json:"height"`
+}
+
+// Video is a video file.
+type Video struct {
+	FileID string `json:"file_id"`
 }
 
 // PreCheckoutQuery is the last confirmation before a payment.
@@ -688,4 +709,64 @@ func (c *Client) EditUserStarSubscription(ctx context.Context, userID int64, cha
 func IsAlreadyRefunded(err error) bool {
 	var ae *APIError
 	return errors.As(err, &ae) && strings.Contains(strings.ToUpper(ae.Description), "ALREADY_REFUNDED")
+}
+
+// --- Broadcasts ------------------------------------------------------------------
+
+// BroadcastMessage is the content of one admin broadcast message.
+type BroadcastMessage struct {
+	Text        string          // message text, or the caption of the media
+	Entities    json.RawMessage // formatting of Text (nil = plain text)
+	MediaType   string          // "", "photo", "video"
+	MediaFileID string
+	Keyboard    *InlineKeyboardMarkup
+}
+
+// MaxCaptionRunes is the Telegram limit of a media caption.
+const MaxCaptionRunes = 1024
+
+// MaxTextRunes is the Telegram limit of a message text.
+const MaxTextRunes = maxMessageRunes
+
+// SendBroadcast sends one broadcast message. Unlike SendMessage it never
+// queues the request for a deferred re-send and never retries a 429
+// inline: the broadcast worker keeps its own durable retry schedule, so a
+// 429 comes back at once as *RateLimitError (RetryAfter set) and other
+// Telegram refusals as *APIError. The global limiter (TG_MAX_RPS) is
+// honoured like for every message-changing call.
+func (c *Client) SendBroadcast(ctx context.Context, chatID int64, m BroadcastMessage) (int64, error) {
+	method := "sendMessage"
+	p := map[string]any{"chat_id": chatID}
+	switch m.MediaType {
+	case "photo", "video":
+		method = "send" + strings.ToUpper(m.MediaType[:1]) + m.MediaType[1:]
+		p[m.MediaType] = m.MediaFileID
+		if m.Text != "" {
+			p["caption"] = m.Text
+			if len(m.Entities) > 0 {
+				p["caption_entities"] = m.Entities
+			}
+		}
+	default:
+		p["text"] = m.Text
+		if len(m.Entities) > 0 {
+			p["entities"] = m.Entities
+		}
+	}
+	if m.Keyboard != nil && len(m.Keyboard.InlineKeyboard) > 0 {
+		p["reply_markup"] = m.Keyboard
+	}
+	body, err := json.Marshal(p)
+	if err != nil {
+		return 0, err
+	}
+	var msg Message
+	retryAfter, err := c.callOnce(ctx, method, body, &msg)
+	if retryAfter > 0 {
+		return 0, &RateLimitError{Method: method, RetryAfter: retryAfter}
+	}
+	if err != nil {
+		return 0, err
+	}
+	return msg.MessageID, nil
 }

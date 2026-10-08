@@ -259,3 +259,11 @@ func TestSubscriptionSettings(t *testing.T) {
 		t.Fatal("bad ADMIN_IDS must fail")
 	}
 }
+
+func TestDefaultBroadcastRPS(t *testing.T) {
+	for in, want := range map[int]int{25: 16, 30: 20, 1: 1, 2: 1, 3: 2} {
+		if got := DefaultBroadcastRPS(in); got != want {
+			t.Errorf("DefaultBroadcastRPS(%d) = %d, want %d", in, got, want)
+		}
+	}
+}

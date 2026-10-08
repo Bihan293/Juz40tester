@@ -59,6 +59,11 @@ type Config struct {
 	// calls that create / change messages (answerCallbackQuery is not
 	// limited). Calls wait for their slot instead of hitting 429.
 	TGMaxRPS int
+	// BroadcastRPS (BROADCAST_RPS, default 2/3 of TG_MAX_RPS, at least 1,
+	// never above TG_MAX_RPS): messages per second of an admin broadcast
+	// for the whole cluster — the rest of TG_MAX_RPS stays for the
+	// interactive traffic.
+	BroadcastRPS int
 	// DBMinConns (DB_MIN_CONNS, default 5): connections kept open when idle
 	// (pgxpool has no "max idle": idle conns above this are closed after
 	// DBConnMaxIdleTime).
@@ -430,6 +435,10 @@ func Load() (*Config, error) {
 	if n, ok := envIntOpt("TG_MAX_RPS"); ok && n > 0 {
 		cfg.TGMaxRPS = n
 	}
+	cfg.BroadcastRPS = DefaultBroadcastRPS(cfg.TGMaxRPS)
+	if n, ok := envIntOpt("BROADCAST_RPS"); ok && n > 0 {
+		cfg.BroadcastRPS = min(n, cfg.TGMaxRPS)
+	}
 	if n, ok := envIntOpt("DB_MIN_CONNS"); ok && n >= 0 {
 		cfg.DBMinConns = n
 	}
@@ -567,6 +576,12 @@ const defaultDBMaxConns = 20
 
 // DefaultUpdateTimeout bounds the processing of one Telegram update.
 const DefaultUpdateTimeout = 60 * time.Second
+
+// DefaultBroadcastRPS is the default BROADCAST_RPS: two thirds of
+// TG_MAX_RPS (at least 1).
+func DefaultBroadcastRPS(tgMaxRPS int) int {
+	return max(1, tgMaxRPS*2/3)
+}
 
 // DefaultTGMaxRPS is the default TG_MAX_RPS.
 const DefaultTGMaxRPS = 25

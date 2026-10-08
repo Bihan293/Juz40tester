@@ -97,7 +97,7 @@ func (h *Handler) hideReplyKeyboard(ctx context.Context, chatID int64) {
 // In the normal test cycle the previous note was already removed by
 // hideReplyKeyboard, so this is ONE Telegram call.
 func (h *Handler) restoreReplyKeyboard(ctx context.Context, chatID int64) {
-	msgID, err := h.tg.SendMessage(ctx, chatID, "🏠 Меню снова доступно 👇", mainMenuKeyboardFor(h.billing != nil))
+	msgID, err := h.tg.SendMessage(ctx, chatID, "🏠 Меню снова доступно 👇", h.menuKeyboard(chatID))
 	if err != nil {
 		logf("restore reply keyboard: %v", err)
 		return
@@ -124,7 +124,7 @@ func (h *Handler) sendMainMenu(ctx context.Context, chatID int64, user *models.U
 		}
 		text = fmt.Sprintf("👋 Привет, %s! %s\n\nДобро пожаловать в JUZ40 Tester — бот для подготовки к ЕНТ.\nВыберите раздел кнопками ниже 👇", name, streakBadge(user))
 	}
-	if _, err := h.tg.SendMessage(ctx, chatID, text, mainMenuKeyboardFor(h.billing != nil)); err != nil {
+	if _, err := h.tg.SendMessage(ctx, chatID, text, h.menuKeyboard(chatID)); err != nil {
 		logf("send main menu: %v", err)
 		return
 	}

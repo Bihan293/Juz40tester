@@ -394,7 +394,7 @@ func startWorkerSide(ctx, workerCtx context.Context, bgWG *sync.WaitGroup, cfg *
 			OrderTimeout:      cfg.Subscriptions.WeakOrderTimeout,
 			MaxGenAttempts:    cfg.Subscriptions.WeakOrderMaxGen,
 			ReconcileInterval: cfg.Subscriptions.ReconcileInterval,
-		}).WithStars(tg)
+		}).WithStars(tg).WithAdmins(cfg.Subscriptions.IsAdmin)
 		var plans []string
 		for _, p := range cat.Plans() {
 			plans = append(plans, fmt.Sprintf("%s %d⭐ %d/day", p.Code, p.PriceStars, p.DailyLimit))
@@ -411,6 +411,20 @@ func startWorkerSide(ctx, workerCtx context.Context, bgWG *sync.WaitGroup, cfg *
 		bgWG.Add(1)
 		go func() { defer bgWG.Done(); billingSvc.Run(workerCtx) }()
 	}
+	// Admin panel (docs/ADMIN.md): ADMIN_IDS see «🛠 Админка» / /admin —
+	// statistics, user search and plan changes, broadcasts. The broadcast
+	// sender runs on every worker; one broadcast is sent by one worker at a
+	// time (lease in PostgreSQL), progress is durable per recipient.
+	adminRepo := repositories.NewAdminRepository(pool)
+	adminSvc := services.NewAdminService(adminRepo, billingSvc, cfg.Subscriptions.IsAdmin,
+		billing.LoadLocation(cfg.Subscriptions.QuotaTZ))
+	bcSvc := services.NewBroadcastService(adminRepo, tg, cfg.InstanceID, services.BroadcastSettings{RPS: cfg.BroadcastRPS}).
+		WithNotifier(h)
+	h.WithAdminPanel(adminSvc, bcSvc)
+	bgWG.Add(1)
+	go func() { defer bgWG.Done(); bcSvc.Run(workerCtx) }()
+	log.Printf("admin panel: %d admin(s) in ADMIN_IDS; broadcasts at %d msg/s (TG_MAX_RPS=%d)",
+		len(cfg.Subscriptions.AdminIDs), cfg.BroadcastRPS, cfg.TGMaxRPS)
 
 	// Cluster events: a generation / translation finished on ANY instance
 	// reaches the users waiting on THIS one at once (otherwise they would

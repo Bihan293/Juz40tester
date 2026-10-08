@@ -213,6 +213,12 @@ func (h *Handler) buyPlan(ctx context.Context, cb *bot.CallbackQuery, user *mode
 		h.answerCallback(ctx, cb, "Такого плана нет")
 		return
 	}
+	if h.canBypassPay(cb.From.ID) {
+		// Administrator: the purchase goes through at once, no invoice.
+		h.answerCallback(ctx, cb, "")
+		h.bypassPurchase(ctx, cb.Message.Chat.ID, user, cb.From.ID, billing.SubscriptionPayload(p.Code))
+		return
+	}
 	link, err := h.planInvoiceLink(ctx, p)
 	if err != nil {
 		logf("invoice link %s: %v", p.Code, err)
@@ -375,6 +381,11 @@ func (h *Handler) sendWeakInvoice(ctx context.Context, chatID int64, user *model
 		h.sendText(ctx, chatID, "Не удалось создать счёт 😔 Попробуй через минуту.")
 		return
 	}
+	if h.canBypassPay(tgUserID) {
+		// Administrator: the order is paid at once, no invoice.
+		h.bypassPurchase(ctx, chatID, user, tgUserID, billing.WeakTestPayload(order.ID))
+		return
+	}
 	subjName := ""
 	if s, err := h.quiz.GetSubject(ctx, subjectID); err == nil {
 		subjName = s.Name
@@ -455,7 +466,13 @@ func (h *Handler) handleSuccessfulPayment(ctx context.Context, m *bot.Message) e
 	if out.Duplicate {
 		return nil
 	}
-	chatID := m.Chat.ID
+	h.sendPaymentOutcome(ctx, m.Chat.ID, user, out)
+	return nil
+}
+
+// sendPaymentOutcome tells the user what a (real or admin-bypass) payment
+// gave them.
+func (h *Handler) sendPaymentOutcome(ctx context.Context, chatID int64, user *models.User, out *services.PaymentOutcome) {
 	switch out.Kind {
 	case services.OutcomeSubscription:
 		until := ""
@@ -483,7 +500,6 @@ func (h *Handler) handleSuccessfulPayment(ctx context.Context, m *bot.Message) e
 	case services.OutcomeRejected:
 		h.sendText(ctx, chatID, "Этот платёж не может быть применён (план уже сменён или счёт устарел) — звёзды вернутся автоматически.")
 	}
-	return nil
 }
 
 func (h *Handler) sendWithKeyboard(ctx context.Context, chatID int64, text string, rows ...[]bot.InlineKeyboardButton) {
@@ -539,7 +555,10 @@ func (h *Handler) handleAdmin(ctx context.Context, m *bot.Message, text string) 
 			reply("Неверный telegram_id")
 			return true
 		}
-		_, until, err := h.billing.Grant(ctx, tgID, f[2], days)
+		uid, until, err := h.billing.Grant(ctx, tgID, f[2], days)
+		if err == nil && h.admin != nil {
+			h.admin.LogAction(ctx, m.From.ID, services.ActionCommandGrant, uid, fmt.Sprintf("plan=%s days=%d", f[2], days))
+		}
 		switch {
 		case errors.Is(err, services.ErrUnknownPlan):
 			reply("Неизвестный план: " + f[2])
@@ -562,9 +581,13 @@ func (h *Handler) handleAdmin(ctx context.Context, m *bot.Message, text string) 
 			reply("Неверный telegram_id")
 			return true
 		}
-		if _, _, err := h.billing.Grant(ctx, tgID, billing.PlanFree, 0); err != nil {
+		uid, _, err := h.billing.Grant(ctx, tgID, billing.PlanFree, 0)
+		if err != nil {
 			reply("Ошибка: " + err.Error())
 			return true
+		}
+		if h.admin != nil {
+			h.admin.LogAction(ctx, m.From.ID, services.ActionCommandRevoke, uid, "plan=free")
 		}
 		reply(fmt.Sprintf("✅ План пользователя %d отозван (Free)", tgID))
 	case "/subinfo":
@@ -604,6 +627,9 @@ func (h *Handler) handleAdmin(ctx context.Context, m *bot.Message, text string) 
 			return true
 		}
 		ok, err := h.billing.AdminRefund(ctx, f[1])
+		if ok && h.admin != nil {
+			h.admin.LogAction(ctx, m.From.ID, services.ActionCommandRefund, 0, "charge="+f[1])
+		}
 		switch {
 		case err != nil:
 			reply("Ошибка: " + err.Error())
