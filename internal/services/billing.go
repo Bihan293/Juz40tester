@@ -2,6 +2,8 @@ package services
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -64,6 +66,9 @@ type BillingService struct {
 	notify BillingNotifier
 	set    BillingSettings
 	wake   chan struct{}
+	// isAdmin (optional) recognises administrators (ADMIN_IDS): their
+	// purchases may be applied without an invoice (AdminBypassPurchase).
+	isAdmin func(tgUserID int64) bool
 }
 
 // NewBillingService wires the service. build may be nil (AI generation
@@ -84,6 +89,16 @@ func NewBillingService(repo *repositories.BillingRepository, tests personalTests
 
 // WithStars wires the Telegram Stars API (refunds / cancellations).
 func (s *BillingService) WithStars(api StarsAPI) *BillingService { s.stars = api; return s }
+
+// WithAdmins installs the administrator check used by AdminBypassPurchase
+// (nil = nobody may bypass the payment).
+func (s *BillingService) WithAdmins(isAdmin func(tgUserID int64) bool) *BillingService {
+	s.isAdmin = isAdmin
+	return s
+}
+
+// IsAdmin reports whether the Telegram user is an administrator.
+func (s *BillingService) IsAdmin(tgUserID int64) bool { return s.isAdmin != nil && s.isAdmin(tgUserID) }
 
 // WithNotifier wires the user notifications.
 func (s *BillingService) WithNotifier(n BillingNotifier) *BillingService { s.notify = n; return s }
@@ -190,6 +205,8 @@ type PaymentInfo struct {
 	SubExpiresAt     time.Time
 	IsRecurring      bool
 	IsFirstRecurring bool
+	// AdminBypass: a test purchase of an administrator (no real Stars).
+	AdminBypass bool
 }
 
 // Payment outcome kinds.
@@ -231,6 +248,7 @@ func (s *BillingService) OnSuccessfulPayment(ctx context.Context, userID, tgUser
 		ChargeID: pi.ChargeID, ProviderChargeID: pi.ProviderChargeID, UserID: userID, TelegramUserID: tgUserID,
 		Kind: pl.Kind, Plan: pl.Plan, OrderID: pl.OrderID, Amount: pi.Amount, Currency: pi.Currency,
 		Payload: pi.Payload, IsRecurring: pi.IsRecurring, IsFirstRecurring: pi.IsFirstRecurring, SubExpiresAt: pi.SubExpiresAt,
+		AdminBypass: pi.AdminBypass,
 	}
 	switch pl.Kind {
 	case billing.KindSubscription:
@@ -249,10 +267,10 @@ func (s *BillingService) applySubscription(ctx context.Context, tgUserID int64, 
 	if dup {
 		log.Printf("billing: duplicate subscription payment %s (user %d) ignored", rec.ChargeID, rec.UserID)
 	} else {
-		metrics.Inc(metrics.Payments, "kind", billing.KindSubscription, "decision", dec.Kind)
-		log.Printf("billing: subscription payment %s: user %d (tg %d) plan %s %d⭐ recurring=%t first=%t → %s",
-			rec.ChargeID, rec.UserID, tgUserID, rec.Plan, rec.Amount, rec.IsRecurring, rec.IsFirstRecurring, dec.Kind)
-		if dec.CancelChargeID != "" && s.stars != nil {
+		metrics.Inc(metrics.Payments, "kind", billing.KindSubscription, "decision", decisionLabel(dec.Kind, rec.AdminBypass))
+		log.Printf("billing: subscription payment %s: user %d (tg %d) plan %s %d⭐ recurring=%t first=%t admin_bypass=%t → %s",
+			rec.ChargeID, rec.UserID, tgUserID, rec.Plan, rec.Amount, rec.IsRecurring, rec.IsFirstRecurring, rec.AdminBypass, dec.Kind)
+		if dec.CancelChargeID != "" && s.stars != nil && !IsAdminBypassCharge(dec.CancelChargeID) {
 			if err := s.stars.EditUserStarSubscription(ctx, tgUserID, dec.CancelChargeID, true); err != nil {
 				log.Printf("billing: cancel auto-renewal of subscription %s (tg %d): %v", dec.CancelChargeID, tgUserID, err)
 			}
@@ -288,9 +306,9 @@ func (s *BillingService) applyWeakPayment(ctx context.Context, tgUserID int64, r
 		log.Printf("billing: duplicate weak-test payment %s (user %d) ignored", rec.ChargeID, rec.UserID)
 		return &PaymentOutcome{Kind: OutcomeWeakPending, Duplicate: true}, nil
 	}
-	metrics.Inc(metrics.Payments, "kind", billing.KindWeakTest, "decision", fmt.Sprint(accepted))
-	log.Printf("billing: weak-test payment %s: user %d (tg %d) order %d %d⭐ accepted=%t",
-		rec.ChargeID, rec.UserID, tgUserID, rec.OrderID, rec.Amount, accepted)
+	metrics.Inc(metrics.Payments, "kind", billing.KindWeakTest, "decision", decisionLabel(fmt.Sprint(accepted), rec.AdminBypass))
+	log.Printf("billing: weak-test payment %s: user %d (tg %d) order %d %d⭐ accepted=%t admin_bypass=%t",
+		rec.ChargeID, rec.UserID, tgUserID, rec.OrderID, rec.Amount, accepted, rec.AdminBypass)
 	if !accepted {
 		s.Wake() // refund
 		return &PaymentOutcome{Kind: OutcomeRejected}, nil
@@ -424,6 +442,14 @@ func (s *BillingService) OnRefundedPayment(ctx context.Context, chargeID string)
 }
 
 func (s *BillingService) processRefund(ctx context.Context, p repositories.Payment) {
+	if p.AdminBypass || IsAdminBypassCharge(p.ChargeID) {
+		// No real Stars were paid: never call refundStarPayment (the
+		// repository already excludes these rows — defence in depth).
+		if _, err := s.repo.MarkRefunded(ctx, p.ChargeID); err != nil {
+			log.Printf("billing: close admin-bypass refund %s: %v", p.ChargeID, err)
+		}
+		return
+	}
 	if s.stars == nil {
 		return
 	}
@@ -592,4 +618,82 @@ func (s *BillingService) AdminRefund(ctx context.Context, chargeID string) (bool
 		s.Wake()
 	}
 	return ok, err
+}
+
+// --- Admin-bypass purchases (test mode of the payments) ---------------------------
+
+// AdminBypassChargePrefix starts the charge id of an admin-bypass purchase
+// (a real Telegram charge id never looks like this).
+const AdminBypassChargePrefix = "admin-bypass:"
+
+// IsAdminBypassCharge reports whether chargeID belongs to an admin-bypass
+// purchase.
+func IsAdminBypassCharge(chargeID string) bool {
+	return strings.HasPrefix(chargeID, AdminBypassChargePrefix)
+}
+
+// ErrNotAdmin: the Telegram user is not in ADMIN_IDS.
+var ErrNotAdmin = errors.New("not an administrator")
+
+// BypassRefusedError: the purchase is not allowed by the usual rules (the
+// same checks as pre_checkout_query) — Reason is the user-facing text.
+type BypassRefusedError struct{ Reason string }
+
+func (e *BypassRefusedError) Error() string { return "admin bypass refused: " + e.Reason }
+
+func decisionLabel(d string, bypass bool) string {
+	if bypass {
+		return d + "_admin_bypass"
+	}
+	return d
+}
+
+// AdminBypassPurchase applies a purchase of an ADMINISTRATOR at once, as
+// if Telegram had confirmed the payment: no invoice, no payment window, no
+// real Stars. It runs the very same pipeline as a real payment (the same
+// pre-checkout rules, the same idempotent payment record — flagged
+// admin_bypass — the same subscription / paid-order logic), so the admin
+// tests exactly what a user gets. The administrator check is done HERE, on
+// the server, whatever the caller checked before. Bypass payments are
+// never refunded through Telegram.
+func (s *BillingService) AdminBypassPurchase(ctx context.Context, userID, tgUserID int64, payload string) (*PaymentOutcome, error) {
+	if !s.IsAdmin(tgUserID) {
+		return nil, ErrNotAdmin
+	}
+	pl, ok := billing.ParsePayload(payload)
+	if !ok {
+		return nil, &BypassRefusedError{Reason: errPayStale}
+	}
+	amount := 0
+	switch pl.Kind {
+	case billing.KindSubscription:
+		p, found := s.Catalog().Get(pl.Plan)
+		if !found {
+			return nil, &BypassRefusedError{Reason: errPayStale}
+		}
+		amount = p.PriceStars
+	case billing.KindWeakTest:
+		o, err := s.repo.WeakOrderByID(ctx, pl.OrderID)
+		if err != nil {
+			return nil, err
+		}
+		amount = o.Amount
+	}
+	if ok, msg := s.PreCheckout(ctx, userID, billing.CurrencyStars, amount, payload); !ok {
+		return nil, &BypassRefusedError{Reason: msg}
+	}
+	pi := PaymentInfo{
+		Currency: billing.CurrencyStars, Amount: amount, Payload: payload,
+		ChargeID:    AdminBypassChargePrefix + randomID(),
+		AdminBypass: true,
+	}
+	log.Printf("billing: ADMIN BYPASS purchase by tg %d (user %d): %s %d⭐ (no invoice, no real Stars)", tgUserID, userID, payload, amount)
+	return s.OnSuccessfulPayment(ctx, userID, tgUserID, pi)
+}
+
+// randomID returns 16 random hex characters (unique charge ids).
+func randomID() string {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }

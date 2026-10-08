@@ -210,6 +210,9 @@ type PaymentRecord struct {
 	IsRecurring      bool
 	IsFirstRecurring bool
 	SubExpiresAt     time.Time
+	// AdminBypass: a test-mode «purchase» of an administrator (ADMIN_IDS)
+	// — no invoice, no real Stars; never refunded through Telegram.
+	AdminBypass bool
 }
 
 func insertPayment(ctx context.Context, tx pgx.Tx, p PaymentRecord) (bool, error) {
@@ -227,11 +230,11 @@ func insertPayment(ctx context.Context, tx pgx.Tx, p PaymentRecord) (bool, error
 	}
 	tag, err := tx.Exec(ctx, `
 		INSERT INTO payments (charge_id, provider_charge_id, user_id, telegram_user_id, kind, plan, order_id,
-		                      amount, currency, payload, is_recurring, is_first_recurring, subscription_expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		                      amount, currency, payload, is_recurring, is_first_recurring, subscription_expires_at, admin_bypass)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		ON CONFLICT (charge_id) DO NOTHING`,
 		p.ChargeID, p.ProviderChargeID, p.UserID, p.TelegramUserID, p.Kind, plan, order,
-		p.Amount, p.Currency, p.Payload, p.IsRecurring, p.IsFirstRecurring, exp)
+		p.Amount, p.Currency, p.Payload, p.IsRecurring, p.IsFirstRecurring, exp, p.AdminBypass)
 	if err != nil {
 		return false, err
 	}
@@ -279,6 +282,13 @@ func (r *BillingRepository) ApplySubscriptionPayment(ctx context.Context, p Paym
 		Plan: p.Plan, ChargeID: p.ChargeID, ExpiresAt: p.SubExpiresAt,
 		IsRecurring: p.IsRecurring, IsFirstRecurring: p.IsFirstRecurring,
 	}, r.now(), r.grace)
+	if dec.New != nil && p.AdminBypass {
+		// A test purchase of an administrator: no Telegram subscription
+		// behind it (nothing to renew or cancel later) — stored like a
+		// plan granted by hand, the payment row keeps admin_bypass.
+		dec.New.Source = billing.SourceAdmin
+		dec.New.SubChargeID = ""
+	}
 	if dec.New != nil {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO user_subscriptions (user_id, plan, status, expires_at, charge_id, sub_charge_id, source, started_at, updated_at)
@@ -297,14 +307,28 @@ func (r *BillingRepository) ApplySubscriptionPayment(ctx context.Context, p Paym
 	status := "paid"
 	reason := ""
 	if dec.Refund {
-		status, reason = "refund_pending", "subscription:"+dec.Kind
+		status, reason = refundStatus(p.AdminBypass), "subscription:"+dec.Kind
 	}
-	if _, err := tx.Exec(ctx, `UPDATE payments SET decision = $2, status = $3, refund_reason = $4 WHERE charge_id = $1`,
+	if _, err := tx.Exec(ctx, `UPDATE payments SET decision = $2, status = $3, refund_reason = $4,
+		refunded_at = CASE WHEN $3 = 'refunded' THEN now() END WHERE charge_id = $1`,
 		p.ChargeID, dec.Kind, status, reason); err != nil {
 		return false, dec, err
 	}
 	return false, dec, tx.Commit(ctx)
 }
+
+// refundStatus is the status of a payment that has to be given back: a
+// real one waits for the reconciler (refundStarPayment); an admin-bypass
+// one had no real Stars — it is closed as refunded at once.
+func refundStatus(adminBypass bool) string {
+	if adminBypass {
+		return "refunded"
+	}
+	return "refund_pending"
+}
+
+// refundStatusSQL is refundStatus inside an UPDATE of payments.
+const refundStatusSQL = `CASE WHEN admin_bypass THEN 'refunded' ELSE 'refund_pending' END`
 
 func nullIfEmpty(s string) *string {
 	if s == "" {
@@ -356,7 +380,12 @@ type Payment struct {
 	RefundReason   string
 	Attempts       int
 	CreatedAt      time.Time
+	AdminBypass    bool
 }
+
+// paymentCols are the columns scanPayments reads (prefix-free).
+const paymentCols = `charge_id, user_id, telegram_user_id, kind, COALESCE(plan, ''), COALESCE(order_id, 0),
+		          amount, status, decision, refund_reason, refund_attempts, created_at, admin_bypass`
 
 // ClaimDueRefunds takes up to limit payments waiting for a refund (lease:
 // next_check_at moves by lease, so another worker skips them meanwhile).
@@ -364,11 +393,11 @@ func (r *BillingRepository) ClaimDueRefunds(ctx context.Context, limit int, leas
 	rows, err := r.pool.Query(ctx, `
 		UPDATE payments p SET next_check_at = now() + make_interval(secs => $2)
 		FROM (SELECT charge_id FROM payments
-		      WHERE status = 'refund_pending' AND next_check_at <= now()
+		      WHERE status = 'refund_pending' AND next_check_at <= now() AND NOT admin_bypass
 		      ORDER BY next_check_at LIMIT $1 FOR UPDATE SKIP LOCKED) d
 		WHERE p.charge_id = d.charge_id
 		RETURNING p.charge_id, p.user_id, p.telegram_user_id, p.kind, COALESCE(p.plan, ''), COALESCE(p.order_id, 0),
-		          p.amount, p.status, p.decision, p.refund_reason, p.refund_attempts, p.created_at`,
+		          p.amount, p.status, p.decision, p.refund_reason, p.refund_attempts, p.created_at, p.admin_bypass`,
 		limit, lease.Seconds())
 	if err != nil {
 		return nil, err
@@ -382,7 +411,7 @@ func scanPayments(rows pgx.Rows) ([]Payment, error) {
 	for rows.Next() {
 		var p Payment
 		if err := rows.Scan(&p.ChargeID, &p.UserID, &p.TelegramUserID, &p.Kind, &p.Plan, &p.OrderID,
-			&p.Amount, &p.Status, &p.Decision, &p.RefundReason, &p.Attempts, &p.CreatedAt); err != nil {
+			&p.Amount, &p.Status, &p.Decision, &p.RefundReason, &p.Attempts, &p.CreatedAt, &p.AdminBypass); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -414,7 +443,8 @@ func (r *BillingRepository) NoteRefundFailure(ctx context.Context, chargeID stri
 // RequestRefund marks a paid payment for refund (admin / failed order).
 func (r *BillingRepository) RequestRefund(ctx context.Context, chargeID, reason string) (bool, error) {
 	tag, err := r.pool.Exec(ctx, `
-		UPDATE payments SET status = 'refund_pending', refund_reason = $2, next_check_at = now()
+		UPDATE payments SET status = `+refundStatusSQL+`, refund_reason = $2, next_check_at = now(),
+		       refunded_at = CASE WHEN admin_bypass THEN now() END
 		WHERE charge_id = $1 AND status = 'paid'`, chargeID, reason)
 	if err != nil {
 		return false, err
@@ -434,8 +464,7 @@ func (r *BillingRepository) OnExternalRefund(ctx context.Context, chargeID strin
 	rows, err := tx.Query(ctx, `
 		UPDATE payments SET status = 'refunded', refunded_at = COALESCE(refunded_at, now())
 		WHERE charge_id = $1
-		RETURNING charge_id, user_id, telegram_user_id, kind, COALESCE(plan, ''), COALESCE(order_id, 0),
-		          amount, status, decision, refund_reason, refund_attempts, created_at`, chargeID)
+		RETURNING `+paymentCols, chargeID)
 	if err != nil {
 		return nil, err
 	}
@@ -457,8 +486,7 @@ func (r *BillingRepository) OnExternalRefund(ctx context.Context, chargeID strin
 // RecentPayments returns the latest payments of a user (admin info).
 func (r *BillingRepository) RecentPayments(ctx context.Context, userID int64, limit int) ([]Payment, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT charge_id, user_id, telegram_user_id, kind, COALESCE(plan, ''), COALESCE(order_id, 0),
-		       amount, status, decision, refund_reason, refund_attempts, created_at
+		SELECT `+paymentCols+`
 		FROM payments WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2`, userID, limit)
 	if err != nil {
 		return nil, err
@@ -600,9 +628,10 @@ func (r *BillingRepository) PayWeakOrder(ctx context.Context, p PaymentRecord, r
 	accepted = tag.RowsAffected() == 1
 	decision, status := "weak_paid", "paid"
 	if !accepted {
-		decision, status = "weak_not_payable", "refund_pending"
+		decision, status = "weak_not_payable", refundStatus(p.AdminBypass)
 	}
-	if _, err := tx.Exec(ctx, `UPDATE payments SET decision = $2, status = $3, refund_reason = CASE WHEN $3 = 'paid' THEN '' ELSE $2 END
+	if _, err := tx.Exec(ctx, `UPDATE payments SET decision = $2, status = $3, refund_reason = CASE WHEN $3 = 'paid' THEN '' ELSE $2 END,
+		refunded_at = CASE WHEN $3 = 'refunded' THEN now() END
 		WHERE charge_id = $1`, p.ChargeID, decision, status); err != nil {
 		return false, false, err
 	}
@@ -701,7 +730,8 @@ func (r *BillingRepository) RefundWeakOrder(ctx context.Context, id int64, reaso
 	}
 	if charge != "" {
 		if _, err := tx.Exec(ctx, `
-			UPDATE payments SET status = 'refund_pending', refund_reason = left($2, 500), next_check_at = now()
+			UPDATE payments SET status = `+refundStatusSQL+`, refund_reason = left($2, 500), next_check_at = now(),
+			       refunded_at = CASE WHEN admin_bypass THEN now() END
 			WHERE charge_id = $1 AND status = 'paid'`, charge, "weak_order:"+reason); err != nil {
 			return false, err
 		}

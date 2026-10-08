@@ -145,7 +145,8 @@ func (h *Handler) showCurrentQuestion(ctx context.Context, cb *bot.CallbackQuery
 		h.showResult(ctx, cb, user, attemptID, 0)
 		return
 	}
-	h.editMessage(ctx, cb, renderQuestion(view), questionKeyboard(view))
+	admin := h.isAdminTG(user.TelegramID)
+	h.editMessage(ctx, cb, renderQuestionFor(view, admin), questionKeyboardFor(view, admin))
 }
 
 // sendCurrentQuestion sends the next unanswered question as a NEW message
@@ -157,29 +158,70 @@ func (h *Handler) sendCurrentQuestion(ctx context.Context, chatID int64, user *m
 		h.showResult(ctx, nil, user, attemptID, chatID)
 		return
 	}
-	if _, err := h.tg.SendMessage(ctx, chatID, renderQuestion(view), questionKeyboard(view)); err != nil {
+	admin := h.isAdminTG(user.TelegramID)
+	if _, err := h.tg.SendMessage(ctx, chatID, renderQuestionFor(view, admin), questionKeyboardFor(view, admin)); err != nil {
 		logf("send question: %v", err)
 	}
 }
 
-func renderQuestion(v *services.QuestionView) string {
+func renderQuestion(v *services.QuestionView) string { return renderQuestionFor(v, false) }
+
+// correctDisplayIndex is the displayed position of the correct option
+// (-1 when unknown).
+func correctDisplayIndex(v *services.QuestionView) int {
+	if v == nil || v.AttemptQ == nil || v.Question == nil {
+		return -1
+	}
+	for i, orig := range v.AttemptQ.OptionOrder {
+		if orig == v.Question.CorrectAnswer && i < len(v.DisplayTexts) {
+			return i
+		}
+	}
+	return -1
+}
+
+// renderQuestionFor renders a question; admin = the viewer is an
+// administrator (ADMIN_IDS): the correct option is marked ✅ and named
+// below. Only the RENDERING differs — the answer is checked and counted
+// exactly like for every other user.
+func renderQuestionFor(v *services.QuestionView, admin bool) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "❓ Вопрос %d/%d\n\n%s\n\n", v.AttemptQ.Position, v.Total, v.Text)
+	correct := -1
+	if admin {
+		correct = correctDisplayIndex(v)
+	}
 	for i, text := range v.DisplayTexts {
-		fmt.Fprintf(&b, "%s) %s\n", services.OptionLabels[i], text)
+		mark := ""
+		if i == correct {
+			mark = " ✅"
+		}
+		fmt.Fprintf(&b, "%s) %s%s\n", services.OptionLabels[i], text, mark)
+	}
+	if correct >= 0 {
+		fmt.Fprintf(&b, "\n🛠 Админ: правильный ответ — %s", services.OptionLabels[correct])
 	}
 	return strings.TrimRight(b.String(), "\n")
 }
 
 func questionKeyboard(v *services.QuestionView) *bot.InlineKeyboardMarkup {
+	return questionKeyboardFor(v, false)
+}
+
+func questionKeyboardFor(v *services.QuestionView, admin bool) *bot.InlineKeyboardMarkup {
 	rows := make([][]bot.InlineKeyboardButton, 0, len(v.DisplayTexts)+1)
 	prefix := fmt.Sprintf("%s%d:%d:", cbAnswer, v.Attempt.ID, v.AttemptQ.Position)
+	correct := -1
+	if admin {
+		correct = correctDisplayIndex(v)
+	}
 	for i := range v.DisplayTexts {
+		label := fmt.Sprintf("%s) %s", services.OptionLabels[i], v.DisplayTexts[i])
+		if i == correct {
+			label = "✅ " + label
+		}
 		// Full-width buttons with the option text: easy to read and to tap.
-		rows = append(rows, bot.Row(bot.Btn(
-			fmt.Sprintf("%s) %s", services.OptionLabels[i], v.DisplayTexts[i]),
-			prefix+strconv.Itoa(i),
-		)))
+		rows = append(rows, bot.Row(bot.Btn(label, prefix+strconv.Itoa(i))))
 	}
 	rows = append(rows, bot.Row(bot.Btn("🚪 Выйти", cbExit+strconv.FormatInt(v.Attempt.ID, 10))))
 	return &bot.InlineKeyboardMarkup{InlineKeyboard: rows}

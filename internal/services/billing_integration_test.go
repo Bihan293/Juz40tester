@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/Bihan293/Juz40tester/internal/billing"
 	"github.com/Bihan293/Juz40tester/internal/database"
 	"github.com/Bihan293/Juz40tester/internal/models"
@@ -134,6 +136,7 @@ type billEnv struct {
 	tgID   int64
 	sid    int64
 	exec   func(sql string, args ...any)
+	pool   *pgxpool.Pool
 }
 
 func newBillEnv(t *testing.T) *billEnv {
@@ -151,7 +154,7 @@ func newBillEnv(t *testing.T) *billEnv {
 	if err := database.Migrate(ctx, pool); err != nil {
 		t.Fatal(err)
 	}
-	e := &billEnv{ctx: ctx, stars: &fakeStars{}, tests: &fakeTests{topics: []string{"t1"}}, notify: &fakeNotify{}}
+	e := &billEnv{ctx: ctx, stars: &fakeStars{}, tests: &fakeTests{topics: []string{"t1"}}, notify: &fakeNotify{}, pool: pool}
 	e.build = &fakeBuild{topics: []string{"Тема"}, tests: e.tests}
 	e.repo = repositories.NewBillingRepository(pool, billing.MustCatalog(billing.DefaultPlans()), billing.LoadLocation("Asia/Almaty"), time.Hour)
 	e.svc = NewBillingService(e.repo, e.tests, e.build, BillingSettings{WeakTestPrice: 10, OrderTimeout: time.Hour, MaxGenAttempts: 2}).

@@ -48,6 +48,11 @@ const (
 	QuotaRefusals = "billing_quota_refusals_total"
 	// QuotaCharges: completed tests charged against the daily quota.
 	QuotaCharges = "billing_quota_charges_total"
+	// BroadcastMessages: broadcast deliveries by result (sent, blocked,
+	// failed, retry, rate_limited).
+	BroadcastMessages = "admin_broadcast_messages_total"
+	// AdminActions: administrator actions by kind.
+	AdminActions = "admin_actions_total"
 )
 
 type registry struct {

@@ -48,6 +48,10 @@ type Handler struct {
 	billing *services.BillingService
 	// isAdmin (optional) recognises administrators (ADMIN_IDS).
 	isAdmin func(tgUserID int64) bool
+	// admin (optional): the admin panel (statistics, users, broadcasts).
+	admin *services.AdminService
+	// bcWaker (optional) wakes the broadcast sender after a confirmation.
+	bcWaker BroadcastWaker
 }
 
 // New creates a Handler.

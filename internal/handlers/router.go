@@ -72,6 +72,12 @@ func (h *Handler) handleMessage(ctx context.Context, m *bot.Message) {
 	}
 
 	text := strings.TrimSpace(m.Text)
+	// Admin panel: /admin, «🛠 Админка» and the input of an admin dialog
+	// step (search query, broadcast text / media / buttons). Only for
+	// ADMIN_IDS — for everybody else this is a no-op.
+	if h.handleAdminMessage(ctx, m, user) {
+		return
+	}
 	if strings.HasPrefix(text, "/") && h.handleAdmin(ctx, m, text) {
 		return
 	}
@@ -134,6 +140,12 @@ func (h *Handler) handleCallback(ctx context.Context, cb *bot.CallbackQuery) {
 	// тест генерируется…» popups never showed because the router answered
 	// the callback BEFORE the handlers did). The router therefore answers
 	// nothing; each handler acknowledges the callback itself.
+	if strings.HasPrefix(data, cbAdmPrefix) {
+		// Admin panel: re-checked against ADMIN_IDS inside (a forged
+		// button of a non-admin is only acknowledged).
+		h.handleAdminCallback(ctx, cb, user, data)
+		return
+	}
 	if h.routeByID(ctx, cb, user, data) {
 		return
 	}
