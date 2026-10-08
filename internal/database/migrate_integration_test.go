@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -57,5 +58,24 @@ func TestMigrateConcurrent(t *testing.T) {
 	}
 	if dups != 0 {
 		t.Fatalf("%d migration(s) recorded more than once", dups)
+	}
+}
+
+// TestMigrateSingleConnectionPool: pool_max_conns=1 in the URL (it wins over
+// the size MigrateURL asks for) must not deadlock the migration lock —
+// everything runs on the connection that holds the lock.
+func TestMigrateSingleConnectionPool(t *testing.T) {
+	url := os.Getenv("TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("TEST_DATABASE_URL not set")
+	}
+	sep := "?"
+	if strings.Contains(url, "?") {
+		sep = "&"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := MigrateURL(ctx, url+sep+"pool_max_conns=1"); err != nil {
+		t.Fatalf("migrate over a one-connection pool: %v", err)
 	}
 }

@@ -176,6 +176,15 @@ func main() {
 	var updates *updateDispatcher
 	var ingress *updq.Ingress
 	if cfg.ServesWebhook() {
+		// pre_checkout_query fast path: answered in the webhook request,
+		// never queued (Telegram waits at most 10 s). ROLE=web has no
+		// update handler — it gets a payment-check-only one.
+		var preCheckout func(context.Context, *bot.PreCheckoutQuery)
+		if w != nil {
+			preCheckout = w.h.AnswerPreCheckout
+		} else {
+			preCheckout = newPreCheckoutHandler(cfg, pool, tg).AnswerPreCheckout
+		}
 		if cfg.WebhookSecret == "" {
 			// Only reachable with APP_ENV=development (config.Load refuses a
 			// production start without the secret).
@@ -183,9 +192,11 @@ func main() {
 		}
 		if queue == nil {
 			updates = newUpdateDispatcher(cfg.WebhookSecret, w.updateWorkers, defaultUpdateQueueSize, cfg.UpdateTimeout, w.h.HandleUpdate)
+			updates.preCheckout = preCheckout
 			mux.Handle("POST /telegram/webhook", updates)
 		} else {
 			ingress = updq.NewIngress(cfg.WebhookSecret, queue)
+			ingress.PreCheckout = preCheckout
 			if w != nil && w.consumer != nil {
 				ingress.OnEnqueued = w.consumer.Wake
 			}
@@ -291,6 +302,29 @@ func healthPing(pool interface{ Ping(context.Context) error }, rdb *redis.Client
 		}
 		return nil
 	}
+}
+
+// newPreCheckoutHandler builds the handler a ROLE=web process uses for the
+// pre_checkout_query fast path only: the same validation as the worker
+// (users + billing repositories, no background loops, no AI clients).
+// With SUBSCRIPTIONS_ENABLED=0 it refuses every payment, like the worker.
+func newPreCheckoutHandler(cfg *config.Config, pool *pgxpool.Pool, tg *bot.Client) *handlers.Handler {
+	h := handlers.New(tg, repositories.NewUserRepository(pool), nil)
+	if !cfg.Subscriptions.Enabled {
+		return h
+	}
+	cat, err := cfg.Subscriptions.Catalog()
+	if err != nil {
+		log.Fatalf("subscriptions: %v", err)
+	}
+	billRepo := repositories.NewBillingRepository(pool, cat, billing.LoadLocation(cfg.Subscriptions.QuotaTZ), cfg.Subscriptions.Grace)
+	svc := services.NewBillingService(billRepo, repositories.NewGenerationRepository(pool), nil, services.BillingSettings{
+		WeakTestPrice:     cfg.Subscriptions.WeakTestPrice,
+		OrderTimeout:      cfg.Subscriptions.WeakOrderTimeout,
+		MaxGenAttempts:    cfg.Subscriptions.WeakOrderMaxGen,
+		ReconcileInterval: cfg.Subscriptions.ReconcileInterval,
+	}).WithAdmins(cfg.Subscriptions.IsAdmin)
+	return h.WithBilling(svc).WithAdmins(cfg.Subscriptions.IsAdmin)
 }
 
 // workerSide is what a ROLE=worker / ROLE=all process runs besides HTTP.
@@ -405,7 +439,8 @@ func startWorkerSide(ctx, workerCtx context.Context, bgWG *sync.WaitGroup, cfg *
 		log.Println("subscriptions: OFF (SUBSCRIPTIONS_ENABLED=0) — no daily quota, free weak-topics tests")
 	}
 	h := handlers.New(tg, userRepo, quiz).WithActionLimiter(actions).
-		WithBilling(billingSvc).WithAdmins(cfg.Subscriptions.IsAdmin)
+		WithBilling(billingSvc).WithAdmins(cfg.Subscriptions.IsAdmin).
+		WithSharedUpdates(cfg.DurableQueue())
 	if billingSvc != nil {
 		billingSvc.WithNotifier(h)
 		bgWG.Add(1)

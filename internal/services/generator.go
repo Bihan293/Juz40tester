@@ -1324,6 +1324,12 @@ func (g *GeneratorService) executeJob(ctx context.Context, job *models.Generatio
 		}
 		return
 	}
+	// The outcome is recorded with a context detached from the worker's:
+	// a shutdown that lands right after a SUCCESSFUL run used to make
+	// CompleteJob fail with «context canceled» — the job stayed 'running'
+	// until the stuck-job reaper re-queued it and spent another attempt.
+	bctx, bcancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer bcancel()
 	if runErr != nil && errors.Is(runErr, deepseek.ErrBudgetExceeded) {
 		// R-9: every free provider failed and the paid fallback is capped
 		// for today. Not a real failure — park the job (attempt not
@@ -1336,21 +1342,21 @@ func (g *GeneratorService) executeJob(ctx context.Context, job *models.Generatio
 			}
 		}
 		log.Printf("generator: job %d deferred until %s — DeepSeek daily cap reached and no free provider succeeded", job.ID, until.Format(time.RFC3339))
-		if derr := g.gen.DeferJob(ctx, job.ID, until); derr != nil {
+		if derr := g.gen.DeferJob(bctx, job.ID, until); derr != nil {
 			log.Printf("generator: defer job %d: %v", job.ID, derr)
 		}
 		return
 	}
-	g.recordOutcome(ctx, run, runErr == nil, g.now().Sub(started))
+	g.recordOutcome(bctx, run, runErr == nil, g.now().Sub(started))
 	if runErr != nil {
 		log.Printf("generator: job %d failed: %v", job.ID, runErr)
-		if ferr := g.gen.FailJob(ctx, job.ID, runErr, retryDelay, maxJobAttempts); ferr != nil {
+		if ferr := g.gen.FailJob(bctx, job.ID, runErr, retryDelay, maxJobAttempts); ferr != nil {
 			log.Printf("generator: fail job %d: %v", job.ID, ferr)
 		}
 		g.jobFinished(job)
 		return
 	}
-	if err := g.gen.CompleteJob(ctx, job.ID, testID); err != nil {
+	if err := g.gen.CompleteJob(bctx, job.ID, testID); err != nil {
 		log.Printf("generator: complete job %d: %v", job.ID, err)
 	}
 	repositories.InvalidateChainCache(job.SubjectID)
@@ -1360,7 +1366,7 @@ func (g *GeneratorService) executeJob(ctx context.Context, job *models.Generatio
 	} else {
 		log.Printf("generator: job %d done -> test %d", job.ID, testID)
 	}
-	g.queueChainTranslation(ctx, job, testID)
+	g.queueChainTranslation(bctx, job, testID)
 }
 
 // queueChainTranslation queues the Kazakh translation of a freshly generated

@@ -78,3 +78,24 @@ func TestGenWatchCloseStopsPollers(t *testing.T) {
 		t.Fatal("no new pollers after Close")
 	}
 }
+
+// A finished poller must not unregister a NEWER watch of the same key
+// (registered between its result and its deferred cleanup): the new
+// subscribers would never get their result.
+func TestGenWatchTakeKeepsNewerWatch(t *testing.T) {
+	w := newGenWatchers()
+	key := chainWatchKey(1, 1)
+	old := &genWatch{subs: []genSubscriber{{1, 1}}, kick: make(chan struct{}, 1)}
+	w.m[key] = old
+	if subs := w.take(key, old); len(subs) != 1 {
+		t.Fatalf("take of the current watch = %v, want its subscriber", subs)
+	}
+	newer := &genWatch{subs: []genSubscriber{{2, 2}}, kick: make(chan struct{}, 1)}
+	w.m[key] = newer
+	if subs := w.take(key, old); subs != nil {
+		t.Fatalf("stale take returned %v, want nil", subs)
+	}
+	if !w.isSubscribed(key, 2) {
+		t.Fatal("the newer watch was removed by the old poller")
+	}
+}

@@ -129,3 +129,18 @@ func equal(a, b []int64) bool {
 	}
 	return true
 }
+
+// Cluster mode: another worker may have restored the menu, so this
+// process's «already hidden» memory must not skip the hide.
+func TestHideReplyKeyboardSharedUpdates(t *testing.T) {
+	f := &kbFake{}
+	h := New(bot.NewClient("T").WithBaseURL(f.server(t).URL), nil, nil).WithSharedUpdates(true)
+	ctx := context.Background()
+	h.hideReplyKeyboard(ctx, 7)
+	// (meanwhile another worker shows the menu for chat 7)
+	before := f.calls
+	h.hideReplyKeyboard(ctx, 7)
+	if f.calls-before != 2 {
+		t.Fatalf("hide in cluster mode = %d Telegram calls, want 2 (never skipped)", f.calls-before)
+	}
+}

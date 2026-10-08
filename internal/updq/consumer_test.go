@@ -16,6 +16,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Bihan293/Juz40tester/internal/bot"
+	"github.com/Bihan293/Juz40tester/internal/metrics"
 )
 
 func miniQueue(t *testing.T, max int) *Redis {
@@ -277,4 +278,71 @@ func TestBackoff(t *testing.T) {
 	if backoff(1) != 2*time.Second || backoff(3) != 8*time.Second || backoff(10) != time.Minute || backoff(0) != 2*time.Second {
 		t.Fatal("unexpected backoff schedule")
 	}
+}
+
+// A second claim of the same update (after a reap) held by this process
+// must stay in flight — and keep being heart-beaten — when the first,
+// stale claim finishes.
+func TestConsumerInflightPerClaim(t *testing.T) {
+	q := miniQueue(t, 0)
+	c := NewConsumer(q, ConsumerConfig{Worker: "w"}, func(context.Context, *bot.Update) error { return nil })
+	second := Item{UpdateID: 9, UserKey: 1, Attempts: 2, Token: "w:b", Payload: []byte(`{"update_id":9}`)}
+	c.mu.Lock()
+	c.inflight[keyOf(second)] = second
+	c.mu.Unlock()
+	c.process(Item{UpdateID: 9, UserKey: 1, Attempts: 1, Token: "w:a", Payload: []byte(`{"update_id":9}`)})
+	if got := c.snapshot(); len(got) != 1 || got[0].Token != "w:b" {
+		t.Fatalf("in flight after the stale claim finished = %+v, want the second claim", got)
+	}
+}
+
+// pre_checkout_query never waits in the queue: the ingress answers it in
+// the request, even when the queue is full or the user has updates
+// waiting (per-user order would hold it behind them).
+func TestIngressPreCheckoutFastPath(t *testing.T) {
+	q := miniQueue(t, 1)
+	in := NewIngress("", q)
+	var answered atomic.Int32
+	var hadDeadline atomic.Bool
+	in.PreCheckout = func(ctx context.Context, pq *bot.PreCheckoutQuery) {
+		_, ok := ctx.Deadline()
+		hadDeadline.Store(ok && ctx.Err() == nil)
+		if pq.ID == "pq1" && pq.From.ID == 7 {
+			answered.Add(1)
+		}
+	}
+	// User 7 already has an update waiting and the queue is full.
+	mustEnqueue(t, q, 1, 7)
+	rec := post(t, in, `{"update_id":2,"pre_checkout_query":{"id":"pq1","from":{"id":7},"currency":"XTR","total_amount":10,"invoice_payload":"sub:plus"}}`, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("pre-checkout: %d, want 200", rec.Code)
+	}
+	if answered.Load() != 1 || !hadDeadline.Load() {
+		t.Fatalf("answered %d time(s), deadline %v — want 1 synchronous answer with its own deadline", answered.Load(), hadDeadline.Load())
+	}
+	if st, _ := q.Stats(context.Background()); st.Pending != 1 {
+		t.Fatalf("queue %+v — the pre-checkout must not be queued", st)
+	}
+	// Without a fast path (nil) it is queued as before.
+	in.PreCheckout = nil
+	if rec := post(t, in, `{"update_id":3,"pre_checkout_query":{"id":"pq2","from":{"id":8}}}`, ""); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("queued pre-checkout with a full queue: %d, want 503", rec.Code)
+	}
+}
+
+// A successful_payment that ends in the dead letters is reported loudly
+// (metric + log), never lost silently.
+func TestConsumerDeadPaymentIsCounted(t *testing.T) {
+	q := miniQueue(t, 0)
+	before := metrics.Get(MetricPaymentDead)
+	c := NewConsumer(q, ConsumerConfig{Worker: "t", Workers: 1, MaxAttempts: 1, Poll: 10 * time.Millisecond},
+		func(context.Context, *bot.Update) error { return errors.New("db down") })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+	body := []byte(`{"update_id":11,"message":{"message_id":1,"from":{"id":3},"chat":{"id":3,"type":"private"},"successful_payment":{"currency":"XTR","total_amount":10,"invoice_payload":"sub:plus","telegram_payment_charge_id":"ch1"}}}`)
+	if _, err := q.Enqueue(context.Background(), 11, 3, body); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return metrics.Get(MetricPaymentDead) > before })
 }

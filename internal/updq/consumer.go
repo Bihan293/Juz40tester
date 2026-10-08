@@ -18,9 +18,12 @@ const (
 	MetricProcessed = "tg_updates_processed_total" // label result=ok|retry|dead|dropped|released
 	MetricReaped    = "tg_updates_reaped_total"    // label result=requeued|dead
 	MetricEnqueued  = "tg_updates_enqueued_total"  // label result=new|duplicate|full|error|ignored
-	GaugePending    = "tg_update_queue_pending"
-	GaugeProcessing = "tg_update_queue_processing"
-	GaugeDead       = "tg_update_queue_dead"
+	// MetricPaymentDead counts successful_payment updates that ended in the
+	// dead letters (a charged payment that was never applied).
+	MetricPaymentDead = "tg_payment_updates_dead_total"
+	GaugePending      = "tg_update_queue_pending"
+	GaugeProcessing   = "tg_update_queue_processing"
+	GaugeDead         = "tg_update_queue_dead"
 )
 
 // ConsumerConfig configures a Consumer.
@@ -56,7 +59,7 @@ type Consumer struct {
 	cancelBase context.CancelFunc
 
 	mu       sync.Mutex
-	inflight map[int64]Item
+	inflight map[claimKey]Item
 
 	wg       sync.WaitGroup
 	errLast  atomic.Int64
@@ -85,7 +88,7 @@ func NewConsumer(q Queue, cfg ConsumerConfig, handle HandleFunc) *Consumer {
 		q: q, cfg: cfg, handle: handle,
 		wake: make(chan struct{}, cfg.Workers),
 		base: base, cancelBase: cancel,
-		inflight: map[int64]Item{},
+		inflight: map[claimKey]Item{},
 		sleepFor: func(ctx context.Context, d time.Duration) {
 			select {
 			case <-ctx.Done():
@@ -174,14 +177,28 @@ func (c *Consumer) worker(ctx context.Context) {
 	}
 }
 
+// claimKey identifies one CLAIM of an update. The same update may be held
+// twice by this process for a moment (its lease expired, the reaper
+// returned it and another worker of this instance claimed it again while
+// the first handler was still running): keyed by update_id alone, the
+// first handler's cleanup deleted the second claim from inflight, its
+// heartbeats stopped and the update was reaped and handled once more.
+type claimKey struct {
+	id       int64
+	attempts int
+	token    string
+}
+
+func keyOf(it Item) claimKey { return claimKey{it.UpdateID, it.Attempts, it.Token} }
+
 // process handles one claimed update and records the outcome.
 func (c *Consumer) process(it Item) {
 	c.mu.Lock()
-	c.inflight[it.UpdateID] = it
+	c.inflight[keyOf(it)] = it
 	c.mu.Unlock()
 	defer func() {
 		c.mu.Lock()
-		delete(c.inflight, it.UpdateID)
+		delete(c.inflight, keyOf(it))
 		c.mu.Unlock()
 	}()
 
@@ -214,6 +231,12 @@ func (c *Consumer) process(it Item) {
 	})
 	if dead {
 		metrics.Inc(MetricProcessed, "result", "dead")
+		if m := upd.Message; m != nil && m.SuccessfulPayment != nil {
+			// The user paid and nothing was applied: never lose it silently.
+			metrics.Inc(MetricPaymentDead)
+			log.Printf("PAYMENT NOT APPLIED: update %d (tg user %d, charge %s, payload %q) moved to dead letters after %d attempt(s): %v — apply it by hand or refund it",
+				it.UpdateID, it.UserKey, m.SuccessfulPayment.TelegramPaymentChargeID, m.SuccessfulPayment.InvoicePayload, it.Attempts, herr)
+		}
 		log.Printf("update queue: update %d (user %d) moved to dead letters after %d attempt(s): %v",
 			it.UpdateID, it.UserKey, it.Attempts, herr)
 	} else {

@@ -35,3 +35,19 @@ func TestHealthCachePingsOncePerTTL(t *testing.T) {
 		t.Fatalf("after TTL: code = %d, pings = %d; want 503, 2", rec.Code, calls)
 	}
 }
+
+// A client that hangs up must not make /health cache «unhealthy» for the
+// whole TTL: the ping is detached from the request context.
+func TestHealthCacheIgnoresCancelledRequest(t *testing.T) {
+	h := newHealthCache(func(ctx context.Context) error { return ctx.Err() }, 45*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if !h.Healthy(ctx) {
+		t.Fatal("a cancelled request context made the cached result unhealthy")
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+}

@@ -33,7 +33,10 @@ func (h *healthCache) Healthy(ctx context.Context) bool {
 	if h.ttl > 0 && !h.checked.IsZero() && h.now().Sub(h.checked) < h.ttl {
 		return h.healthy
 	}
-	pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	// Detached from the request: a client that hangs up (a monitor with a
+	// short timeout) cancels r.Context(), and that ping error was cached as
+	// «unhealthy» for the whole ttl — every /health answered 503 meanwhile.
+	pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	h.healthy = h.ping(pctx) == nil
 	h.checked = h.now()

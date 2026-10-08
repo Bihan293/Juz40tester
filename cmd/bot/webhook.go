@@ -13,6 +13,7 @@ import (
 
 	"github.com/Bihan293/Juz40tester/internal/bot"
 	"github.com/Bihan293/Juz40tester/internal/metrics"
+	"github.com/Bihan293/Juz40tester/internal/updq"
 )
 
 // updateDispatcher receives Telegram webhook requests and processes the
@@ -35,6 +36,10 @@ type updateDispatcher struct {
 	secret  string
 	handle  func(ctx context.Context, upd *bot.Update)
 	timeout time.Duration
+	// preCheckout (optional) answers a pre_checkout_query synchronously in
+	// the webhook request instead of queueing it: Telegram waits at most
+	// 10 s, a full or busy queue would make the payment fail.
+	preCheckout func(ctx context.Context, q *bot.PreCheckoutQuery)
 
 	// base is the parent context of every update; cancelled only when the
 	// graceful wait times out (last resort to unblock stuck handlers).
@@ -147,6 +152,11 @@ func (d *updateDispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if upd.UpdateID != 0 && !d.seen.add(int64(upd.UpdateID)) {
 		metrics.Inc(metrics.DuplicateUpdates)
 		w.WriteHeader(http.StatusOK) // already accepted once — do not process twice
+		return
+	}
+	if upd.PreCheckoutQuery != nil && d.preCheckout != nil {
+		updq.AnswerPreCheckoutNow(r.Context(), &upd, d.preCheckout)
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 	res := d.enqueue(&upd)

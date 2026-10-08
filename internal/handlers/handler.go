@@ -38,6 +38,11 @@ type Handler struct {
 	// (chatID -> true) and nothing has shown it since — a repeated hide is
 	// then skipped without any Telegram call (R-2).
 	kbHidden sync.Map
+	// sharedUpdates: the updates of one user may be handled by DIFFERENT
+	// processes (durable update queue, ROLE=worker × N). The per-process
+	// kbHidden shortcut is then wrong — another worker may have shown the
+	// menu again meanwhile — and is not used.
+	sharedUpdates bool
 	// limiter throttles actions per Telegram user (R-9): at most one every
 	// cfg.UserActionInterval. In memory per instance (ratelimit.Limiter) or
 	// shared by the cluster (Redis, RATELIMIT_BACKEND=redis).
@@ -58,6 +63,13 @@ type Handler struct {
 // New creates a Handler.
 func New(tg *bot.Client, users *repositories.UserRepository, quiz *services.QuizService) *Handler {
 	return &Handler{tg: tg, users: users, quiz: quiz, gen: newGenWatchers()}
+}
+
+// WithSharedUpdates marks a process whose users' updates are also handled
+// by other processes (cluster mode): per-process UI shortcuts are off.
+func (h *Handler) WithSharedUpdates(on bool) *Handler {
+	h.sharedUpdates = on
+	return h
 }
 
 // ActionLimiter allows at most one action per key per interval
