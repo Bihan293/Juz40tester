@@ -440,7 +440,7 @@ func (t *TranslatorService) executeJob(ctx context.Context, job *repositories.Tr
 		if err := t.repo.FailTranslationJob(ctx, job.ID, runErr, 0, 0); err != nil {
 			log.Printf("translator: fail job %d: %v", job.ID, err)
 		}
-		t.hub.publish(job.TestID, TranslationOutcome{Err: runErr.Error()})
+		t.publishOutcome(job.TestID, TranslationOutcome{Err: runErr.Error()})
 		return
 	}
 	if runErr != nil {
@@ -450,13 +450,13 @@ func (t *TranslatorService) executeJob(ctx context.Context, job *repositories.Tr
 		if err := t.repo.FailTranslationJob(ctx, job.ID, runErr, translationRetryDelay, translationMaxAttempts); err != nil {
 			log.Printf("translator: fail job %d: %v", job.ID, err)
 		}
-		t.hub.publish(job.TestID, TranslationOutcome{Err: runErr.Error()})
+		t.publishOutcome(job.TestID, TranslationOutcome{Err: runErr.Error()})
 		return
 	}
 	if err := t.repo.CompleteTranslationJob(ctx, job.ID); err != nil {
 		log.Printf("translator: complete job %d: %v", job.ID, err)
 	}
-	t.hub.publish(job.TestID, TranslationOutcome{Ready: true})
+	t.publishOutcome(job.TestID, TranslationOutcome{Ready: true})
 }
 
 // errNotTranslatable marks a job for a test that must never be translated.
@@ -492,4 +492,26 @@ func (t *TranslatorService) runJob(ctx context.Context, job *repositories.Transl
 		}
 	}
 	return nil
+}
+
+// publishOutcome delivers a finished translation to the users waiting in
+// THIS process and, in cluster mode, to the other instances (hook).
+func (t *TranslatorService) publishOutcome(testID int64, out TranslationOutcome) {
+	t.hub.publish(testID, out)
+	if t.onOutcome != nil {
+		t.onOutcome(testID, out)
+	}
+}
+
+// WithOutcomeHook installs a callback for every finished translation job
+// (cluster mode: the outcome is broadcast to the other instances).
+func (t *TranslatorService) WithOutcomeHook(f func(testID int64, out TranslationOutcome)) *TranslatorService {
+	t.onOutcome = f
+	return t
+}
+
+// DeliverRemote hands an outcome broadcast by another instance to the
+// users waiting for that test in this process (no-op when nobody waits).
+func (t *TranslatorService) DeliverRemote(testID int64, out TranslationOutcome) {
+	t.hub.publish(testID, out)
 }

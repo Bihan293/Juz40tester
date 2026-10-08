@@ -46,9 +46,26 @@ const (
 type registry struct {
 	mu sync.Mutex
 	c  map[string]float64 // key = name{labels}
+	g  map[string]float64 // gauges (current values, not counters)
 }
 
-var std = &registry{c: map[string]float64{}}
+var std = &registry{c: map[string]float64{}, g: map[string]float64{}}
+
+// SetGauge sets a gauge (a current value such as a queue size).
+func SetGauge(name string, v float64, labels ...string) {
+	key := name + labelString(labels)
+	std.mu.Lock()
+	std.g[key] = v
+	std.mu.Unlock()
+}
+
+// Gauge returns the current value of a gauge.
+func Gauge(name string, labels ...string) float64 {
+	key := name + labelString(labels)
+	std.mu.Lock()
+	defer std.mu.Unlock()
+	return std.g[key]
+}
 
 // Inc adds 1 to the counter name with the given label pairs
 // ("k1", "v1", "k2", "v2", …).
@@ -98,6 +115,7 @@ func Snapshot() map[string]float64 {
 func Reset() {
 	std.mu.Lock()
 	std.c = map[string]float64{}
+	std.g = map[string]float64{}
 	std.mu.Unlock()
 }
 
@@ -120,6 +138,28 @@ func WritePrometheus(w io.Writer) {
 			typed[name] = true
 		}
 		fmt.Fprintf(w, "%s %g\n", k, snap[k])
+	}
+	std.mu.Lock()
+	gauges := make(map[string]float64, len(std.g))
+	for k, v := range std.g {
+		gauges[k] = v
+	}
+	std.mu.Unlock()
+	gkeys := make([]string, 0, len(gauges))
+	for k := range gauges {
+		gkeys = append(gkeys, k)
+	}
+	sort.Strings(gkeys)
+	for _, k := range gkeys {
+		name := k
+		if i := strings.IndexByte(k, '{'); i >= 0 {
+			name = k[:i]
+		}
+		if !typed[name] {
+			fmt.Fprintf(w, "# TYPE %s gauge\n", name)
+			typed[name] = true
+		}
+		fmt.Fprintf(w, "%s %g\n", k, gauges[k])
 	}
 }
 

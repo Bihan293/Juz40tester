@@ -21,6 +21,15 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -47,8 +56,9 @@ jobs:
       - name: go test -race (unit)
         run: go test -race ./...
 
-      - name: go test -race (integration, PostgreSQL)
+      - name: go test -race (integration, PostgreSQL + Redis)
         env:
           TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/juz40_test?sslmode=disable
+          REDIS_TEST_URL: redis://localhost:6379/0
         # -p 1: integration tests of all packages share one database.
         run: go test -race -count=1 -p 1 ./...

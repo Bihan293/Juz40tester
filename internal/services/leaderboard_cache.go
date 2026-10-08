@@ -2,6 +2,8 @@ package services
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"sync"
 	"time"
 
@@ -45,6 +47,45 @@ type leaderboardCache struct {
 
 	mu      sync.Mutex
 	entries map[leaderboardKey]*leaderboardEntry
+
+	// shared (optional, CACHE_BACKEND=redis) is a second level shared by
+	// every instance: with N workers the heavy aggregation runs once per
+	// TTL for the whole cluster instead of once per instance.
+	shared SharedCache
+}
+
+// SharedCache is the cross-instance cache used as a second level
+// (cluster.Cache satisfies it).
+type SharedCache interface {
+	Get(ctx context.Context, key string) ([]byte, bool, error)
+	Set(ctx context.Context, key string, val []byte, ttl time.Duration) error
+}
+
+func (k leaderboardKey) String() string {
+	return fmt.Sprintf("lb:%d:%d:%d", k.kind, k.subjectID, k.limit)
+}
+
+// loadShared wraps load with the shared second level (errors of the shared
+// cache are ignored: it is an optimisation, the database is the truth).
+func (c *leaderboardCache) loadShared(ctx context.Context, key leaderboardKey,
+	load func(context.Context) ([]models.LeaderboardEntry, error)) ([]models.LeaderboardEntry, error) {
+	if c.shared == nil {
+		return load(ctx)
+	}
+	if b, ok, err := c.shared.Get(ctx, key.String()); err == nil && ok {
+		var rows []models.LeaderboardEntry
+		if json.Unmarshal(b, &rows) == nil {
+			return rows, nil
+		}
+	}
+	rows, err := load(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if b, merr := json.Marshal(rows); merr == nil {
+		_ = c.shared.Set(ctx, key.String(), b, c.ttl)
+	}
+	return rows, nil
 }
 
 func newLeaderboardCache(ttl time.Duration) *leaderboardCache {
@@ -91,7 +132,7 @@ func (c *leaderboardCache) get(ctx context.Context, key leaderboardKey,
 
 		// The query must not be cut short by one impatient waiter only,
 		// but the leader's own deadline still applies.
-		rows, err := load(ctx)
+		rows, err := c.loadShared(ctx, key, load)
 
 		c.mu.Lock()
 		e.rows, e.err = rows, err

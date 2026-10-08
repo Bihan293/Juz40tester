@@ -85,6 +85,22 @@ func newRateLimiter(rps, burst int) *rateLimiter {
 	}
 }
 
+// setRate changes the rate (RATELIMIT_BACKEND=postgres: the cluster-wide
+// TG_MAX_RPS is split between the live instances, see cluster.Registry).
+func (l *rateLimiter) setRate(rps, burst int) {
+	if rps <= 0 {
+		rps = 1
+	}
+	if burst <= 0 {
+		burst = 1
+	}
+	iv := time.Second / time.Duration(rps)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.interval = iv
+	l.tau = time.Duration(burst-1) * iv
+}
+
 // reserve books the next slot and returns how long the caller must wait.
 func (l *rateLimiter) reserve() time.Duration {
 	l.mu.Lock()
@@ -187,9 +203,53 @@ func (c *Client) WithMaxRPS(rps int) *Client {
 	return c
 }
 
+// SharedLimiter is a rate limiter shared by all instances of the bot
+// (implemented on Redis in internal/cluster). Wait blocks until the caller
+// may send; an error that is not a ctx error means the shared store is
+// unavailable — the client then falls back to its local limiter.
+type SharedLimiter interface {
+	Wait(ctx context.Context) error
+	Pause(d time.Duration)
+}
+
+// WithSharedLimiter installs a cluster-wide limiter (nil = local only).
+func (c *Client) WithSharedLimiter(l SharedLimiter) *Client {
+	c.shared = l
+	return c
+}
+
+// SetMaxRPS changes the rate of the local limiter at runtime (the
+// Postgres-based share of the cluster-wide TG_MAX_RPS).
+func (c *Client) SetMaxRPS(rps int) {
+	if c.limiter == nil {
+		c.limiter = newRateLimiter(max(rps, 1), min(defaultBurst, max(rps, 1)))
+		return
+	}
+	c.limiter.setRate(rps, min(defaultBurst, max(rps, 1)))
+}
+
+// sharedFallbackLogEvery bounds the «shared limiter unavailable» log line.
+var sharedFallbackLast atomic.Int64
+
 // waitLimit waits for the global limiter when method is a limited one.
 func (c *Client) waitLimit(ctx context.Context, method string) error {
-	if c.limiter == nil || !limitedMethods[method] {
+	if !limitedMethods[method] {
+		return nil
+	}
+	if c.shared != nil {
+		err := c.shared.Wait(ctx)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return c.safeErr(method, ctx.Err())
+		}
+		if now := time.Now().Unix(); now-sharedFallbackLast.Load() >= 60 {
+			sharedFallbackLast.Store(now)
+			log.Printf("WARNING: shared telegram rate limiter unavailable (%v) — falling back to the local limiter", err)
+		}
+	}
+	if c.limiter == nil {
 		return nil
 	}
 	if err := c.limiter.Wait(ctx); err != nil {

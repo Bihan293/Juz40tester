@@ -98,6 +98,8 @@ type TranslatorService struct {
 	wake chan struct{}
 	// hub fans the outcome of a translation out to every waiting user.
 	hub *translationHub
+	// onOutcome (optional) is told about every finished job (cluster events).
+	onOutcome func(testID int64, out TranslationOutcome)
 }
 
 func NewTranslatorService(ds *deepseek.Client, repo *repositories.TranslationRepository) *TranslatorService {

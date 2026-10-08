@@ -161,6 +161,64 @@ type Config struct {
 	// «Authorization: Bearer <token>» (or ?token=).
 	MetricsToken string
 
+	// --- Cluster mode -----------------------------------------------------
+
+	// Role (ROLE, default "all"): which part of the bot this process runs.
+	//   web    — accepts the Telegram webhook, validates it, puts the update
+	//            into the durable queue and answers 200 at once; serves
+	//            /health, /ping, /metrics. No update handling, no workers.
+	//   worker — no webhook endpoint: takes updates from the queue and
+	//            handles them, runs generation / translation workers,
+	//            reapers, quality sweep, cleanup (/health, /ping, /metrics
+	//            are served too, for the platform's health check).
+	//   all    — everything in one process (the historical behaviour).
+	Role string
+	// QueueBackend (QUEUE_BACKEND): where accepted updates wait for a
+	// worker. "memory" (in-process bounded channel — only possible with
+	// ROLE=all, the default there), "postgres" (durable table, the default
+	// for ROLE=web/worker) or "redis" (needs REDIS_URL).
+	QueueBackend string
+	// RateLimitBackend (RATELIMIT_BACKEND): how TG_MAX_RPS and the per-user
+	// action throttle hold across instances. "memory" (per process; the
+	// default with ROLE=all), "postgres" (TG_MAX_RPS is split evenly
+	// between the live instances registered in cluster_instances; the
+	// default with ROLE=web/worker; the per-user throttle stays per process)
+	// or "redis" (one shared token bucket + shared throttle; needs REDIS_URL).
+	RateLimitBackend string
+	// CacheBackend (CACHE_BACKEND, default "memory"): shared cache for
+	// cross-instance data (leaderboard). "redis" needs REDIS_URL.
+	CacheBackend string
+	// RedisURL (REDIS_URL, optional): redis://[:password@]host:port/db.
+	// Empty = Redis is never used; everything runs on PostgreSQL / memory.
+	// Even when it is set, Redis is used ONLY by the backends switched to
+	// "redis" explicitly.
+	RedisURL string
+	// RedisPrefix (REDIS_PREFIX, default "juz40"): key prefix (a hash tag,
+	// so the multi-key scripts also work on Redis Cluster).
+	RedisPrefix string
+	// InstanceID (INSTANCE_ID, default hostname-pid): name of this process
+	// in cluster_instances, queue locks and logs.
+	InstanceID string
+	// UpdateWorkers (UPDATE_WORKERS, default derived from DB_MAX_CONNS):
+	// updates handled at once by this process.
+	UpdateWorkers int
+	// UpdateQueueMax (UPDATE_QUEUE_MAX, default 20000, 0 = no limit):
+	// backpressure of the durable queue — when this many updates wait, the
+	// webhook answers 503 and Telegram re-delivers later.
+	UpdateQueueMax int
+	// UpdateMaxAttempts (UPDATE_MAX_ATTEMPTS, default 3): a crashing update
+	// is retried with backoff and then moved to the dead letters.
+	UpdateMaxAttempts int
+	// UpdateLease (UPDATE_LEASE_SEC, default 45): a claimed update whose
+	// worker stopped heart-beating for this long is returned to the queue.
+	UpdateLease time.Duration
+	// UpdateDoneTTL (UPDATE_DONE_TTL_HOURS, default 48): handled updates are
+	// kept this long (idempotency window: Telegram re-delivers for ≤ 24 h).
+	UpdateDoneTTL time.Duration
+	// UpdateDeadTTL (UPDATE_DEAD_TTL_DAYS, default 14): dead letters are
+	// kept this long for inspection.
+	UpdateDeadTTL time.Duration
+
 	OffPeakStartHour int  // custom window start (inclusive); -1 = official schedule
 	OffPeakEndHour   int  // custom window end (exclusive)
 	OffPeakCustom    bool // true when a custom window is configured
@@ -210,6 +268,17 @@ func Load() (*Config, error) {
 		GenMaxActivePersonal:   DefaultGenMaxActivePersonal,
 		GenTemplateReuse:       true,
 		MetricsToken:           strings.TrimSpace(os.Getenv("METRICS_TOKEN")),
+		RedisURL:               strings.TrimSpace(os.Getenv("REDIS_URL")),
+		RedisPrefix:            DefaultRedisPrefix,
+		InstanceID:             strings.TrimSpace(os.Getenv("INSTANCE_ID")),
+		UpdateQueueMax:         DefaultUpdateQueueMax,
+		UpdateMaxAttempts:      DefaultUpdateMaxAttempts,
+		UpdateLease:            DefaultUpdateLease,
+		UpdateDoneTTL:          DefaultUpdateDoneTTL,
+		UpdateDeadTTL:          DefaultUpdateDeadTTL,
+	}
+	if err := cfg.loadCluster(); err != nil {
+		return nil, err
 	}
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV"))) {
 	case "development", "dev", "local", "test":
@@ -340,12 +409,14 @@ func Load() (*Config, error) {
 	if cfg.DatabaseURL == "" {
 		missing = append(missing, "DATABASE_URL")
 	}
-	if cfg.WebhookURL == "" {
+	// A worker never receives the webhook: it needs neither the public URL
+	// nor the secret.
+	if cfg.WebhookURL == "" && cfg.ServesWebhook() {
 		missing = append(missing, "WEBHOOK_URL")
 	}
 	// A production webhook without a secret accepts forged updates from
 	// anyone who knows the URL — refuse to start instead of only warning.
-	if cfg.Production && cfg.WebhookSecret == "" {
+	if cfg.Production && cfg.WebhookSecret == "" && cfg.ServesWebhook() {
 		missing = append(missing, "WEBHOOK_SECRET (required in production; set APP_ENV=development to run without it)")
 	}
 	if len(missing) > 0 {
@@ -519,3 +590,123 @@ func (c *Config) NextOffPeakStart(now time.Time) time.Time {
 	}
 	return now // unreachable in practice — never block generation forever
 }
+
+// Process roles (ROLE).
+const (
+	RoleAll    = "all"
+	RoleWeb    = "web"
+	RoleWorker = "worker"
+)
+
+// Backends (QUEUE_BACKEND, RATELIMIT_BACKEND, CACHE_BACKEND).
+const (
+	BackendMemory   = "memory"
+	BackendPostgres = "postgres"
+	BackendRedis    = "redis"
+)
+
+// Cluster defaults.
+const (
+	DefaultRedisPrefix       = "juz40"
+	DefaultUpdateQueueMax    = 20000
+	DefaultUpdateMaxAttempts = 3
+	DefaultUpdateLease       = 45 * time.Second
+	DefaultUpdateDoneTTL     = 48 * time.Hour
+	DefaultUpdateDeadTTL     = 14 * 24 * time.Hour
+)
+
+// loadCluster reads and validates the cluster settings (ROLE, backends,
+// Redis, durable update queue).
+func (c *Config) loadCluster() error {
+	c.Role = strings.ToLower(strings.TrimSpace(os.Getenv("ROLE")))
+	switch c.Role {
+	case "":
+		c.Role = RoleAll
+	case RoleAll, RoleWeb, RoleWorker:
+	default:
+		return fmt.Errorf("ROLE must be all, web or worker (got %q)", c.Role)
+	}
+	split := c.Role != RoleAll
+
+	pick := func(env string, allowed []string, def string) (string, error) {
+		v := strings.ToLower(strings.TrimSpace(os.Getenv(env)))
+		if v == "" {
+			return def, nil
+		}
+		for _, a := range allowed {
+			if v == a {
+				return v, nil
+			}
+		}
+		return "", fmt.Errorf("%s must be one of %v (got %q)", env, allowed, v)
+	}
+	var err error
+	defQueue, defLimit := BackendMemory, BackendMemory
+	if split {
+		defQueue, defLimit = BackendPostgres, BackendPostgres
+	}
+	if c.QueueBackend, err = pick("QUEUE_BACKEND", []string{BackendMemory, BackendPostgres, BackendRedis}, defQueue); err != nil {
+		return err
+	}
+	if c.RateLimitBackend, err = pick("RATELIMIT_BACKEND", []string{BackendMemory, BackendPostgres, BackendRedis}, defLimit); err != nil {
+		return err
+	}
+	if c.CacheBackend, err = pick("CACHE_BACKEND", []string{BackendMemory, BackendRedis}, BackendMemory); err != nil {
+		return err
+	}
+	if split && c.QueueBackend == BackendMemory {
+		return fmt.Errorf("ROLE=%s needs a shared update queue: QUEUE_BACKEND=postgres or redis (memory works only with ROLE=all)", c.Role)
+	}
+	if c.RedisURL == "" {
+		for env, v := range map[string]string{"QUEUE_BACKEND": c.QueueBackend, "RATELIMIT_BACKEND": c.RateLimitBackend, "CACHE_BACKEND": c.CacheBackend} {
+			if v == BackendRedis {
+				return fmt.Errorf("%s=redis needs REDIS_URL", env)
+			}
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("REDIS_PREFIX")); v != "" {
+		c.RedisPrefix = v
+	}
+	if c.InstanceID == "" {
+		host, _ := os.Hostname()
+		if host == "" {
+			host = "juz40"
+		}
+		c.InstanceID = fmt.Sprintf("%s-%d", host, os.Getpid())
+	}
+	if n, ok := envIntOpt("UPDATE_WORKERS"); ok && n > 0 {
+		c.UpdateWorkers = n
+	}
+	if n, ok := envIntOpt("UPDATE_QUEUE_MAX"); ok && n >= 0 {
+		c.UpdateQueueMax = n
+	}
+	if n, ok := envIntOpt("UPDATE_MAX_ATTEMPTS"); ok && n > 0 {
+		c.UpdateMaxAttempts = min(n, 20)
+	}
+	if n, ok := envIntOpt("UPDATE_LEASE_SEC"); ok && n >= 10 {
+		c.UpdateLease = time.Duration(n) * time.Second
+	}
+	if n, ok := envIntOpt("UPDATE_DONE_TTL_HOURS"); ok && n >= 25 {
+		c.UpdateDoneTTL = time.Duration(n) * time.Hour
+	}
+	if n, ok := envIntOpt("UPDATE_DEAD_TTL_DAYS"); ok && n > 0 {
+		c.UpdateDeadTTL = time.Duration(n) * 24 * time.Hour
+	}
+	return nil
+}
+
+// ServesWebhook reports whether this process accepts the Telegram webhook.
+func (c *Config) ServesWebhook() bool { return c.Role != RoleWorker }
+
+// HandlesUpdates reports whether this process handles updates and runs the
+// background workers (generation, translation, reapers, cleanup).
+func (c *Config) HandlesUpdates() bool { return c.Role != RoleWeb }
+
+// DurableQueue reports whether updates go through the shared queue
+// (postgres / redis) instead of the in-process channel.
+func (c *Config) DurableQueue() bool { return c.QueueBackend != BackendMemory }
+
+// Clustered reports whether more than one process may share the work
+// (split roles or a shared queue): cross-instance events are then
+// broadcast (generation / translation finished).
+func (c *Config) Clustered() bool { return c.Role != RoleAll || c.DurableQueue() }

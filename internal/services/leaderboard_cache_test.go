@@ -113,3 +113,51 @@ func TestLeaderboardCacheSingleFlight(t *testing.T) {
 		t.Fatalf("calls=%d, want 1", calls)
 	}
 }
+
+// mapCache is an in-memory SharedCache (stands for Redis in unit tests).
+type mapCache struct {
+	mu sync.Mutex
+	m  map[string][]byte
+}
+
+func (c *mapCache) Get(_ context.Context, k string) ([]byte, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	v, ok := c.m[k]
+	return v, ok, nil
+}
+
+func (c *mapCache) Set(_ context.Context, k string, v []byte, _ time.Duration) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.m[k] = v
+	return nil
+}
+
+// Cluster mode: two instances share the second-level cache, so the heavy
+// leaderboard query runs once for both.
+func TestLeaderboardSharedCacheAcrossInstances(t *testing.T) {
+	shared := &mapCache{m: map[string][]byte{}}
+	a, _ := newTestBoardCache(time.Minute)
+	b, _ := newTestBoardCache(time.Minute)
+	a.shared, b.shared = shared, shared
+	var calls int32
+	load := func(context.Context) ([]models.LeaderboardEntry, error) {
+		atomic.AddInt32(&calls, 1)
+		return []models.LeaderboardEntry{{UserID: 1, FirstName: "Аня", Green: 5}}, nil
+	}
+	key := leaderboardKey{boardGreen, 3, 10}
+	if _, err := a.get(context.Background(), key, load); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := b.get(context.Background(), key, load)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("query ran %d times, want 1", calls)
+	}
+	if len(rows) != 1 || rows[0].FirstName != "Аня" || rows[0].Green != 5 {
+		t.Fatalf("rows from the shared cache: %+v", rows)
+	}
+}
