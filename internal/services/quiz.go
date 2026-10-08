@@ -71,6 +71,15 @@ func (s *QuizService) ListSubjects(ctx context.Context) ([]models.Subject, error
 	return s.subjects.List(ctx)
 }
 
+// WithSharedCache installs the cross-instance second-level cache of the
+// leaderboards (CACHE_BACKEND=redis). nil = per-process cache only.
+func (s *QuizService) WithSharedCache(c SharedCache) *QuizService {
+	if s.boards != nil && c != nil {
+		s.boards.shared = c
+	}
+	return s
+}
+
 // GetSubject returns a subject by id (leaderboard screen header).
 func (s *QuizService) GetSubject(ctx context.Context, subjectID int64) (*models.Subject, error) {
 	return s.subjects.GetByID(ctx, subjectID)

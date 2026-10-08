@@ -31,6 +31,12 @@ var listenKeepalive = 60 * time.Second
 // notification may have been missed while disconnected). Returns when ctx
 // is cancelled.
 func Listen(ctx context.Context, databaseURL string, channels []string, onNotify func(channel string)) {
+	ListenPayload(ctx, databaseURL, channels, func(ch, _ string) { onNotify(ch) })
+}
+
+// ListenPayload is Listen with the NOTIFY payload. The catch-up call after
+// every (re)connect has an empty payload.
+func ListenPayload(ctx context.Context, databaseURL string, channels []string, onNotify func(channel, payload string)) {
 	retry := listenRetryMin
 	for ctx.Err() == nil {
 		err := listenOnce(ctx, databaseURL, channels, onNotify, func() { retry = listenRetryMin })
@@ -49,7 +55,7 @@ func Listen(ctx context.Context, databaseURL string, channels []string, onNotify
 	}
 }
 
-func listenOnce(ctx context.Context, databaseURL string, channels []string, onNotify func(string), connected func()) error {
+func listenOnce(ctx context.Context, databaseURL string, channels []string, onNotify func(string, string), connected func()) error {
 	conn, err := pgx.Connect(ctx, databaseURL)
 	if err != nil {
 		return err
@@ -68,7 +74,7 @@ func listenOnce(ctx context.Context, databaseURL string, channels []string, onNo
 	log.Printf("db listener: listening on %v", channels)
 	// Catch up on anything enqueued while we were not listening.
 	for _, ch := range channels {
-		onNotify(ch)
+		onNotify(ch, "")
 	}
 	for {
 		wctx, cancel := context.WithTimeout(ctx, listenKeepalive)
@@ -90,6 +96,6 @@ func listenOnce(ctx context.Context, databaseURL string, channels []string, onNo
 			}
 			return err
 		}
-		onNotify(n.Channel)
+		onNotify(n.Channel, n.Payload)
 	}
 }

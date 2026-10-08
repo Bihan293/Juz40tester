@@ -28,6 +28,11 @@ type Client struct {
 	// limiter is the global token bucket of message-changing calls (A8,
 	// TG_MAX_RPS). answerCallbackQuery and service calls bypass it.
 	limiter *rateLimiter
+	// shared (optional) is a limiter shared by every instance of the bot
+	// (Redis, RATELIMIT_BACKEND=redis): TG_MAX_RPS then holds for the whole
+	// cluster, not per process. When it fails (Redis unreachable) the call
+	// falls back to the local limiter, so sending never stalls.
+	shared SharedLimiter
 }
 
 // NewClient creates a client for the given bot token.
@@ -55,6 +60,23 @@ type Update struct {
 	UpdateID      int64          `json:"update_id"`
 	Message       *Message       `json:"message,omitempty"`
 	CallbackQuery *CallbackQuery `json:"callback_query,omitempty"`
+}
+
+// UserKey returns the key that serialises the processing of updates of
+// one user (cluster mode: two updates of the same user are never handled
+// in parallel, and they are handled in update_id order). It is the sender
+// id; 0 means the update carries nothing the bot handles (HandleUpdate
+// ignores it), so it can be acknowledged without queueing.
+func (u *Update) UserKey() int64 {
+	switch {
+	case u == nil:
+		return 0
+	case u.Message != nil && u.Message.From != nil:
+		return u.Message.From.ID
+	case u.CallbackQuery != nil && u.CallbackQuery.From != nil:
+		return u.CallbackQuery.From.ID
+	}
+	return 0
 }
 
 // TgUser is a Telegram user.
@@ -378,6 +400,9 @@ func (c *Client) callOnce(ctx context.Context, method string, body []byte, out a
 			}
 			if c.limiter != nil {
 				c.limiter.pause(min(wait, maxGlobalPause))
+			}
+			if c.shared != nil {
+				c.shared.Pause(min(wait, maxGlobalPause))
 			}
 			return wait, fmt.Errorf("telegram %s: %s", method, ar.Description)
 		}

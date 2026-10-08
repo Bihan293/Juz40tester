@@ -1,0 +1,280 @@
+package updq
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
+
+	"github.com/Bihan293/Juz40tester/internal/bot"
+)
+
+func miniQueue(t *testing.T, max int) *Redis {
+	t.Helper()
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	return NewRedis(rdb, RedisOptions{Prefix: "c", MaxBacklog: max, Lease: 3 * time.Second})
+}
+
+func waitFor(t *testing.T, d time.Duration, cond func() bool) {
+	t.Helper()
+	end := time.Now().Add(d)
+	for time.Now().Before(end) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("condition not reached in time")
+}
+
+// TestConsumerOrderAndParallelism: 8 workers handle 3 users × 10 updates;
+// users run in parallel, one user's updates never overlap and keep order.
+func TestConsumerOrderAndParallelism(t *testing.T) {
+	q := miniQueue(t, 0)
+	var mu sync.Mutex
+	busy := map[int64]bool{}
+	order := map[int64][]int64{}
+	var overlap, parallel atomic.Int32
+	var running atomic.Int32
+	handle := func(ctx context.Context, upd *bot.Update) error {
+		uk := upd.UserKey()
+		mu.Lock()
+		if busy[uk] {
+			overlap.Add(1)
+		}
+		busy[uk] = true
+		order[uk] = append(order[uk], upd.UpdateID)
+		mu.Unlock()
+		if running.Add(1) > 1 {
+			parallel.Add(1)
+		}
+		time.Sleep(3 * time.Millisecond)
+		running.Add(-1)
+		mu.Lock()
+		busy[uk] = false
+		mu.Unlock()
+		return nil
+	}
+	c := NewConsumer(q, ConsumerConfig{Worker: "t", Workers: 8, Poll: 20 * time.Millisecond}, handle)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { c.Run(ctx); close(done) }()
+	id := int64(0)
+	for i := 0; i < 10; i++ {
+		for u := int64(1); u <= 3; u++ {
+			id++
+			body := `{"update_id":` + itoa(id) + `,"message":{"message_id":1,"from":{"id":` + itoa(u) + `},"chat":{"id":` + itoa(u) + `,"type":"private"},"text":"x"}}`
+			if _, err := q.Enqueue(context.Background(), id, u, []byte(body)); err != nil {
+				t.Fatal(err)
+			}
+			c.Wake()
+		}
+	}
+	waitFor(t, 10*time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		n := 0
+		for _, o := range order {
+			n += len(o)
+		}
+		return n == 30
+	})
+	cancel()
+	<-done
+	if overlap.Load() != 0 {
+		t.Fatalf("%d overlapping updates of one user", overlap.Load())
+	}
+	if parallel.Load() == 0 {
+		t.Fatal("different users were never handled in parallel")
+	}
+	for u, o := range order {
+		for i := 1; i < len(o); i++ {
+			if o[i] < o[i-1] {
+				t.Fatalf("user %d out of order: %v", u, o)
+			}
+		}
+	}
+}
+
+func itoa(n int64) string { return strconv.FormatInt(n, 10) }
+
+// TestConsumerRetryAndDeadLetter: a failing update is retried and then
+// dead-lettered; the next update of the same user still runs.
+func TestConsumerRetryAndDeadLetter(t *testing.T) {
+	q := miniQueue(t, 0)
+	var calls atomic.Int32
+	var okSeen atomic.Bool
+	handle := func(ctx context.Context, upd *bot.Update) error {
+		if upd.UpdateID == 1 {
+			calls.Add(1)
+			return errors.New("boom")
+		}
+		okSeen.Store(true)
+		return nil
+	}
+	c := NewConsumer(q, ConsumerConfig{Worker: "t", Workers: 2, MaxAttempts: 2, Poll: 10 * time.Millisecond}, handle)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+	mustEnqueue(t, q, 1, 5)
+	mustEnqueue(t, q, 2, 5)
+	// attempt 1 fails → backoff 2 s → attempt 2 fails → dead → update 2 runs.
+	waitFor(t, 10*time.Second, func() bool { return okSeen.Load() })
+	if calls.Load() != 2 {
+		t.Fatalf("failing update ran %d times, want 2", calls.Load())
+	}
+	st, _ := q.Stats(context.Background())
+	if st.Dead != 1 {
+		t.Fatalf("stats %+v", st)
+	}
+}
+
+// TestConsumerPanicIsRetried: a panicking handler does not kill the worker.
+func TestConsumerPanicIsRetried(t *testing.T) {
+	q := miniQueue(t, 0)
+	var n atomic.Int32
+	handle := func(ctx context.Context, upd *bot.Update) error {
+		if n.Add(1) == 1 {
+			panic("first try explodes")
+		}
+		return nil
+	}
+	c := NewConsumer(q, ConsumerConfig{Worker: "t", Workers: 1, MaxAttempts: 3, Poll: 10 * time.Millisecond}, handle)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+	mustEnqueue(t, q, 9, 9)
+	waitFor(t, 10*time.Second, func() bool {
+		st, _ := q.Stats(context.Background())
+		return n.Load() >= 2 && st.Pending == 0 && st.Processing == 0
+	})
+}
+
+// TestConsumerShutdownReleases: an update still running when the grace
+// period ends is released (attempt not counted) for another worker.
+func TestConsumerShutdownReleases(t *testing.T) {
+	q := miniQueue(t, 0)
+	started := make(chan struct{})
+	handle := func(ctx context.Context, upd *bot.Update) error {
+		close(started)
+		<-ctx.Done() // a long handler that only ends when cancelled
+		return nil
+	}
+	c := NewConsumer(q, ConsumerConfig{Worker: "t", Workers: 1, Poll: 10 * time.Millisecond}, handle)
+	ctx, cancel := context.WithCancel(context.Background())
+	go c.Run(ctx)
+	mustEnqueue(t, q, 3, 3)
+	c.Wake()
+	<-started
+	cancel()
+	sctx, scancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer scancel()
+	if err := c.Shutdown(sctx); err == nil {
+		t.Fatal("expected the grace period to run out")
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		st, _ := q.Stats(context.Background())
+		return st.Processing == 0 && st.Pending == 1
+	})
+	items := claimAll(t, q, "other")
+	if len(items) != 1 || items[0].Attempts != 1 {
+		t.Fatalf("released update claimed as %+v (attempt must not count)", items)
+	}
+}
+
+// TestConsumerHeartbeatKeepsLease: a handler longer than the lease is not
+// reaped while its worker heart-beats.
+func TestConsumerHeartbeatKeepsLease(t *testing.T) {
+	q := miniQueue(t, 0) // lease 3 s
+	var runs atomic.Int32
+	handle := func(ctx context.Context, upd *bot.Update) error {
+		runs.Add(1)
+		time.Sleep(4500 * time.Millisecond)
+		return nil
+	}
+	c := NewConsumer(q, ConsumerConfig{Worker: "t", Workers: 2, Lease: 3 * time.Second, Poll: 10 * time.Millisecond}, handle)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+	mustEnqueue(t, q, 4, 4)
+	waitFor(t, 10*time.Second, func() bool {
+		st, _ := q.Stats(context.Background())
+		return runs.Load() >= 1 && st.Pending == 0 && st.Processing == 0
+	})
+	if runs.Load() != 1 {
+		t.Fatalf("update ran %d times — the lease was lost despite heartbeats", runs.Load())
+	}
+}
+
+// --- Ingress -----------------------------------------------------------------
+
+func post(t *testing.T, h http.Handler, body, secret string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/telegram/webhook", strings.NewReader(body))
+	if secret != "" {
+		req.Header.Set("X-Telegram-Bot-Api-Secret-Token", secret)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestIngress(t *testing.T) {
+	q := miniQueue(t, 2)
+	in := NewIngress("s3cret", q)
+	var woke atomic.Int32
+	in.OnEnqueued = func() { woke.Add(1) }
+	msg := func(id int64, user int64) string {
+		return `{"update_id":` + itoa(id) + `,"message":{"message_id":1,"from":{"id":` + itoa(user) + `},"chat":{"id":1,"type":"private"},"text":"hi"}}`
+	}
+	if rec := post(t, in, msg(1, 1), "wrong"); rec.Code != http.StatusForbidden {
+		t.Fatalf("wrong secret: %d", rec.Code)
+	}
+	if rec := post(t, in, `{not json`, "s3cret"); rec.Code != http.StatusOK {
+		t.Fatalf("malformed: %d (must be 200, never retried)", rec.Code)
+	}
+	if rec := post(t, in, `{"update_id":5,"edited_message":{}}`, "s3cret"); rec.Code != http.StatusOK {
+		t.Fatalf("ignored update: %d", rec.Code)
+	}
+	if rec := post(t, in, msg(1, 1), "s3cret"); rec.Code != http.StatusOK {
+		t.Fatalf("new: %d", rec.Code)
+	}
+	if rec := post(t, in, msg(1, 1), "s3cret"); rec.Code != http.StatusOK {
+		t.Fatalf("duplicate: %d", rec.Code)
+	}
+	if woke.Load() != 1 {
+		t.Fatalf("OnEnqueued called %d times, want 1 (not for the duplicate)", woke.Load())
+	}
+	if rec := post(t, in, msg(2, 2), "s3cret"); rec.Code != http.StatusOK {
+		t.Fatalf("second: %d", rec.Code)
+	}
+	rec := post(t, in, msg(3, 3), "s3cret")
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("full queue: %d (want 503 + Retry-After)", rec.Code)
+	}
+	st, _ := q.Stats(context.Background())
+	if st.Pending != 2 {
+		t.Fatalf("queued %d, want 2", st.Pending)
+	}
+	in.Close()
+	if rec := post(t, in, msg(4, 4), "s3cret"); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("closing: %d", rec.Code)
+	}
+}
+
+func TestBackoff(t *testing.T) {
+	if backoff(1) != 2*time.Second || backoff(3) != 8*time.Second || backoff(10) != time.Minute || backoff(0) != 2*time.Second {
+		t.Fatal("unexpected backoff schedule")
+	}
+}

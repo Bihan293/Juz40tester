@@ -3,11 +3,11 @@ package handlers
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/Bihan293/Juz40tester/internal/bot"
 	"github.com/Bihan293/Juz40tester/internal/models"
-	"github.com/Bihan293/Juz40tester/internal/ratelimit"
 	"github.com/Bihan293/Juz40tester/internal/repositories"
 	"github.com/Bihan293/Juz40tester/internal/services"
 )
@@ -38,8 +38,9 @@ type Handler struct {
 	// then skipped without any Telegram call (R-2).
 	kbHidden sync.Map
 	// limiter throttles actions per Telegram user (R-9): at most one every
-	// cfg.UserActionInterval. In memory, per instance (see ratelimit).
-	limiter *ratelimit.Limiter
+	// cfg.UserActionInterval. In memory per instance (ratelimit.Limiter) or
+	// shared by the cluster (Redis, RATELIMIT_BACKEND=redis).
+	limiter ActionLimiter
 	// gen is the registry of shared generation watchers (R-7).
 	gen *genWatchers
 }
@@ -49,8 +50,14 @@ func New(tg *bot.Client, users *repositories.UserRepository, quiz *services.Quiz
 	return &Handler{tg: tg, users: users, quiz: quiz, gen: newGenWatchers()}
 }
 
+// ActionLimiter allows at most one action per key per interval
+// (ratelimit.Limiter in memory, cluster.RedisActionLimiter shared).
+type ActionLimiter interface {
+	Allow(key int64) bool
+}
+
 // WithActionLimiter installs the per-user tap throttle (R-9). nil = off.
-func (h *Handler) WithActionLimiter(l *ratelimit.Limiter) *Handler {
+func (h *Handler) WithActionLimiter(l ActionLimiter) *Handler {
 	h.limiter = l
 	return h
 }
@@ -64,9 +71,18 @@ func (h *Handler) throttled(tgUserID int64) bool {
 
 // HandleUpdate processes a single webhook update. It never panics; errors are logged.
 func (h *Handler) HandleUpdate(ctx context.Context, upd *bot.Update) {
+	_ = h.ProcessUpdate(ctx, upd)
+}
+
+// ProcessUpdate is HandleUpdate for the durable update queue (cluster
+// mode): it returns an error when the processing crashed (panic), so the
+// queue retries the update and dead-letters it after the last attempt.
+// Business errors are still answered to the user and logged, not returned.
+func (h *Handler) ProcessUpdate(ctx context.Context, upd *bot.Update) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			logf("panic in update %d: %v", upd.UpdateID, r)
+			err = fmt.Errorf("update %d panicked: %v", upd.UpdateID, r)
 		}
 	}()
 	switch {
@@ -75,6 +91,7 @@ func (h *Handler) HandleUpdate(ctx context.Context, upd *bot.Update) {
 	case upd.CallbackQuery != nil && upd.CallbackQuery.From != nil:
 		h.handleCallback(ctx, upd.CallbackQuery)
 	}
+	return nil
 }
 
 // ensureUser registers or refreshes the Telegram user.
