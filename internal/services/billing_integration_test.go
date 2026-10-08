@@ -380,3 +380,98 @@ func TestBillingWeakTestTimeoutAndNoTopics(t *testing.T) {
 		t.Fatal("foreign order must be refused")
 	}
 }
+
+// TestBillingDuplicateSubscriptionRefunded: the same plan paid twice (two
+// invoices confirmed before the first payment was applied) — the second
+// payment is refunded and ITS subscription cancelled; the first keeps its
+// expiry and auto-renewal.
+func TestBillingDuplicateSubscriptionRefunded(t *testing.T) {
+	e := newBillEnv(t)
+	exp := time.Now().Add(billing.SubscriptionPeriod).Truncate(time.Second)
+	c1, c2 := fmt.Sprintf("dup%d-1", e.tgID), fmt.Sprintf("dup%d-2", e.tgID)
+	pay := func(charge string, exp time.Time) *PaymentOutcome {
+		t.Helper()
+		out, err := e.svc.OnSuccessfulPayment(e.ctx, e.user.ID, e.tgID, PaymentInfo{Currency: "XTR", Amount: 10,
+			Payload: billing.SubscriptionPayload("plus"), ChargeID: charge, SubExpiresAt: exp, IsRecurring: true, IsFirstRecurring: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	if out := pay(c1, exp); out.Decision != billing.DecisionNew {
+		t.Fatalf("first: %+v", out)
+	}
+	out := pay(c2, exp.Add(time.Minute))
+	if out.Kind != OutcomeRejected || out.Decision != billing.DecisionDuplicate {
+		t.Fatalf("second payment of the same plan: %+v", out)
+	}
+	if len(e.stars.cancels) != 1 || e.stars.cancels[0] != c2 {
+		t.Fatalf("the duplicate subscription must be cancelled (and only it): %v", e.stars.cancels)
+	}
+	u, _ := e.svc.Usage(e.ctx, e.user.ID)
+	if u.Plan.Code != "plus" || !u.ExpiresAt.Equal(exp) || u.Stored.SubChargeID != c1 {
+		t.Fatalf("the first subscription must stay as it was: %+v %+v", u, u.Stored)
+	}
+	e.dueNow()
+	e.svc.ReconcileOnce(e.ctx)
+	// The shared test database may hold refunds of other tests: look for ours.
+	if !containsStr(e.stars.refunds, c2) || containsStr(e.stars.refunds, c1) {
+		t.Fatalf("the duplicate payment (only it) must be refunded: %v", e.stars.refunds)
+	}
+	if u, _ := e.svc.Usage(e.ctx, e.user.ID); u.Plan.Code != "plus" {
+		t.Fatalf("refunding the duplicate must not end the plan: %+v", u.Plan)
+	}
+}
+
+// TestBillingAdminRefundEndsPlan: an admin /refund of the payment the
+// current plan was bought with gives the Stars back AND ends the plan (the
+// same as a refund Telegram reports itself).
+func TestBillingAdminRefundEndsPlan(t *testing.T) {
+	e := newBillEnv(t)
+	charge := fmt.Sprintf("ar%d", e.tgID)
+	if _, err := e.svc.OnSuccessfulPayment(e.ctx, e.user.ID, e.tgID, PaymentInfo{Currency: "XTR", Amount: 40,
+		Payload: billing.SubscriptionPayload("pro"), ChargeID: charge, SubExpiresAt: time.Now().Add(billing.SubscriptionPeriod)}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := e.svc.AdminRefund(e.ctx, charge); err != nil || !ok {
+		t.Fatalf("admin refund: %v %v", ok, err)
+	}
+	e.dueNow()
+	e.svc.ReconcileOnce(e.ctx)
+	if !containsStr(e.stars.refunds, charge) {
+		t.Fatalf("refund call: %v", e.stars.refunds)
+	}
+	if u, _ := e.svc.Usage(e.ctx, e.user.ID); u.Plan.Code != billing.PlanFree {
+		t.Fatalf("a refunded plan must end: %+v", u.Plan)
+	}
+	// refunded_payment arriving afterwards changes nothing and is no error.
+	if err := e.svc.OnRefundedPayment(e.ctx, charge); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestBillingWeakPreCheckoutRefusedWhileOrderInFlight: a second invoice of
+// the subject is not payable while a paid order is still being built.
+func TestBillingWeakPreCheckoutRefusedWhileOrderInFlight(t *testing.T) {
+	e := newBillEnv(t)
+	e.build.pending = true
+	if _, out := e.payWeak(t, fmt.Sprintf("wf%d", e.tgID)); out.Kind != OutcomeWeakPending {
+		t.Fatalf("outcome: %+v", out)
+	}
+	o2, err := e.svc.OpenWeakOrder(e.ctx, e.user.ID, e.tgID, e.sid)
+	if err != nil || o2 == nil {
+		t.Fatalf("second order: %v", err)
+	}
+	if ok, msg := e.svc.PreCheckout(e.ctx, e.user.ID, "XTR", 10, billing.WeakTestPayload(o2.ID)); ok || msg != errPayInFlight {
+		t.Fatalf("pre-checkout with a paid order in flight: ok=%v %q", ok, msg)
+	}
+}
+
+func containsStr(xs []string, s string) bool {
+	for _, x := range xs {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
