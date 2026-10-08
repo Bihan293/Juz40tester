@@ -403,30 +403,33 @@ func (s *QuizService) CanOpenTest(ctx context.Context, userID int64, test *model
 // weak/mastered topics are stable enough to build the next test on. An
 // unfinished attempt tells the model almost nothing, so generating earlier
 // would waste an API call on a worse test.
-func (s *QuizService) OnTestCompleted(ctx context.Context, userID int64, test *models.Test, green, yellow int) {
+func (s *QuizService) OnTestCompleted(ctx context.Context, userID int64, test *models.Test, green, yellow int) CompletionOutcome {
+	var out CompletionOutcome
 	if test.Kind != models.TestKindChain || s.state == nil {
-		return
+		return out
 	}
 	// Not at the bar yet — nothing to unlock or generate. The user keeps
 	// training this same test; generation starts exactly when the bar is
 	// crossed.
 	if !models.MeetsUnlockBar(green, yellow) {
-		return
+		return out
 	}
 	// The bar is reached — remember it permanently (the unlock watermark):
 	// a later retry with mistakes must never lock the next tests again.
-	if err := s.state.SaveProgress(ctx, userID, test.SubjectID, test.TestNumber); err != nil {
+	raised, err := s.state.RaiseWatermark(ctx, userID, test.SubjectID, test.TestNumber)
+	if err != nil {
 		log.Printf("test completed: save progress user %d subject %d test #%d: %v",
 			userID, test.SubjectID, test.TestNumber, err)
-		return
+		return out
 	}
+	out.NewUnlock = raised
 	if s.genSvc == nil || !s.genSvc.Enabled() {
-		return
+		return out
 	}
 	chain, err := s.subjects.ListChainTests(ctx, test.SubjectID)
 	if err != nil {
 		log.Printf("test completed: list chain tests subject %d (user %d): %v", test.SubjectID, userID, err)
-		return
+		return out
 	}
 	byNumber := make(map[int]bool, len(chain))
 	for _, t := range chain {
@@ -435,7 +438,11 @@ func (s *QuizService) OnTestCompleted(ctx context.Context, userID int64, test *m
 	// The next test of the chain (the one this unlock opened) does not
 	// exist yet — generate it NOW, with the freshest knowledge marks.
 	if next := test.TestNumber + 1; next <= models.MaxVisibleTests && !byNumber[next] {
-		_, _ = s.genSvc.EnsureChainTest(ctx, test.SubjectID, next, true, userID)
+		queued, err := s.genSvc.EnsureChainTest(ctx, test.SubjectID, next, true, userID)
+		if err != nil {
+			log.Printf("test completed: generate subject %d #%d for user %d: %v", test.SubjectID, next, userID, err)
+		}
+		out.NextGenerating = queued
 	}
 	// Opt-in (GEN_PREGEN_AHEAD=1): the test AFTER the next one is queued as
 	// a NON-urgent job — it runs in the off-peak window (cheaper DeepSeek
@@ -448,6 +455,17 @@ func (s *QuizService) OnTestCompleted(ctx context.Context, userID int64, test *m
 			}
 		}
 	}
+	return out
+}
+
+// CompletionOutcome is what OnTestCompleted did, for the result screen.
+type CompletionOutcome struct {
+	// NewUnlock: this pass raised the unlock watermark — the next chain
+	// test was NOT open before (false for a retry of an earlier test).
+	NewUnlock bool
+	// NextGenerating: the next chain test does not exist yet and its
+	// generation is queued or running.
+	NextGenerating bool
 }
 
 // ReviveChainTest exposes the stuck/failed-generation recovery to handlers:

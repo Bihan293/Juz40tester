@@ -326,13 +326,13 @@ func (h *Handler) handleAnswer(ctx context.Context, cb *bot.CallbackQuery, user 
 			h.sendText(ctx, chatID, "Ошибка загрузки результата 😔")
 			return
 		}
-		h.quiz.OnTestCompleted(ctx, user.ID, sum.Test,
+		outcome := h.quiz.OnTestCompleted(ctx, user.ID, sum.Test,
 			sum.StatusCounts[models.StatusMastered], sum.StatusCounts[models.StatusPartial])
 		extra := ""
 		if res.Charged {
 			extra = h.chargedLine(ctx, user)
 		}
-		h.renderSummary(ctx, sum, user, attemptID, chatID, extra)
+		h.renderSummary(ctx, sum, user, attemptID, chatID, extra, outcome)
 		return
 	}
 	// The next question is sent as a NEW message right below the answered
