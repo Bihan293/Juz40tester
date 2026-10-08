@@ -12,6 +12,10 @@ import (
 // after this long.
 const emptyAbandonedAge = 3 * 24 * time.Hour
 
+// testTemplateTTL: a fingerprint template neither created nor used for this
+// long is deleted (bounded growth of test_templates).
+const testTemplateTTL = 90 * 24 * time.Hour
+
 // cleanupStore is the subset of CleanupRepository used by runCleanup.
 type cleanupStore interface {
 	DeleteOldAttemptQuestions(ctx context.Context, olderThan time.Duration, limit int) (int64, error)
@@ -59,6 +63,17 @@ func cleanupOnce(ctx context.Context, store cleanupStore, s cleanupSettings) {
 		{"done translation_jobs", s.trJobAge, store.DeleteOldTranslationJobs},
 		{"stale personal-test templates", s.templateAge, store.DeleteStaleTemplates},
 		{"old finished attempts", s.finishedAttemptAge, store.DeleteOldFinishedAttempts},
+	}
+	// Fingerprint test templates unused for testTemplateTTL (optional
+	// method: test fakes of cleanupStore need not implement it).
+	if ts, ok := store.(interface {
+		DeleteUnusedTestTemplates(ctx context.Context, olderThan time.Duration, limit int) (int64, error)
+	}); ok {
+		steps = append(steps, struct {
+			name string
+			age  time.Duration
+			del  func(context.Context, time.Duration, int) (int64, error)
+		}{"unused test templates", testTemplateTTL, ts.DeleteUnusedTestTemplates})
 	}
 	for _, st := range steps {
 		total := deleteInBatches(ctx, st.age, s.pause, st.del)

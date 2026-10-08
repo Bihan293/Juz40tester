@@ -60,7 +60,7 @@ func TestGenerationRoute(t *testing.T) {
 	msgs := []deepseek.Message{{Role: "user", Content: "x"}}
 
 	chain := stepNames(g.generationSteps(msgs, models.TestKindChain, 1))
-	want := "groq/openai/gpt-oss-120b(medium),groq/openai/gpt-oss-120b(low),groq/qwen/qwen3.8-27b(none),deepseek/deepseek-flash(high)"
+	want := "groq/openai/gpt-oss-120b(medium),groq/qwen/qwen3.8-27b(none),deepseek/deepseek-flash(high)" // at most 2 Groq attempts
 	if chain != want {
 		t.Fatalf("chain route:\n got %s\nwant %s", chain, want)
 	}

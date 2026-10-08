@@ -73,6 +73,19 @@ func stepContext(ctx context.Context, steps []aiStep, i int) (context.Context, c
 // returns the accepted raw reply and the name of the step that produced it.
 // Errors of every failed step are joined into the final error.
 func runSteps(ctx context.Context, task string, steps []aiStep, validate func(raw string) error) (string, string, error) {
+	return runStepsFeedback(ctx, task, steps, validate, nil)
+}
+
+// runStepsFeedback is runSteps with a rejection hook: onReject is called
+// with the validation error of a step's reply BEFORE the next step runs, so
+// the caller can feed the reason back into the next prompt («your previous
+// reply was rejected: mean difficulty 1.6, need 3.5») — models ignore
+// instructions most often on a blind retry. Every model call and every
+// rejected reply is counted (metrics + the job's genRun); a difficulty
+// violation is additionally logged as one greppable line:
+//
+//	difficulty_violation task=… step=… err=…
+func runStepsFeedback(ctx context.Context, task string, steps []aiStep, validate func(raw string) error, onReject func(error)) (string, string, error) {
 	var errs []error
 	for i, st := range steps {
 		if ctx.Err() != nil {
@@ -88,10 +101,19 @@ func runSteps(ctx context.Context, task string, steps []aiStep, validate func(ra
 		started := time.Now()
 		raw, err := st.run(sctx)
 		cancel()
+		if err == nil || (!groq.IsRateLimited(err) && !errors.Is(err, groq.ErrTooLarge)) {
+			noteAICall(ctx, st.name)
+		}
 		if err == nil {
-			err = validate(raw)
-			if err != nil {
-				err = fmt.Errorf("invalid reply: %w", err)
+			if verr := validate(raw); verr != nil {
+				noteReject(ctx, st.name, verr)
+				if rejectClass(verr) == rejectDifficulty {
+					log.Printf("difficulty_violation task=%q step=%s err=%q", task, st.name, verr.Error())
+				}
+				if onReject != nil {
+					onReject(verr)
+				}
+				err = fmt.Errorf("invalid reply: %w", verr)
 			}
 		}
 		if err == nil {
@@ -131,6 +153,7 @@ func groqStep(gc *groq.Client, req groq.Request) aiStep {
 		if err != nil {
 			return "", err
 		}
+		noteTokens(ctx, res.PromptTokens, res.CompletionTokens)
 		return res.Content, nil
 	}}
 }

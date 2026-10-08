@@ -130,6 +130,37 @@ type Config struct {
 	// than this are deleted, except the latest and the best per (user, test).
 	AttemptTTLDays int
 
+	// GenStrategy (GEN_STRATEGY): "batch" (default — the test is assembled
+	// from batches of GenBatchSize questions), "full" (one call writes all
+	// 20 questions) or "ab" (A/B test: GenABBatchPercent % of jobs batch).
+	GenStrategy string
+	// GenABBatchPercent (GEN_AB_BATCH_PERCENT, default 50): share of jobs
+	// on the "batch" arm when GenStrategy = "ab".
+	GenABBatchPercent int
+	// GenBatchSize (GEN_BATCH_SIZE, default 5, 2..10): questions per batch call.
+	GenBatchSize int
+	// GenBatchParallel (GEN_BATCH_PARALLEL, default 2, 1..4): batch calls of
+	// one job in flight at once (they alternate between the two free Groq
+	// models, which have independent quotas).
+	GenBatchParallel int
+	// GenMaxActivePersonal (GEN_MAX_ACTIVE_PERSONAL, default 300, 0 = no
+	// limit): backpressure — when this many personal AI generations are
+	// already queued/running, new ones are refused with a friendly message
+	// instead of growing the queue without bound (the free AI quota is the
+	// real bottleneck with thousands of users).
+	GenMaxActivePersonal int
+	// GenTemplateReuse (GEN_TEMPLATE_REUSE, default true): reuse generated
+	// tests via the weak-topics fingerprint (clone instead of regeneration).
+	GenTemplateReuse bool
+	// GenPregenAhead (GEN_PREGEN_AHEAD, default 0 = off): when a user
+	// unlocks chain test N, also queue test N+1 as a NON-urgent job that
+	// runs in the off-peak window (opt-in: the next test is then written
+	// with fewer knowledge marks of test N).
+	GenPregenAhead int
+	// MetricsToken (METRICS_TOKEN): when set, GET /metrics requires
+	// «Authorization: Bearer <token>» (or ?token=).
+	MetricsToken string
+
 	OffPeakStartHour int  // custom window start (inclusive); -1 = official schedule
 	OffPeakEndHour   int  // custom window end (exclusive)
 	OffPeakCustom    bool // true when a custom window is configured
@@ -172,6 +203,13 @@ func Load() (*Config, error) {
 		AttemptTTLDays:         DefaultAttemptTTLDays,
 		CleanupJobDays:         DefaultCleanupJobDays,
 		ChainCacheTTL:          DefaultChainCacheTTL,
+		GenStrategy:            GenStrategyBatch,
+		GenABBatchPercent:      DefaultGenABBatchPercent,
+		GenBatchSize:           DefaultGenBatchSize,
+		GenBatchParallel:       DefaultGenBatchParallel,
+		GenMaxActivePersonal:   DefaultGenMaxActivePersonal,
+		GenTemplateReuse:       true,
+		MetricsToken:           strings.TrimSpace(os.Getenv("METRICS_TOKEN")),
 	}
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV"))) {
 	case "development", "dev", "local", "test":
@@ -197,6 +235,39 @@ func Load() (*Config, error) {
 	}
 	if n, ok := envIntOpt("DB_CONN_MAX_IDLE_SEC"); ok && n > 0 {
 		cfg.DBConnMaxIdleTime = time.Duration(n) * time.Second
+	}
+	// Audit names: DB_CONN_MAX_LIFETIME / DB_CONN_MAX_IDLE_TIME accept a Go
+	// duration ("30m", "90s") or plain seconds; they win over the *_SEC forms.
+	if d, ok := envDurationOpt("DB_CONN_MAX_LIFETIME"); ok && d > 0 {
+		cfg.DBConnMaxLifetime = d
+	}
+	if d, ok := envDurationOpt("DB_CONN_MAX_IDLE_TIME"); ok && d > 0 {
+		cfg.DBConnMaxIdleTime = d
+	}
+	switch v := strings.ToLower(strings.TrimSpace(os.Getenv("GEN_STRATEGY"))); v {
+	case GenStrategyBatch, GenStrategyFull, GenStrategyAB:
+		cfg.GenStrategy = v
+	case "":
+	default:
+		return nil, fmt.Errorf("GEN_STRATEGY must be batch, full or ab (got %q)", v)
+	}
+	if n, ok := envIntOpt("GEN_AB_BATCH_PERCENT"); ok && n >= 0 && n <= 100 {
+		cfg.GenABBatchPercent = n
+	}
+	if n, ok := envIntOpt("GEN_BATCH_SIZE"); ok && n >= 2 && n <= 10 {
+		cfg.GenBatchSize = n
+	}
+	if n, ok := envIntOpt("GEN_BATCH_PARALLEL"); ok && n >= 1 && n <= 4 {
+		cfg.GenBatchParallel = n
+	}
+	if n, ok := envIntOpt("GEN_MAX_ACTIVE_PERSONAL"); ok && n >= 0 {
+		cfg.GenMaxActivePersonal = n
+	}
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("GEN_TEMPLATE_REUSE"))); v != "" {
+		cfg.GenTemplateReuse = !(v == "0" || v == "false" || v == "no" || v == "off")
+	}
+	if n, ok := envIntOpt("GEN_PREGEN_AHEAD"); ok && n >= 0 {
+		cfg.GenPregenAhead = min(n, 1)
 	}
 	if n, ok := envIntOpt("CHAIN_CACHE_TTL_SEC"); ok && n >= 0 {
 		cfg.ChainCacheTTL = time.Duration(n) * time.Second
@@ -328,6 +399,60 @@ const (
 	// DefaultChainCacheTTL: in-memory cache of a subject's chain structure.
 	DefaultChainCacheTTL = 45 * time.Second
 )
+
+// Generation strategies (GEN_STRATEGY).
+const (
+	GenStrategyBatch = "batch"
+	GenStrategyFull  = "full"
+	GenStrategyAB    = "ab"
+)
+
+// Generation tuning defaults.
+const (
+	DefaultGenABBatchPercent    = 50
+	DefaultGenBatchSize         = 5
+	DefaultGenBatchParallel     = 2
+	DefaultGenMaxActivePersonal = 300
+)
+
+// DBConnsReserved is the minimum part of the pgx pool kept for background
+// work (generation/translation workers, reapers, cleanup) — update handlers
+// get at most DB_MAX_CONNS - reserve connections.
+const DBConnsReserved = 8
+
+// TranslationWorkers is the number of background translation workers.
+const TranslationWorkers = 2
+
+// BackgroundConns estimates the pool connections the background work can
+// hold at once: one per generation worker, one per translation worker, plus
+// 2 for the reapers / cleanup / backfill (short queries that rarely overlap).
+// The quality-sweep lock and the LISTEN connection are DEDICATED direct
+// connections outside the pool. With the defaults (4 + 2 + 2) this equals
+// the historical reserve of 8; GEN_WORKERS=16 reserves 20.
+func (c *Config) BackgroundConns() int {
+	gw := c.GenWorkers
+	if gw <= 0 {
+		gw = DefaultGenWorkers
+	}
+	return max(DBConnsReserved, gw+TranslationWorkers+2)
+}
+
+// envDurationOpt reads a duration env var: a Go duration ("30m") or plain
+// seconds ("1800").
+func envDurationOpt(key string) (time.Duration, bool) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return 0, false
+	}
+	if n, err := strconv.Atoi(v); err == nil {
+		return time.Duration(n) * time.Second, true
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, false
+	}
+	return d, true
+}
 
 // envIntOpt reads an integer env var; ok is false when it is unset or
 // unparsable (callers need to distinguish "unset" from an explicit value).

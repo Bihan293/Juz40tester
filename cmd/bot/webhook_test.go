@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
@@ -15,7 +16,19 @@ import (
 	"github.com/Bihan293/Juz40tester/internal/bot"
 )
 
+// postSeq makes every well-formed test update unique: the dispatcher drops
+// re-delivered update_ids (idempotency), while these tests model DISTINCT
+// updates that merely share a template body.
+var postSeq atomic.Int64
+
 func post(d *updateDispatcher, body, secret string) int {
+	if strings.HasPrefix(body, `{"update_id":`) && strings.HasSuffix(body, "}") && !strings.Contains(body, "message") {
+		body = fmt.Sprintf(`{"update_id":%d}`, 1_000_000+postSeq.Add(1))
+	}
+	return postRaw(d, body, secret)
+}
+
+func postRaw(d *updateDispatcher, body, secret string) int {
 	req := httptest.NewRequest(http.MethodPost, "/telegram/webhook", strings.NewReader(body))
 	if secret != "" {
 		req.Header.Set("X-Telegram-Bot-Api-Secret-Token", secret)
@@ -280,5 +293,41 @@ func TestUpdateWorkersCappedByPool(t *testing.T) {
 		if got := updateWorkers(conns); got != want {
 			t.Errorf("updateWorkers(%d) = %d, want %d", conns, got, want)
 		}
+	}
+}
+
+// TestWebhookDropsDuplicateUpdateIDs: a re-delivered update (same update_id)
+// is acknowledged but processed only once; an update refused with 503 is
+// NOT remembered (its re-delivery must be processed).
+func TestWebhookDropsDuplicateUpdateIDs(t *testing.T) {
+	var n atomic.Int32
+	d := newUpdateDispatcher("", 1, 10, time.Second, func(ctx context.Context, u *bot.Update) { n.Add(1) })
+	for i := 0; i < 3; i++ {
+		if code := postRaw(d, `{"update_id":777}`, ""); code != http.StatusOK {
+			t.Fatalf("HTTP %d", code)
+		}
+	}
+	if err := d.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := n.Load(); got != 1 {
+		t.Fatalf("processed %d times, want 1", got)
+	}
+	r := newRecentIDs(2)
+	if !r.add(1) || r.add(1) || !r.add(2) || !r.add(3) || !r.add(1) {
+		t.Fatal("ring buffer must forget the oldest ids")
+	}
+	r.forget(3)
+	if !r.add(3) {
+		t.Fatal("forgotten id must be accepted again")
+	}
+}
+
+func TestUpdateWorkersReserveFollowsBackgroundWork(t *testing.T) {
+	if got := updateWorkersFor(40, 22); got != 18 {
+		t.Fatalf("40 conns - 22 background = %d", got)
+	}
+	if got := updateWorkersFor(20, 3); got != 12 {
+		t.Fatalf("the reserve never drops below 8: %d", got)
 	}
 }

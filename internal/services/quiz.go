@@ -428,6 +428,17 @@ func (s *QuizService) OnTestCompleted(ctx context.Context, userID int64, test *m
 	if next := test.TestNumber + 1; next <= models.MaxVisibleTests && !byNumber[next] {
 		_, _ = s.genSvc.EnsureChainTest(ctx, test.SubjectID, next, true, userID)
 	}
+	// Opt-in (GEN_PREGEN_AHEAD=1): the test AFTER the next one is queued as
+	// a NON-urgent job — it runs in the off-peak window (cheaper DeepSeek
+	// fallback, no user waiting) and is upgraded to urgent automatically if
+	// somebody unlocks it earlier (EnqueueChainJob's conflict update).
+	if s.genSvc.PregenAhead() {
+		if ahead := test.TestNumber + 2; ahead <= models.MaxVisibleTests && !byNumber[ahead] {
+			if _, err := s.genSvc.EnsureChainTest(ctx, test.SubjectID, ahead, false, 0); err != nil {
+				log.Printf("test completed: pre-generate subject %d #%d: %v", test.SubjectID, ahead, err)
+			}
+		}
+	}
 }
 
 // ReviveChainTest exposes the stuck/failed-generation recovery to handlers:
