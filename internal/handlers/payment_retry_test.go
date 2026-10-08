@@ -3,10 +3,12 @@ package handlers
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Bihan293/Juz40tester/internal/bot"
+	"github.com/Bihan293/Juz40tester/internal/services"
 )
 
 func TestRetryWithBackoff(t *testing.T) {
@@ -56,5 +58,18 @@ func TestIsPaymentUpdate(t *testing.T) {
 		if got := isPaymentUpdate(c.upd); got != c.want {
 			t.Fatalf("case %d: %v", i, got)
 		}
+	}
+}
+
+func TestGrantStarsNote(t *testing.T) {
+	if grantStarsNote(nil) != "" || grantStarsNote(&services.GrantResult{}) != "" {
+		t.Fatal("nothing to say without a Stars subscription")
+	}
+	n := grantStarsNote(&services.GrantResult{Stars: services.GrantStarsCanceled, OfferPlan: "pro"})
+	if !strings.Contains(n, "отменено") || !strings.Contains(n, "ссылку на подписку") {
+		t.Fatalf("cancelled + offer: %q", n)
+	}
+	if n := grantStarsNote(&services.GrantResult{Stars: services.GrantStarsFailed}); !strings.Contains(n, "Не удалось") {
+		t.Fatalf("failed: %q", n)
 	}
 }

@@ -249,7 +249,7 @@ func TestQuotaConcurrentStarts(t *testing.T) {
 func TestPlanGrantAndExpiry(t *testing.T) {
 	f := newBillFixture(t)
 	until := f.now().Add(24 * time.Hour)
-	if err := f.bill.GrantPlan(f.ctx, f.user.ID, billing.PlanPlus, until); err != nil {
+	if err := f.bill.GrantPlan(f.ctx, f.user.ID, billing.PlanPlus, until, ""); err != nil {
 		t.Fatal(err)
 	}
 	u := f.usage(t)
@@ -272,7 +272,7 @@ func TestPlanGrantAndExpiry(t *testing.T) {
 	if u := f.usage(t); u.Plan.Code != billing.PlanFree || u.Limit != 1 || !u.ExpiresAt.IsZero() {
 		t.Fatalf("expired: %+v", u)
 	}
-	if err := f.bill.GrantPlan(f.ctx, f.user.ID, billing.PlanFree, time.Time{}); err != nil {
+	if err := f.bill.GrantPlan(f.ctx, f.user.ID, billing.PlanFree, time.Time{}, ""); err != nil {
 		t.Fatal(err)
 	}
 	f.setNow(time.Now())

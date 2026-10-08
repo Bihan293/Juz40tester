@@ -138,7 +138,10 @@ func (h *Handler) renderPlans(ctx context.Context, user *models.User) (string, *
 			continue
 		}
 		fmt.Fprintf(&b, "• %s — %d⭐/мес, %d %s в день%s\n", p.Title, p.PriceStars, p.DailyLimit, passWord(p.DailyLimit), mark)
-		if _, v := cat.CanBuy(u.Plan, p.Code); v == billing.BuyAllowed {
+		if services.GrantedWithoutRenewal(u) && p.Code == u.Plan.Code {
+			// A granted plan does not renew by itself — offer its subscription.
+			rows = append(rows, bot.Row(bot.Btn(fmt.Sprintf("🔁 Оформить подписку %s — %d⭐/мес", p.Title, p.PriceStars), cbBuyPlan+p.Code)))
+		} else if _, v := cat.CanBuy(u.Plan, p.Code); v == billing.BuyAllowed {
 			verb := "⭐ Купить"
 			if !u.Plan.IsFree() {
 				verb = "⬆️ Перейти на"
@@ -228,7 +231,10 @@ func (h *Handler) buyPlan(ctx context.Context, cb *bot.CallbackQuery, user *mode
 	h.answerCallback(ctx, cb, "")
 	text := fmt.Sprintf("⭐ План %s — %d⭐ в месяц, %d %s теста в день.\n\nНажми кнопку ниже — откроется оплата Telegram Stars. Подписка продлевается автоматически каждые 30 дней, отменить можно в любой момент в настройках Telegram.",
 		p.Title, p.PriceStars, p.DailyLimit, passWord(p.DailyLimit))
-	if !u.Plan.IsFree() {
+	switch {
+	case services.GrantedWithoutRenewal(u):
+		text += fmt.Sprintf("\n\nСейчас действует план %s, назначенный администратором. После оплаты начнётся подписка %s.", u.Plan.Title, p.Title)
+	case !u.Plan.IsFree():
 		text += fmt.Sprintf("\n\nПлан %s сменится на %s сразу после оплаты, автопродление %s будет отменено.", u.Plan.Title, p.Title, u.Plan.Title)
 	}
 	kb := &bot.InlineKeyboardMarkup{InlineKeyboard: [][]bot.InlineKeyboardButton{
@@ -484,6 +490,8 @@ func (h *Handler) sendPaymentOutcome(ctx context.Context, chatID int64, user *mo
 		}
 		text := fmt.Sprintf("✅ Оплата получена! План %s активен%s — %d %s в день.", out.Plan.Title, until, out.Plan.DailyLimit, passWord(out.Plan.DailyLimit))
 		switch out.Decision {
+		case billing.DecisionAdminKept:
+			text = fmt.Sprintf("✅ Оплата продления получена. Сейчас у тебя действует план %s%s, назначенный администратором; автопродление прежней подписки отключено.", out.Plan.Title, until)
 		case billing.DecisionRenewal:
 			text = fmt.Sprintf("🔁 Подписка %s продлена%s. Спасибо!", out.Plan.Title, until)
 		case billing.DecisionUpgrade:
@@ -519,6 +527,22 @@ func (h *Handler) WeakTestReady(ctx context.Context, tgUserID int64, test *model
 		bot.Row(bot.Btn("▶️ Начать тест", cbOpenTest+strconv.FormatInt(test.ID, 10))))
 }
 
+// RenewOffer implements services.BillingNotifier: the plan granted by an
+// administrator has ended — the user gets the subscription link of it.
+func (h *Handler) RenewOffer(ctx context.Context, tgUserID int64, p billing.Plan) {
+	link, err := h.planInvoiceLink(ctx, p)
+	if err != nil {
+		logf("renew offer %s to %d: invoice link: %v", p.Code, tgUserID, err)
+		h.sendWithKeyboard(ctx, tgUserID, fmt.Sprintf("⏰ Срок плана %s закончился. Продлить его можно в разделе «⭐ Подписка».", p.Title),
+			bot.Row(bot.Btn("⭐ Тарифы", cbPlans)))
+		return
+	}
+	h.sendWithKeyboard(ctx, tgUserID, fmt.Sprintf("⏰ Срок плана %s закончился.\n\nЧтобы и дальше проходить %d %s в день, оформи подписку — %d⭐ раз в 30 дней, продлевается автоматически.",
+		p.Title, p.DailyLimit, passWord(p.DailyLimit), p.PriceStars),
+		bot.Row(bot.URLBtn(fmt.Sprintf("⭐ Подписка %s — %d⭐/мес", p.Title, p.PriceStars), link)),
+		bot.Row(bot.Btn("⭐ Все тарифы", cbPlans)))
+}
+
 // PaymentRefunded implements services.BillingNotifier.
 func (h *Handler) PaymentRefunded(ctx context.Context, tgUserID int64, p repositories.Payment) {
 	text := fmt.Sprintf("↩️ Возвращено %d⭐ на твой баланс Telegram Stars.", p.Amount)
@@ -529,6 +553,27 @@ func (h *Handler) PaymentRefunded(ctx context.Context, tgUserID int64, p reposit
 }
 
 // --- Admin commands ----------------------------------------------------------------------
+
+// grantStarsNote tells the admin what an admin plan change did with the
+// user's Telegram Stars subscription.
+func grantStarsNote(g *services.GrantResult) string {
+	if g == nil {
+		return ""
+	}
+	note := ""
+	switch g.Stars {
+	case services.GrantStarsCanceled:
+		note = "\nАвтопродление Stars-подписки пользователя отменено (уже оплаченное не возвращается)."
+	case services.GrantStarsKept:
+		note = "\nStars-подписка пользователя того же плана продолжит продлеваться."
+	case services.GrantStarsFailed:
+		note = "\n⚠️ Не удалось отменить автопродление Stars-подписки (см. лог). Если продление всё же придёт, платёж примется, а выданный план не изменится."
+	}
+	if g.OfferPlan != "" {
+		note += "\nПо окончании срока пользователь получит ссылку на подписку этого плана."
+	}
+	return note
+}
 
 // handleAdmin runs an administrator command; false = not an admin command
 // (or not an admin — the text is then handled as usual).
@@ -559,9 +604,13 @@ func (h *Handler) handleAdmin(ctx context.Context, m *bot.Message, text string) 
 			reply("Неверный telegram_id")
 			return true
 		}
-		uid, until, err := h.billing.Grant(ctx, tgID, f[2], days)
-		if err == nil && h.admin != nil {
-			h.admin.LogAction(ctx, m.From.ID, services.ActionCommandGrant, uid, fmt.Sprintf("plan=%s days=%d", f[2], days))
+		g, err := h.billing.GrantDetailed(ctx, tgID, f[2], days)
+		var until time.Time
+		if err == nil {
+			until = g.Until
+			if h.admin != nil {
+				h.admin.LogAction(ctx, m.From.ID, services.ActionCommandGrant, g.UserID, fmt.Sprintf("plan=%s days=%d stars=%s", f[2], days, g.Stars))
+			}
 		}
 		switch {
 		case errors.Is(err, services.ErrUnknownPlan):
@@ -571,9 +620,9 @@ func (h *Handler) handleAdmin(ctx context.Context, m *bot.Message, text string) 
 		case err != nil:
 			reply("Ошибка: " + err.Error())
 		case strings.EqualFold(f[2], billing.PlanFree):
-			reply(fmt.Sprintf("✅ Пользователь %d переведён на Free", tgID))
+			reply(fmt.Sprintf("✅ Пользователь %d переведён на Free", tgID) + grantStarsNote(g))
 		default:
-			reply(fmt.Sprintf("✅ Пользователю %d выдан план %s до %s", tgID, f[2], until.Format("02.01.2006 15:04")))
+			reply(fmt.Sprintf("✅ Пользователю %d выдан план %s до %s", tgID, f[2], until.Format("02.01.2006 15:04")) + grantStarsNote(g))
 		}
 	case "/revoke":
 		if len(f) < 2 {
@@ -585,15 +634,15 @@ func (h *Handler) handleAdmin(ctx context.Context, m *bot.Message, text string) 
 			reply("Неверный telegram_id")
 			return true
 		}
-		uid, _, err := h.billing.Grant(ctx, tgID, billing.PlanFree, 0)
+		g, err := h.billing.GrantDetailed(ctx, tgID, billing.PlanFree, 0)
 		if err != nil {
 			reply("Ошибка: " + err.Error())
 			return true
 		}
 		if h.admin != nil {
-			h.admin.LogAction(ctx, m.From.ID, services.ActionCommandRevoke, uid, "plan=free")
+			h.admin.LogAction(ctx, m.From.ID, services.ActionCommandRevoke, g.UserID, "plan=free stars="+g.Stars)
 		}
-		reply(fmt.Sprintf("✅ План пользователя %d отозван (Free)", tgID))
+		reply(fmt.Sprintf("✅ План пользователя %d отозван (Free)", tgID) + grantStarsNote(g))
 	case "/subinfo":
 		if len(f) < 2 {
 			reply("Формат: /subinfo <telegram_id>")

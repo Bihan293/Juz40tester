@@ -84,7 +84,7 @@ type Usage struct {
 // excludeTest. Index-only work: user_subscriptions PK, daily_usage PK,
 // test_attempts(user_id).
 const usageSQL = `
-	SELECT s.plan, s.expires_at, COALESCE(s.sub_charge_id, ''), COALESCE(s.charge_id, ''), s.source,
+	SELECT s.plan, s.expires_at, COALESCE(s.sub_charge_id, ''), COALESCE(s.charge_id, ''), s.source, s.offer_plan,
 	       COALESCE((SELECT used FROM daily_usage WHERE user_id = $1 AND day = $2::date), 0),
 	       (SELECT COUNT(*)::int FROM test_attempts a JOIN tests t ON t.id = a.test_id
 	         WHERE a.user_id = $1 AND a.status = 'in_progress' AND a.started_at >= $3
@@ -95,15 +95,16 @@ const usageSQL = `
 func (r *BillingRepository) usage(ctx context.Context, q querier, userID, excludeTest int64) (*Usage, error) {
 	now := r.now()
 	day, start, next := r.cal.Day(now)
-	var plan, subCharge, charge, source *string
+	var plan, subCharge, charge, source, offer *string
 	var expires *time.Time
 	u := &Usage{Day: day, ResetAt: next}
 	if err := q.QueryRow(ctx, usageSQL, userID, day, start, excludeTest).
-		Scan(&plan, &expires, &subCharge, &charge, &source, &u.Used, &u.OpenToday); err != nil {
+		Scan(&plan, &expires, &subCharge, &charge, &source, &offer, &u.Used, &u.OpenToday); err != nil {
 		return nil, err
 	}
 	if plan != nil && expires != nil {
-		u.Stored = &billing.SubState{Plan: *plan, ExpiresAt: *expires, SubChargeID: deref(subCharge), ChargeID: deref(charge), Source: deref(source)}
+		u.Stored = &billing.SubState{Plan: *plan, ExpiresAt: *expires, SubChargeID: deref(subCharge), ChargeID: deref(charge), Source: deref(source),
+			OfferPlan: deref(offer)}
 		u.Plan = r.cat.Effective(*plan, *expires, now, r.grace)
 		if !u.Plan.IsFree() {
 			u.ExpiresAt = *expires
@@ -264,16 +265,17 @@ func (r *BillingRepository) ApplySubscriptionPayment(ctx context.Context, p Paym
 		return true, dec, tx.Commit(ctx)
 	}
 	var cur *billing.SubState
-	var plan, source string
+	var plan, source, status string
 	var subCharge, charge *string
 	var expires time.Time
 	err = tx.QueryRow(ctx, `
-		SELECT plan, expires_at, sub_charge_id, charge_id, source
-		FROM user_subscriptions WHERE user_id = $1 AND status = 'active'
-		FOR UPDATE`, p.UserID).Scan(&plan, &expires, &subCharge, &charge, &source)
+		SELECT plan, expires_at, sub_charge_id, charge_id, source, status
+		FROM user_subscriptions WHERE user_id = $1
+		FOR UPDATE`, p.UserID).Scan(&plan, &expires, &subCharge, &charge, &source, &status)
 	switch {
 	case err == nil:
-		cur = &billing.SubState{Plan: plan, ExpiresAt: expires, SubChargeID: deref(subCharge), ChargeID: deref(charge), Source: source}
+		cur = &billing.SubState{Plan: plan, ExpiresAt: expires, SubChargeID: deref(subCharge), ChargeID: deref(charge), Source: source,
+			Revoked: status != "active"}
 	case errors.Is(err, pgx.ErrNoRows):
 	default:
 		return false, dec, err
@@ -297,6 +299,9 @@ func (r *BillingRepository) ApplySubscriptionPayment(ctx context.Context, p Paym
 				plan = EXCLUDED.plan, status = 'active', expires_at = EXCLUDED.expires_at,
 				charge_id = EXCLUDED.charge_id, sub_charge_id = EXCLUDED.sub_charge_id,
 				source = EXCLUDED.source,
+				sub_canceled_at = CASE WHEN user_subscriptions.sub_charge_id IS DISTINCT FROM EXCLUDED.sub_charge_id
+				                       THEN NULL ELSE user_subscriptions.sub_canceled_at END,
+				offer_plan = '', offer_sent_at = NULL,
 				started_at = CASE WHEN user_subscriptions.plan = EXCLUDED.plan AND user_subscriptions.status = 'active'
 				                  THEN user_subscriptions.started_at ELSE now() END,
 				updated_at = now()`,
@@ -304,14 +309,14 @@ func (r *BillingRepository) ApplySubscriptionPayment(ctx context.Context, p Paym
 			return false, dec, err
 		}
 	}
-	status := "paid"
+	payStatus := "paid"
 	reason := ""
 	if dec.Refund {
-		status, reason = refundStatus(p.AdminBypass), "subscription:"+dec.Kind
+		payStatus, reason = refundStatus(p.AdminBypass), "subscription:"+dec.Kind
 	}
 	if _, err := tx.Exec(ctx, `UPDATE payments SET decision = $2, status = $3, refund_reason = $4,
 		refunded_at = CASE WHEN $3 = 'refunded' THEN now() END WHERE charge_id = $1`,
-		p.ChargeID, dec.Kind, status, reason); err != nil {
+		p.ChargeID, dec.Kind, payStatus, reason); err != nil {
 		return false, dec, err
 	}
 	return false, dec, tx.Commit(ctx)
@@ -338,19 +343,106 @@ func nullIfEmpty(s string) *string {
 }
 
 // GrantPlan sets the user's plan by hand (admin): plan until `until`,
-// source 'admin'. Plan "free" revokes the current plan.
-func (r *BillingRepository) GrantPlan(ctx context.Context, userID int64, plan string, until time.Time) error {
+// source 'admin'. Plan "free" revokes the current plan. offerPlan (may be
+// "") is the plan whose subscription link the user gets when the granted
+// period ends (no Telegram subscription renews it). The Telegram
+// subscription id (sub_charge_id) is kept: a late renewal of it is still
+// recognised.
+func (r *BillingRepository) GrantPlan(ctx context.Context, userID int64, plan string, until time.Time, offerPlan string) error {
 	if plan == billing.PlanFree {
-		_, err := r.pool.Exec(ctx, `UPDATE user_subscriptions SET status = 'revoked', updated_at = now() WHERE user_id = $1`, userID)
+		// source = 'admin': a renewal of the old Telegram subscription that
+		// races the cancellation must not bring the plan back.
+		_, err := r.pool.Exec(ctx, `UPDATE user_subscriptions SET status = 'revoked', source = 'admin', offer_plan = '', updated_at = now() WHERE user_id = $1`, userID)
 		return err
 	}
 	_, err := r.pool.Exec(ctx, `
-		INSERT INTO user_subscriptions (user_id, plan, status, expires_at, source)
-		VALUES ($1, $2, 'active', $3, 'admin')
+		INSERT INTO user_subscriptions (user_id, plan, status, expires_at, source, offer_plan)
+		VALUES ($1, $2, 'active', $3, 'admin', $4)
 		ON CONFLICT (user_id) DO UPDATE SET plan = EXCLUDED.plan, status = 'active',
-			expires_at = EXCLUDED.expires_at, source = 'admin', started_at = now(), updated_at = now()`,
-		userID, plan, until)
+			expires_at = EXCLUDED.expires_at, source = 'admin', offer_plan = EXCLUDED.offer_plan,
+			offer_sent_at = NULL, started_at = now(), updated_at = now()`,
+		userID, plan, until, offerPlan)
 	return err
+}
+
+// StarsSub is the Telegram Stars subscription remembered for a user (the
+// one sub_charge_id points to), as the admin plan change needs it.
+type StarsSub struct {
+	ChargeID string // sub_charge_id ("" = none)
+	Plan     string // plan of its first payment
+	Amount   int    // its price in Stars (the first payment)
+	Canceled bool   // the bot already cancelled its auto-renewal
+}
+
+// StarsSubscription returns the user's remembered Telegram subscription
+// (zero value when none).
+func (r *BillingRepository) StarsSubscription(ctx context.Context, userID int64) (StarsSub, error) {
+	var s StarsSub
+	var charge, plan *string
+	var amount *int
+	err := r.pool.QueryRow(ctx, `
+		SELECT us.sub_charge_id, us.sub_canceled_at IS NOT NULL, p.plan, p.amount
+		FROM user_subscriptions us LEFT JOIN payments p ON p.charge_id = us.sub_charge_id
+		WHERE us.user_id = $1`, userID).Scan(&charge, &s.Canceled, &plan, &amount)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return StarsSub{}, nil
+	}
+	if err != nil {
+		return StarsSub{}, err
+	}
+	s.ChargeID, s.Plan = deref(charge), deref(plan)
+	if amount != nil {
+		s.Amount = *amount
+	}
+	return s, nil
+}
+
+// MarkSubCanceled records that the auto-renewal of the user's Telegram
+// subscription chargeID was cancelled by the bot.
+func (r *BillingRepository) MarkSubCanceled(ctx context.Context, userID int64, chargeID string) error {
+	_, err := r.pool.Exec(ctx, `UPDATE user_subscriptions SET sub_canceled_at = now()
+		WHERE user_id = $1 AND sub_charge_id = $2 AND sub_canceled_at IS NULL`, userID, chargeID)
+	return err
+}
+
+// RenewOffer is a plan granted by an administrator whose period has just
+// ended: the user is offered a subscription of that plan.
+type RenewOffer struct {
+	UserID         int64
+	TelegramUserID int64
+	Plan           string
+}
+
+// renewOfferMaxAge: an offer whose plan ended longer ago is not sent any
+// more (e.g. the workers were down for days).
+const renewOfferMaxAge = 72 * time.Hour
+
+// ClaimDueRenewOffers takes up to limit admin-granted plans that ended and
+// still owe the user a subscription offer, marking them sent (at most
+// once — a failed send is not repeated).
+func (r *BillingRepository) ClaimDueRenewOffers(ctx context.Context, limit int) ([]RenewOffer, error) {
+	now := r.now()
+	rows, err := r.pool.Query(ctx, `
+		UPDATE user_subscriptions us SET offer_sent_at = $2, updated_at = now()
+		FROM users u, (SELECT user_id FROM user_subscriptions
+		               WHERE offer_plan <> '' AND offer_sent_at IS NULL AND status = 'active' AND source = 'admin'
+		                 AND expires_at <= $2 AND expires_at > $2 - make_interval(secs => $3)
+		               ORDER BY expires_at LIMIT $1 FOR UPDATE SKIP LOCKED) d
+		WHERE us.user_id = d.user_id AND u.id = us.user_id
+		RETURNING us.user_id, u.telegram_id, us.offer_plan`, limit, now, renewOfferMaxAge.Seconds())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RenewOffer
+	for rows.Next() {
+		var o RenewOffer
+		if err := rows.Scan(&o.UserID, &o.TelegramUserID, &o.Plan); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
 }
 
 // SubscriptionCharge returns the Telegram subscription id of the user's

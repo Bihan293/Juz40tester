@@ -110,6 +110,13 @@ type fakeNotify struct {
 	mu       sync.Mutex
 	ready    []int64
 	refunded []string
+	offers   []string // "tg:plan"
+}
+
+func (f *fakeNotify) RenewOffer(_ context.Context, tg int64, p billing.Plan) {
+	f.mu.Lock()
+	f.offers = append(f.offers, fmt.Sprintf("%d:%s", tg, p.Code))
+	f.mu.Unlock()
 }
 
 func (f *fakeNotify) WeakTestReady(_ context.Context, _ int64, t *models.Test) {
@@ -454,6 +461,11 @@ func TestBillingAdminRefundEndsPlan(t *testing.T) {
 // the subject is not payable while a paid order is still being built.
 func TestBillingWeakPreCheckoutRefusedWhileOrderInFlight(t *testing.T) {
 	e := newBillEnv(t)
+	// The paid order would stay in flight in the shared database and be
+	// picked up by the reconciler of other tests: close it at the end.
+	t.Cleanup(func() {
+		_, _ = e.pool.Exec(e.ctx, `UPDATE weak_test_orders SET status = 'refunded' WHERE user_id = $1 AND status = 'paid'`, e.user.ID)
+	})
 	e.build.pending = true
 	if _, out := e.payWeak(t, fmt.Sprintf("wf%d", e.tgID)); out.Kind != OutcomeWeakPending {
 		t.Fatalf("outcome: %+v", out)
@@ -474,4 +486,146 @@ func containsStr(xs []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// subPay applies a subscription payment of the env user.
+func (e *billEnv) subPay(t *testing.T, plan, charge string, amount int, first bool) *PaymentOutcome {
+	t.Helper()
+	out, err := e.svc.OnSuccessfulPayment(e.ctx, e.user.ID, e.tgID, PaymentInfo{Currency: "XTR", Amount: amount,
+		Payload: billing.SubscriptionPayload(plan), ChargeID: charge, SubExpiresAt: time.Now().Add(billing.SubscriptionPeriod),
+		IsRecurring: true, IsFirstRecurring: first})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func (e *billEnv) paymentStatus(t *testing.T, charge string) string {
+	t.Helper()
+	var st string
+	if err := e.pool.QueryRow(e.ctx, `SELECT status FROM payments WHERE charge_id = $1`, charge).Scan(&st); err != nil {
+		t.Fatal(err)
+	}
+	return st
+}
+
+// TestAdminGrantOverStarsSubscription: the owner's rules — an admin plan
+// of another price cancels the auto-renewal of the user's Stars
+// subscription (nothing is refunded); a renewal that still arrives is
+// accepted without touching the admin's plan; when the granted period
+// ends the user gets the subscription link of the granted plan, once.
+func TestAdminGrantOverStarsSubscription(t *testing.T) {
+	e := newBillEnv(t)
+	sub := fmt.Sprintf("ag%d-1", e.tgID)
+	e.subPay(t, "plus", sub, 10, true)
+
+	g, err := e.svc.GrantDetailed(e.ctx, e.tgID, "premium", 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.Stars != GrantStarsCanceled || g.OfferPlan != "premium" || !containsStr(e.stars.cancels, sub) {
+		t.Fatalf("grant premium over stars plus: %+v cancels=%v", g, e.stars.cancels)
+	}
+	if e.paymentStatus(t, sub) != "paid" {
+		t.Fatal("the paid period must not be refunded")
+	}
+	// A Plus renewal raced the cancellation: accepted, Premium stays.
+	ren := fmt.Sprintf("ag%d-2", e.tgID)
+	out := e.subPay(t, "plus", ren, 10, false)
+	if out.Kind != OutcomeSubscription || out.Decision != billing.DecisionAdminKept || out.Plan.Code != "premium" {
+		t.Fatalf("renewal under the admin plan: %+v", out)
+	}
+	if e.paymentStatus(t, ren) != "paid" {
+		t.Fatal("a renewal under an admin plan must not be refunded")
+	}
+	if u, _ := e.svc.Usage(e.ctx, e.user.ID); u.Plan.Code != "premium" || u.Stored.Source != billing.SourceAdmin {
+		t.Fatalf("admin plan overwritten: %+v %+v", u.Plan, u.Stored)
+	}
+	// A second grant does not cancel the (already cancelled) subscription again.
+	n := len(e.stars.cancels)
+	if g, err = e.svc.GrantDetailed(e.ctx, e.tgID, "premium", 30); err != nil || g.Stars != GrantStarsNone {
+		t.Fatalf("regrant: %v %+v", err, g)
+	}
+	if len(e.stars.cancels) != n {
+		t.Fatalf("cancelled twice: %v", e.stars.cancels)
+	}
+	// While Premium is granted the user may subscribe to it.
+	if _, v, _, _ := e.svc.CanBuy(e.ctx, e.user.ID, "premium"); v != billing.BuyAllowed {
+		t.Fatalf("subscribing to the granted plan: %v", v)
+	}
+	if _, v, _, _ := e.svc.CanBuy(e.ctx, e.user.ID, "plus"); v != billing.BuyDowngrade {
+		t.Fatalf("downgrade during the granted period: %v", v)
+	}
+	// The granted period ends: one offer of Premium.
+	e.exec(`UPDATE user_subscriptions SET expires_at = now() - interval '1 minute' WHERE user_id = $1`, e.user.ID)
+	e.svc.ReconcileOnce(e.ctx)
+	e.svc.ReconcileOnce(e.ctx)
+	want := fmt.Sprintf("%d:premium", e.tgID)
+	got := 0
+	for _, o := range e.notify.offers {
+		if o == want {
+			got++
+		}
+	}
+	if got != 1 {
+		t.Fatalf("renew offers: %v", e.notify.offers)
+	}
+	// Grace window: any plan may be bought now.
+	if _, v, _, _ := e.svc.CanBuy(e.ctx, e.user.ID, "plus"); v != billing.BuyAllowed {
+		t.Fatalf("plan after the granted period: %v", v)
+	}
+	if len(e.stars.refunds) != 0 {
+		t.Fatalf("nothing may be refunded: %v", e.stars.refunds)
+	}
+}
+
+// TestAdminGrantSamePlanKeepsSubscription: the admin grants the plan the
+// user already pays for — the Stars subscription keeps renewing, no
+// offer at expiry, a renewal extends without lowering the granted date.
+func TestAdminGrantSamePlanKeepsSubscription(t *testing.T) {
+	e := newBillEnv(t)
+	sub := fmt.Sprintf("ak%d-1", e.tgID)
+	e.subPay(t, "pro", sub, 40, true)
+	g, err := e.svc.GrantDetailed(e.ctx, e.tgID, "pro", 90)
+	if err != nil || g.Stars != GrantStarsKept || g.OfferPlan != "" || len(e.stars.cancels) != 0 {
+		t.Fatalf("grant same plan: %v %+v cancels=%v", err, g, e.stars.cancels)
+	}
+	out := e.subPay(t, "pro", fmt.Sprintf("ak%d-2", e.tgID), 40, false)
+	if out.Decision != billing.DecisionRenewal || out.Plan.Code != "pro" {
+		t.Fatalf("renewal: %+v", out)
+	}
+	u, _ := e.svc.Usage(e.ctx, e.user.ID)
+	if u.ExpiresAt.Before(g.Until.Add(-time.Second)) || u.Stored.SubChargeID != sub {
+		t.Fatalf("the granted period must not shrink: %s < %s (%+v)", u.ExpiresAt, g.Until, u.Stored)
+	}
+}
+
+// TestAdminRevokeCancelsStarsSubscription: Free set by an admin cancels
+// the auto-renewal, nothing is refunded, and a late renewal keeps the
+// user on Free (payment accepted).
+func TestAdminRevokeCancelsStarsSubscription(t *testing.T) {
+	e := newBillEnv(t)
+	sub := fmt.Sprintf("ar2%d-1", e.tgID)
+	e.subPay(t, "plus", sub, 10, true)
+	g, err := e.svc.GrantDetailed(e.ctx, e.tgID, billing.PlanFree, 0)
+	if err != nil || g.Stars != GrantStarsCanceled || g.OfferPlan != "" || !containsStr(e.stars.cancels, sub) {
+		t.Fatalf("revoke: %v %+v %v", err, g, e.stars.cancels)
+	}
+	if e.paymentStatus(t, sub) != "paid" {
+		t.Fatal("revoke must not refund")
+	}
+	ren := fmt.Sprintf("ar2%d-2", e.tgID)
+	if out := e.subPay(t, "plus", ren, 10, false); out.Decision != billing.DecisionAdminKept {
+		t.Fatalf("late renewal after revoke: %+v", out)
+	}
+	if u, _ := e.svc.Usage(e.ctx, e.user.ID); u.Plan.Code != billing.PlanFree {
+		t.Fatalf("revoke overwritten: %+v", u.Plan)
+	}
+	if e.paymentStatus(t, ren) != "paid" {
+		t.Fatal("late renewal must not be refunded")
+	}
+	// The user subscribes again himself: applies.
+	if out := e.subPay(t, "plus", fmt.Sprintf("ar2%d-3", e.tgID), 10, true); out.Decision != billing.DecisionNew || out.Plan.Code != "plus" {
+		t.Fatalf("new subscription after revoke: %+v", out)
+	}
 }
