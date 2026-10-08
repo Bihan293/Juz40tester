@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 
 	"github.com/Bihan293/Juz40tester/internal/config"
+	"github.com/Bihan293/Juz40tester/internal/deepseek"
 	"github.com/Bihan293/Juz40tester/internal/metrics"
 	"github.com/Bihan293/Juz40tester/internal/models"
 )
@@ -101,7 +102,14 @@ type genRun struct {
 type genRunKey struct{}
 
 func withGenRun(ctx context.Context, r *genRun) context.Context {
-	return context.WithValue(ctx, genRunKey{}, r)
+	ctx = context.WithValue(ctx, genRunKey{}, r)
+	// Paid DeepSeek calls report their tokens too (the Groq steps call
+	// noteTokens themselves): the per-job «tokens_in/out» used to show
+	// only the free tokens.
+	return deepseek.WithUsageHook(ctx, func(prompt, completion int) {
+		r.promptTok.Add(int64(prompt))
+		r.complTok.Add(int64(completion))
+	})
 }
 
 func genRunFrom(ctx context.Context) *genRun {

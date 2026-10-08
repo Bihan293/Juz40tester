@@ -121,3 +121,25 @@ func TestFallbackRouting(t *testing.T) {
 		t.Fatalf("with thinking disabled the first call must go without thinking: %v", calls)
 	}
 }
+
+// The per-job statistics of the generator learn the tokens of paid calls
+// through WithUsageHook (they used to count only the free Groq tokens).
+func TestUsageHookReportsTokens(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"ok\":true}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1200,"completion_tokens":800,"total_tokens":2000}}`))
+	}))
+	defer srv.Close()
+	c := New("k", "pro", "flash", srv.URL)
+	var in, out int
+	ctx := WithUsageHook(context.Background(), func(p, c int) { in += p; out += c })
+	if _, err := c.GenerateJSON(ctx, []Message{{Role: "user", Content: "x"}}, 100, ThinkingEffortLow); err != nil {
+		t.Fatal(err)
+	}
+	if in != 1200 || out != 800 {
+		t.Fatalf("hook got in=%d out=%d, want 1200/800", in, out)
+	}
+	// No hook: nothing breaks.
+	if _, err := c.GenerateJSON(context.Background(), []Message{{Role: "user", Content: "x"}}, 100, ThinkingEffortLow); err != nil {
+		t.Fatal(err)
+	}
+}

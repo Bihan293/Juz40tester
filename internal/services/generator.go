@@ -820,8 +820,14 @@ func (g *GeneratorService) EnsureChainTest(ctx context.Context, subjectID int64,
 // that tap only showed a toast and changed NOTHING, so a failed job left the
 // test in «Минуточку...» forever (nobody ever re-enqueued it). If an active
 // job already exists it is simply made urgent; a missing test with no active
-// job gets a fresh urgent job (the unique index treats 'failed' rows as
-// free slots). The tap is a no-op for tests that already exist.
+// job gets its failed job revived (or a fresh urgent job). The tap is a
+// no-op for tests that already exist.
+//
+// A failed job is revived only once its backoff has elapsed
+// (repositories.ChainReviveBaseBackoff): a test whose generation fails
+// every time must not start a new round of paid attempts on every tap. In
+// that case nothing is queued and retryAt tells when a retry is possible
+// (zero: a job is queued/running, or generation is disabled).
 //
 // Unexported on purpose: it performs NO unlock check. The only entry point
 // is QuizService.ReviveChainTest, which refuses test numbers above the
@@ -829,16 +835,15 @@ func (g *GeneratorService) EnsureChainTest(ctx context.Context, subjectID int64,
 // test by bypassing that guard.
 //
 // A5: the caller (QuizService.ChainTestOrRevive) has already verified that
-// the test does not exist, so no second chain lookup is done here, and the
-// enqueue does not re-check the job status (nobody reads it).
-func (g *GeneratorService) reviveChainTest(ctx context.Context, subjectID int64, testNumber int, ownerUserID int64) {
+// the test does not exist, so no second chain lookup is done here.
+func (g *GeneratorService) reviveChainTest(ctx context.Context, subjectID int64, testNumber int, ownerUserID int64) (retryAt time.Time) {
 	if !g.Enabled() || testNumber < 1 || testNumber > models.MaxVisibleTests {
-		return
+		return time.Time{}
 	}
 	revived, err := g.gen.ReviveChainJob(ctx, subjectID, testNumber, ownerUserID)
 	if err != nil {
 		log.Printf("generator: revive chain job subject %d test %d: %v", subjectID, testNumber, err)
-		return
+		return time.Time{}
 	}
 	if revived {
 		log.Printf("generator: revived failed chain job: subject %d test %d (urgent)", subjectID, testNumber)
@@ -847,12 +852,27 @@ func (g *GeneratorService) reviveChainTest(ctx context.Context, subjectID int64,
 	inserted, err := g.gen.EnqueueChainJob(ctx, subjectID, testNumber, time.Now(), true, ownerUserID)
 	if err != nil {
 		log.Printf("generator: ensure after revive subject %d test %d: %v", subjectID, testNumber, err)
-		return
+		return time.Time{}
 	}
 	if inserted {
 		log.Printf("generator: queued URGENT chain job: subject %d test %d", subjectID, testNumber)
 	}
 	g.notifyWorkers()
+	if revived || inserted {
+		return time.Time{}
+	}
+	if active, err := g.gen.HasPendingOrRunningChainJob(ctx, subjectID, testNumber); err != nil || active {
+		return time.Time{}
+	}
+	at, err := g.gen.ChainRetryAt(ctx, subjectID, testNumber)
+	if err != nil {
+		log.Printf("generator: retry time of chain job subject %d test %d: %v", subjectID, testNumber, err)
+		return time.Time{}
+	}
+	if !at.IsZero() {
+		log.Printf("generator: chain test subject %d #%d keeps failing — next attempt not before %s", subjectID, testNumber, at.Format(time.RFC3339))
+	}
+	return at
 }
 
 // EnsurePersonalTest returns the user's own weak-topics test of the subject,
@@ -1491,6 +1511,14 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 			}
 		}
 		spec.prevStems = questionStems(prev)
+		// Repeats are checked locally (no prompt tokens) against the older
+		// chain tests too — the prompt shows only the previous test, so a
+		// question of Тест n-2…n-20 used to come back unnoticed.
+		older, err := g.olderChainStems(ctx, job.SubjectID, spec.testNumber)
+		if err != nil {
+			return 0, err
+		}
+		spec.prevStems = append(spec.prevStems, older...)
 		spec.prevMean = meanDifficulty(prev)
 		// Weak topics: of the previous test (average mark per topic) +
 		// subject-wide (aggregated user_topic_stats of active students).
@@ -1876,6 +1904,36 @@ func (g *GeneratorService) questionMarks(ctx context.Context, questions []models
 		}
 	}
 	return marks, nil
+}
+
+// chainRepeatWindow: a new chain test may not repeat a question of any of
+// the previous chainRepeatWindow chain tests (the previous one included).
+const chainRepeatWindow = 20
+
+// olderChainStems returns the question stems of chain tests
+// testNumber-chainRepeatWindow … testNumber-2 (the previous test is loaded
+// separately, with its knowledge marks, for the prompt).
+func (g *GeneratorService) olderChainStems(ctx context.Context, subjectID int64, testNumber int) ([]string, error) {
+	if testNumber <= 2 {
+		return nil, nil
+	}
+	tests, err := g.subjects.ListChainTests(ctx, subjectID)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for i := range tests {
+		n := tests[i].TestNumber
+		if n >= testNumber-1 || n < testNumber-chainRepeatWindow {
+			continue
+		}
+		qs, err := g.subjects.TestQuestions(ctx, tests[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, questionStems(qs)...)
+	}
+	return out, nil
 }
 
 // findChainTest locates the chain test by number (nil if not generated yet).

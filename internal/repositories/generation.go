@@ -309,13 +309,78 @@ func (r *GenerationRepository) DeletePersonalTest(ctx context.Context, userID, t
 	return tx.Commit(ctx)
 }
 
+// Chain revive backoff: a chain job that spent all its attempts is parked
+// as 'failed'. The FIRST re-queue of such a job is allowed at once (the
+// cause — a provider outage — may already be gone); every further one waits
+// ChainReviveBaseBackoff·2^(revivals-1) after the last failure, capped at
+// ChainReviveMaxBackoff (30 min, 1 h, 2 h, 4 h, 8 h, 12 h, 12 h …). Without
+// it every open of the subject screen re-queued an urgent generation of a
+// missing openable test, so a test whose generation kept failing started a
+// new round of paid attempts on every open.
+const (
+	ChainReviveBaseBackoff = 30 * time.Minute
+	ChainReviveMaxBackoff  = 12 * time.Hour
+)
+
+// chainReviveCooldownSQL is the pause (seconds) a failed chain job with
+// `revivals` earlier re-queues must wait after its last failure. $base and
+// $max are the parameter placeholders of the two backoff constants.
+func chainReviveCooldownSQL(revivals, base, max string) string {
+	return `(CASE WHEN ` + revivals + ` <= 0 THEN 0
+	         ELSE LEAST(` + base + `::float8 * power(2, LEAST(` + revivals + ` - 1, 30)), ` + max + `::float8) END)`
+}
+
+// reviveFailedChainSQL flips the NEWEST failed chain job of the slot back to
+// pending (attempts reset, revivals + 1) when its backoff has elapsed and no
+// active or done job holds the slot. The row keeps its id, so the batches a
+// previous attempt already paid for (gen_job_batches) are reused.
+// $1 subject, $2 test number, $3 urgent, $4 not_before, $5 owner (NULL =
+// keep), $6/$7 backoff base/max seconds.
+var reviveFailedChainSQL = `
+	UPDATE generation_jobs
+	SET status = 'pending', urgent = $3, not_before = $4,
+	    attempts = 0, last_error = '', revivals = revivals + 1,
+	    owner_user_id = COALESCE($5, owner_user_id), updated_at = now()
+	WHERE id = (
+		SELECT id FROM generation_jobs
+		WHERE kind = 'chain' AND subject_id = $1 AND test_number = $2
+		  AND status = 'failed'
+		ORDER BY id DESC LIMIT 1)
+	  AND status = 'failed'
+	  AND updated_at <= now() - make_interval(secs => ` + chainReviveCooldownSQL("revivals", "$6", "$7") + `)
+	  AND NOT EXISTS (
+		SELECT 1 FROM generation_jobs
+		WHERE kind = 'chain' AND subject_id = $1 AND test_number = $2
+		  AND status IN ('pending','running','done'))`
+
+// ChainRetryAt reports when the newest FAILED chain job of the slot may be
+// re-queued again (zero time: no failed job, or it may be re-queued now).
+func (r *GenerationRepository) ChainRetryAt(ctx context.Context, subjectID int64, testNumber int) (time.Time, error) {
+	var at *time.Time
+	err := r.pool.QueryRow(ctx, `
+		SELECT CASE WHEN until > now() THEN until END
+		FROM (
+			SELECT updated_at + make_interval(secs => `+chainReviveCooldownSQL("revivals", "$3", "$4")+`) AS until
+			FROM generation_jobs
+			WHERE kind = 'chain' AND subject_id = $1 AND test_number = $2 AND status = 'failed'
+			ORDER BY id DESC LIMIT 1) f`,
+		subjectID, testNumber, ChainReviveBaseBackoff.Seconds(), ChainReviveMaxBackoff.Seconds()).Scan(&at)
+	if errors.Is(err, pgx.ErrNoRows) || at == nil {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	return *at, nil
+}
+
 // EnqueueChainJob registers a job to generate chain test number testNumber
 // of the subject. Idempotent: the partial unique index on
 // (subject_id, test_number) for active jobs makes duplicates a no-op.
 // urgent jobs bypass the off-peak deferral (the user is waiting for this
 // test); ownerUserID carries whose knowledge marks the generator should
-// personalise against (0 = none). Returns true when a NEW job row was
-// inserted.
+// personalise against (0 = none). Returns true when a job was queued
+// (a NEW row, or a failed row revived).
 //
 // When an active (pending/running) job for the same test already exists and
 // the new request is urgent while the existing job is NOT (it was deferred
@@ -325,12 +390,32 @@ func (r *GenerationRepository) DeletePersonalTest(ctx context.Context, userID, t
 // off-peak window in ⏳ «Минуточку...» — hours for a test they can already
 // open. A 'done' row is never touched: the conflict update's WHERE clause
 // excludes it, so the unique index keeps blocking a paid regeneration.
+//
+// A slot whose last job FAILED (all attempts spent) is not given a fresh
+// row: the failed job itself is revived — keeping the batches it already
+// paid for — and only once its backoff has elapsed (ChainReviveBaseBackoff).
+// While the backoff runs nothing is queued and false is returned.
 func (r *GenerationRepository) EnqueueChainJob(ctx context.Context, subjectID int64, testNumber int, notBefore time.Time, urgent bool, ownerUserID int64) (bool, error) {
 	var owner any
 	if ownerUserID > 0 {
 		owner = ownerUserID
 	}
-	tag, err := r.pool.Exec(ctx, `
+	tag, err := r.pool.Exec(ctx, reviveFailedChainSQL, subjectID, testNumber, urgent, notBefore, owner,
+		ChainReviveBaseBackoff.Seconds(), ChainReviveMaxBackoff.Seconds())
+	if err != nil {
+		return false, err
+	}
+	if tag.RowsAffected() > 0 {
+		notifyQueue(ctx, r.pool, ChannelGenJobs)
+		return true, nil
+	}
+	// A failed job still in its backoff: do not start a new paid round.
+	if at, err := r.ChainRetryAt(ctx, subjectID, testNumber); err != nil {
+		return false, err
+	} else if !at.IsZero() {
+		return false, nil
+	}
+	tag, err = r.pool.Exec(ctx, `
 		INSERT INTO generation_jobs (kind, subject_id, test_number, not_before, urgent, owner_user_id)
 		VALUES ('chain', $1, $2, $3, $4, $5)
 		ON CONFLICT (subject_id, test_number) WHERE kind = 'chain' AND status IN ('pending','running')
@@ -350,16 +435,10 @@ func (r *GenerationRepository) EnqueueChainJob(ctx context.Context, subjectID in
 // EnqueueChainJobNow is EnqueueChainJob with not_before = now() and
 // urgent = true: the job is due immediately, ignoring the off-peak
 // deferral. Used to bootstrap the chain (Тест 1) on a fresh database so the
-// user never faces an empty grid.
+// user never faces an empty grid. It goes through EnqueueChainJob, so a
+// Тест 1 whose generation keeps failing is not re-queued on every restart.
 func (r *GenerationRepository) EnqueueChainJobNow(ctx context.Context, subjectID int64, testNumber int) (bool, error) {
-	tag, err := r.pool.Exec(ctx, `
-		INSERT INTO generation_jobs (kind, subject_id, test_number, not_before, urgent)
-		VALUES ('chain', $1, $2, now(), TRUE)
-		ON CONFLICT DO NOTHING`, subjectID, testNumber)
-	if err == nil && tag.RowsAffected() > 0 {
-		notifyQueue(ctx, r.pool, ChannelGenJobs)
-	}
-	return tag.RowsAffected() > 0, err
+	return r.EnqueueChainJob(ctx, subjectID, testNumber, time.Now(), true, 0)
 }
 
 // EnqueuePersonalJob registers an URGENT job to generate the user's personal
@@ -427,7 +506,7 @@ func (r *GenerationRepository) ReviveChainJob(ctx context.Context, subjectID int
 	// subject). Such orphaned rows are released by parking them as 'failed'.
 	if _, err := tx.Exec(ctx, `
 		UPDATE generation_jobs j
-		SET status = 'failed', last_error = 'test missing: released', updated_at = now()
+		SET status = 'failed', last_error = 'test missing: released', revivals = 0, updated_at = now()
 		WHERE j.kind = 'chain' AND j.subject_id = $1 AND j.test_number = $2
 		  AND j.status = 'done'
 		  AND (j.test_id IS NULL OR NOT EXISTS (
@@ -438,22 +517,10 @@ func (r *GenerationRepository) ReviveChainJob(ctx context.Context, subjectID int
 
 	// Revive exactly ONE failed row (the newest), and only when no active
 	// or done job holds the unique slot — reviving several rows (or one
-	// next to an active job) violated idx_genjobs_chain_unique.
-	tag, err := tx.Exec(ctx, `
-		UPDATE generation_jobs
-		SET status = 'pending', urgent = TRUE, not_before = now(),
-		    attempts = 0, last_error = '', owner_user_id = COALESCE($3, owner_user_id),
-		    updated_at = now()
-		WHERE id = (
-			SELECT id FROM generation_jobs
-			WHERE kind = 'chain' AND subject_id = $1 AND test_number = $2
-			  AND status = 'failed'
-			ORDER BY id DESC LIMIT 1)
-		  AND NOT EXISTS (
-			SELECT 1 FROM generation_jobs
-			WHERE kind = 'chain' AND subject_id = $1 AND test_number = $2
-			  AND status IN ('pending','running','done'))`,
-		subjectID, testNumber, owner)
+	// next to an active job) violated idx_genjobs_chain_unique — and only
+	// when its backoff has elapsed (ChainReviveBaseBackoff).
+	tag, err := tx.Exec(ctx, reviveFailedChainSQL, subjectID, testNumber, true, time.Now(), owner,
+		ChainReviveBaseBackoff.Seconds(), ChainReviveMaxBackoff.Seconds())
 	if err != nil {
 		return false, err
 	}

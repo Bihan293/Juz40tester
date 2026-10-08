@@ -9,6 +9,7 @@ import (
 	"log"
 	mrand "math/rand"
 	"sync"
+	"time"
 
 	"github.com/Bihan293/Juz40tester/internal/models"
 	"github.com/Bihan293/Juz40tester/internal/repositories"
@@ -270,7 +271,10 @@ func (s *QuizService) GetSubjectScreen(ctx context.Context, userID, subjectID in
 	// Self-healing only: when a test the user CAN ALREADY OPEN is missing
 	// (a generation failed earlier and left a hole in the chain), it is
 	// re-queued URGENTLY — the user must never wait for a test they are
-	// allowed to open. This is a recovery path, not pre-generation.
+	// allowed to open. This is a recovery path, not pre-generation. A test
+	// whose generation already FAILED is re-queued only after its backoff
+	// (repositories.ChainReviveBaseBackoff): opening the screen again and
+	// again must not start a new round of paid attempts every time.
 	if s.genSvc != nil && s.genSvc.Enabled() {
 		byNumber0 := make(map[int]bool, len(chain))
 		for _, t := range chain {
@@ -478,7 +482,7 @@ type CompletionOutcome struct {
 // trigger a (paid) generation — otherwise any Тест 50/100 could be
 // generated on demand.
 func (s *QuizService) ReviveChainTest(ctx context.Context, subjectID int64, testNumber int, userID int64) {
-	_, _ = s.ChainTestOrRevive(ctx, subjectID, testNumber, userID)
+	_, _, _ = s.ChainTestOrRevive(ctx, subjectID, testNumber, userID)
 }
 
 // ChainTestOrRevive is the ⏳ tap in ONE pass (A5): it returns chain test
@@ -486,42 +490,45 @@ func (s *QuizService) ReviveChainTest(ctx context.Context, subjectID int64, test
 // generation (same unlock guard as before) and returns nil. It replaces
 // ReviveChainTest + ChainTestStatus, which listed the chain twice, re-checked
 // the test inside the generator and re-read the job status nobody used.
-func (s *QuizService) ChainTestOrRevive(ctx context.Context, subjectID int64, testNumber int, userID int64) (*models.Test, error) {
+//
+// retryAt is non-zero when the test's generation failed recently and its
+// backoff is still running: nothing was queued, a retry is possible only
+// after retryAt (the handler tells the user instead of a fake «генерируется»).
+func (s *QuizService) ChainTestOrRevive(ctx context.Context, subjectID int64, testNumber int, userID int64) (test *models.Test, retryAt time.Time, err error) {
 	if testNumber < 1 {
-		return nil, nil
+		return nil, time.Time{}, nil
 	}
 	chain, err := s.subjects.ListChainTests(ctx, subjectID)
 	if err != nil {
 		log.Printf("revive chain test: list subject %d: %v", subjectID, err)
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	for i := range chain {
 		if chain[i].TestNumber == testNumber {
-			return &chain[i], nil
+			return &chain[i], time.Time{}, nil
 		}
 	}
 	// The chain list may be cached — a point query sees a test generated
 	// a moment ago.
 	if id, err := s.gen.ChainTestID(ctx, subjectID, testNumber); err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	} else if id > 0 {
-		return &models.Test{ID: id, SubjectID: subjectID, TestNumber: testNumber, Kind: models.TestKindChain, IsActive: true}, nil
+		return &models.Test{ID: id, SubjectID: subjectID, TestNumber: testNumber, Kind: models.TestKindChain, IsActive: true}, time.Time{}, nil
 	}
 	if s.genSvc == nil {
-		return nil, nil
+		return nil, time.Time{}, nil
 	}
 	unlocked, err := s.unlockedMax(ctx, userID, subjectID, chain)
 	if err != nil {
 		log.Printf("revive chain test: unlocked subject %d user %d: %v", subjectID, userID, err)
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	if testNumber > unlocked {
 		log.Printf("revive chain test: refused subject %d test %d for user %d (unlocked up to %d)",
 			subjectID, testNumber, userID, unlocked)
-		return nil, nil
+		return nil, time.Time{}, nil
 	}
-	s.genSvc.reviveChainTest(ctx, subjectID, testNumber, userID)
-	return nil, nil
+	return nil, s.genSvc.reviveChainTest(ctx, subjectID, testNumber, userID), nil
 }
 
 // WeakMenu returns, in ONE topic-stats query (+ the subject list and one

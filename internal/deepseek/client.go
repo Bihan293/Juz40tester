@@ -92,6 +92,15 @@ var prices = map[string]pricePerToken{
 	"deepseek-reasoner": {inHit: 0.14e-6, inMiss: 0.55e-6, out: 2.19e-6},
 }
 
+type usageHookKey struct{}
+
+// WithUsageHook returns a context whose DeepSeek calls report the token
+// usage of every successful reply to fn (the generator adds it to the
+// per-job statistics, which otherwise counted only the free Groq tokens).
+func WithUsageHook(ctx context.Context, fn func(prompt, completion int)) context.Context {
+	return context.WithValue(ctx, usageHookKey{}, fn)
+}
+
 // Client calls the DeepSeek chat completions API.
 type Client struct {
 	apiKey        string
@@ -468,6 +477,9 @@ func (c *Client) call(ctx context.Context, model string, messages []Message, tem
 	// with an estimated price, plus the running session total. This is the
 	// early-warning system against runaway spend.
 	if cr.Usage != nil {
+		if fn, ok := ctx.Value(usageHookKey{}).(func(prompt, completion int)); ok && fn != nil {
+			fn(cr.Usage.PromptTokens, cr.Usage.CompletionTokens)
+		}
 		off, peak := estimateCost(model, cr.Usage)
 		if c.budget != nil {
 			actual := peak
