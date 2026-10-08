@@ -63,6 +63,7 @@ const bankCandidatesSQL = `
 		LEFT JOIN user_question_progress p ON p.user_id = $2 AND p.question_id = q.id
 		WHERE q.subject_id = $1
 		  AND q.quality_checked_at IS NOT NULL
+		  AND q.quality_attempts < $6
 		  AND (p.question_id IS NULL OR p.status = 0)
 		  AND lower(btrim(q.question_text)) NOT IN (SELECT t FROM seen)
 		ORDER BY lower(btrim(q.question_text)), md5($5::text || ':' || q.id::text)
@@ -74,6 +75,11 @@ const bankCandidatesSQL = `
 	SELECT c.id, c.topic_key FROM c JOIN quota ON quota.topic_key = c.topic_key
 	WHERE c.rn <= quota.n
 	ORDER BY md5($5::text || '/' || c.id::text)`
+
+// QualityGiveUpAttempts: after this many failed repairs of a flagged
+// question the quality sweep stops trying (NoteQualityAttempt stamps it as
+// checked). Such a question still fails the audit.
+const QualityGiveUpAttempts = 3
 
 // BankShortage is a topic whose bank quota could not be filled for the user
 // (B4b): Missing questions are lacking.
@@ -107,7 +113,7 @@ func (r *GenerationRepository) BankCandidates(ctx context.Context, subjectID, us
 		keys = append(keys, k)
 		ns = append(ns, int32(quota[k]))
 	}
-	rows, err := r.pool.Query(ctx, bankCandidatesSQL, subjectID, userID, keys, ns, seed)
+	rows, err := r.pool.Query(ctx, bankCandidatesSQL, subjectID, userID, keys, ns, seed, QualityGiveUpAttempts)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -188,8 +194,8 @@ func (r *GenerationRepository) createBankPersonalTest(ctx context.Context, subje
 		SELECT $1, q.id, u.ord
 		FROM unnest($2::bigint[]) WITH ORDINALITY AS u(qid, ord)
 		JOIN questions q ON q.id = u.qid
-		WHERE q.subject_id = $3 AND q.quality_checked_at IS NOT NULL`,
-		testID, questionIDs, subjectID)
+		WHERE q.subject_id = $3 AND q.quality_checked_at IS NOT NULL AND q.quality_attempts < $4`,
+		testID, questionIDs, subjectID, QualityGiveUpAttempts)
 	if err != nil {
 		return nil, err
 	}

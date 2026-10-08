@@ -259,7 +259,7 @@ const (
 	sweepScanLimit = 300
 	// sweepMaxQuestionAttempts: after this many failed repairs a question is
 	// left as is (logged) — the sweep must not spend money on it forever.
-	sweepMaxQuestionAttempts = 3
+	sweepMaxQuestionAttempts = repositories.QualityGiveUpAttempts
 	// sweepBusyPostpone: a flagged question that is on screen in an
 	// unfinished attempt is skipped by the sweep for this long (no AI call).
 	sweepBusyPostpone = 6 * time.Hour
@@ -392,7 +392,8 @@ func (g *GeneratorService) RunQualitySweep(ctx context.Context) (int, error) {
 				}
 				if errors.Is(err, repositories.ErrQuestionShared) {
 					// R-8b: shared by several clones — never rewrite in place.
-					if err := g.gen.MarkQuestionsChecked(ctx, []int64{q.ID}); err != nil {
+					// Given up (not "clean"): the bank must not hand it out.
+					if err := g.gen.GiveUpQualityCheck(ctx, q.ID); err != nil {
 						return repaired, err
 					}
 					log.Printf("quality sweep: question %d is shared by several tests — left as is", q.ID)

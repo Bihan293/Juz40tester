@@ -933,6 +933,18 @@ func (r *GenerationRepository) NoteQualityAttempt(ctx context.Context, id int64,
 	return err
 }
 
+// GiveUpQualityCheck stamps a flagged question that can not be repaired
+// (e.g. shared by several tests) as checked AND as given up
+// (quality_attempts = QualityGiveUpAttempts): the sweep stops paying for
+// it, and the question bank does not hand it out (it still fails the audit).
+func (r *GenerationRepository) GiveUpQualityCheck(ctx context.Context, id int64) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE questions
+		SET quality_attempts = GREATEST(quality_attempts, $2), quality_checked_at = now()
+		WHERE id = $1`, id, QualityGiveUpAttempts)
+	return err
+}
+
 // questionBusySQL: the question is on screen (unanswered) in an
 // in-progress attempt.
 const questionBusySQL = `

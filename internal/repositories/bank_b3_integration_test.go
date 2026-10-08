@@ -208,3 +208,34 @@ func TestBankAssemblyDedupesClonedContent(t *testing.T) {
 		t.Fatalf("links=%d distinct=%d solved=%d", links, distinct, solved)
 	}
 }
+
+// TestBankSkipsGivenUpQuestions: a flagged question the quality sweep gave
+// up on is stamped as checked only to stop paying for repairs — it still
+// fails the audit and must never be handed out by the bank.
+func TestBankSkipsGivenUpQuestions(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	gen := NewGenerationRepository(pool)
+	keys := []string{"г1"}
+	sid := bankFixture(t, ctx, pool, "Банк брак", keys, 3)
+	var bad int64
+	if err := pool.QueryRow(ctx, `SELECT MIN(id) FROM questions WHERE subject_id = $1`, sid).Scan(&bad); err != nil {
+		t.Fatal(err)
+	}
+	if err := gen.GiveUpQualityCheck(ctx, bad); err != nil {
+		t.Fatal(err)
+	}
+	u := bankUser(t, ctx, pool, 9)
+	_, missing, err := gen.AssembleBankPersonalTest(ctx, sid, u.ID, keys, keys, 3, "x")
+	if err != nil || len(missing) != 1 || missing[0].Missing != 1 {
+		t.Fatalf("given-up question counted as bank material: missing=%v err=%v", missing, err)
+	}
+	test, _, err := gen.AssembleBankPersonalTest(ctx, sid, u.ID, keys, keys, 2, "x")
+	if err != nil || test == nil {
+		t.Fatalf("assemble 2: %v %v", test, err)
+	}
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM test_questions WHERE test_id = $1 AND question_id = $2`, test.ID, bad).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("given-up question linked: %d %v", n, err)
+	}
+}
