@@ -155,3 +155,56 @@ func TestBankQuota(t *testing.T) {
 		}
 	}
 }
+
+// TestBankAssemblyDedupesClonedContent: template clones store identical
+// questions as separate rows. The bank must never put the same question
+// into one test twice, nor hand out (on a clone row) a question the user
+// already solved on another row.
+func TestBankAssemblyDedupesClonedContent(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	gen := NewGenerationRepository(pool)
+	keys := []string{"д1"}
+	// 4 distinct questions, each stored 3 times (source test + 2 clones).
+	sid := bankFixture(t, ctx, pool, "Банк дубли", keys, 4)
+	for c := 0; c < 2; c++ {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO questions (subject_id, question_text, option_a, option_b, option_c, option_d,
+			                       correct_answer, topic, difficulty, quality_checked_at, topic_key)
+			SELECT subject_id, question_text, option_a, option_b, option_c, option_d,
+			       correct_answer, topic, difficulty, now(), topic_key
+			FROM questions WHERE subject_id = $1 AND id IN (
+				SELECT MIN(id) FROM questions WHERE subject_id = $1 GROUP BY question_text)`, sid); err != nil {
+			t.Fatal(err)
+		}
+	}
+	u := bankUser(t, ctx, pool, 7)
+	// The user solved «д1 q0» on its ORIGINAL row.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO user_question_progress (user_id, question_id, status)
+		SELECT $1, MIN(id), 2 FROM questions WHERE subject_id = $2 AND question_text = 'д1 q0'`, u.ID, sid); err != nil {
+		t.Fatal(err)
+	}
+
+	// Only 3 distinct unseen questions exist — a quota of 4 is short by 1
+	// (by id there would be 11 "unseen" rows).
+	_, missing, err := gen.AssembleBankPersonalTest(ctx, sid, u.ID, keys, keys, 4, "x")
+	if err != nil || len(missing) != 1 || missing[0].Missing != 1 {
+		t.Fatalf("missing=%v err=%v (cloned rows must not count as distinct questions)", missing, err)
+	}
+	test, missing, err := gen.AssembleBankPersonalTest(ctx, sid, u.ID, keys, keys, 3, "x")
+	if err != nil || test == nil || len(missing) != 0 {
+		t.Fatalf("assemble 3: test=%v missing=%v err=%v", test, missing, err)
+	}
+	var links, distinct, solved int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*), COUNT(DISTINCT q.question_text),
+		       COUNT(*) FILTER (WHERE q.question_text = 'д1 q0')
+		FROM test_questions tq JOIN questions q ON q.id = tq.question_id WHERE tq.test_id = $1`,
+		test.ID).Scan(&links, &distinct, &solved); err != nil {
+		t.Fatal(err)
+	}
+	if links != 3 || distinct != 3 || solved != 0 {
+		t.Fatalf("links=%d distinct=%d solved=%d", links, distinct, solved)
+	}
+}

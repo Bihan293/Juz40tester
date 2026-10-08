@@ -41,18 +41,35 @@ func BankQuota(topicKeys []string, total int) map[string]int {
 // rows), while different weak-topic sets still get differently shuffled
 // selections. Users who have already seen some questions simply get the
 // next unseen ones of the same permutation.
+//
+// The bank is de-duplicated by CONTENT (normalised question text): template
+// clones (personal and chain) store identical questions as separate rows,
+// so selecting by id alone could put the same question into one test twice
+// and hand a question the user already solved (🟡/🟢) on another row out
+// again as "unseen". Exactly one row per text is a candidate, and a text the
+// user has progress > 🔴 on (on any row) is excluded.
 const bankCandidatesSQL = `
 	WITH quota AS (
 		SELECT * FROM unnest($3::text[], $4::int[]) AS t(topic_key, n)
-	), c AS (
-		SELECT q.id, q.topic_key,
-		       row_number() OVER (PARTITION BY q.topic_key ORDER BY md5($5::text || ':' || q.id::text)) AS rn
+	), seen AS (
+		SELECT DISTINCT lower(btrim(sq.question_text)) AS t
+		FROM user_question_progress sp
+		JOIN questions sq ON sq.id = sp.question_id
+		WHERE sp.user_id = $2 AND sp.status > 0 AND sq.subject_id = $1
+	), u AS (
+		SELECT DISTINCT ON (lower(btrim(q.question_text))) q.id, q.topic_key
 		FROM questions q
 		JOIN quota ON quota.topic_key = q.topic_key
 		LEFT JOIN user_question_progress p ON p.user_id = $2 AND p.question_id = q.id
 		WHERE q.subject_id = $1
 		  AND q.quality_checked_at IS NOT NULL
 		  AND (p.question_id IS NULL OR p.status = 0)
+		  AND lower(btrim(q.question_text)) NOT IN (SELECT t FROM seen)
+		ORDER BY lower(btrim(q.question_text)), md5($5::text || ':' || q.id::text)
+	), c AS (
+		SELECT u.id, u.topic_key,
+		       row_number() OVER (PARTITION BY u.topic_key ORDER BY md5($5::text || ':' || u.id::text)) AS rn
+		FROM u
 	)
 	SELECT c.id, c.topic_key FROM c JOIN quota ON quota.topic_key = c.topic_key
 	WHERE c.rn <= quota.n
