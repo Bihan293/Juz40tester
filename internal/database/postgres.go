@@ -135,8 +135,12 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, migrationLockKey)
 	}()
 
+	// Everything below runs on the SAME connection that holds the lock:
+	// with a pool of one connection (pool_max_conns=1 in the URL wins over
+	// the size MigrateURL asks for) a second connection never came and the
+	// start hung forever on the first migration.
 	// Create migration tracking table.
-	if _, err := pool.Exec(ctx, `
+	if _, err := conn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			version BIGINT PRIMARY KEY,
 			applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -189,7 +193,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	for _, version := range versions {
 		var applied bool
 
-		err := pool.QueryRow(
+		err := conn.QueryRow(
 			ctx,
 			`SELECT EXISTS(
 				SELECT 1
@@ -222,7 +226,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		}
 
 		// Start transaction.
-		tx, err := pool.Begin(ctx)
+		tx, err := conn.Begin(ctx)
 		if err != nil {
 			return fmt.Errorf(
 				"begin migration %d: %w",
