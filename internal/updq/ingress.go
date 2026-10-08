@@ -34,6 +34,11 @@ type Ingress struct {
 	// OnEnqueued (optional) is called after a new update was stored (ROLE=all
 	// wakes its in-process consumer without waiting for the NOTIFY).
 	OnEnqueued func()
+	// PreCheckout (optional) answers a pre_checkout_query synchronously,
+	// BEFORE the queue: Telegram gives the bot 10 s, and in the queue the
+	// query would wait behind the user's earlier updates (per-user order)
+	// and the backlog. Set on every role that serves the webhook.
+	PreCheckout func(ctx context.Context, q *bot.PreCheckoutQuery)
 
 	closing atomic.Bool
 	errLast atomic.Int64
@@ -75,6 +80,11 @@ func (in *Ingress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+	if upd.PreCheckoutQuery != nil && in.PreCheckout != nil {
+		AnswerPreCheckoutNow(r.Context(), &upd, in.PreCheckout)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), enqueueTimeout)
 	defer cancel()
 	inserted, err := in.q.Enqueue(ctx, upd.UpdateID, key, body)
@@ -100,6 +110,20 @@ func (in *Ingress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(http.StatusOK)
 	}
+}
+
+// PreCheckoutTimeout bounds the synchronous answer of a pre_checkout_query
+// (Telegram's own limit is 10 s).
+const PreCheckoutTimeout = 8 * time.Second
+
+// AnswerPreCheckoutNow runs the fast path of a pre_checkout_query: answered
+// at once with its own deadline, detached from the webhook request (a
+// dropped connection must not cancel the answer).
+func AnswerPreCheckoutNow(ctx context.Context, upd *bot.Update, answer func(context.Context, *bot.PreCheckoutQuery)) {
+	actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), PreCheckoutTimeout)
+	defer cancel()
+	metrics.Inc(MetricEnqueued, "result", "pre_checkout_direct")
+	answer(actx, upd.PreCheckoutQuery)
 }
 
 func (in *Ingress) logErr(msg string) {

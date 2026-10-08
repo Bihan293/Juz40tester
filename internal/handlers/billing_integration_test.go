@@ -206,6 +206,17 @@ func TestSubscriptionFlowThroughHandler(t *testing.T) {
 	if !pre(10) || pre(1) {
 		t.Fatal("pre-checkout answers")
 	}
+	// The fast path of the webhook (AnswerPreCheckout, outside the update
+	// queues) validates exactly like the queued path.
+	direct := func(amount int, payload string) bool {
+		n := f.n()
+		h.AnswerPreCheckout(ctx, &bot.PreCheckoutQuery{ID: "pd", From: from, Currency: "XTR", TotalAmount: amount, InvoicePayload: payload})
+		c := findCall(f.since(n), "answerPreCheckoutQuery", "")
+		return c != nil && c.p["ok"] == true
+	}
+	if !direct(10, "sub:plus") || direct(1, "sub:plus") || direct(10, "bogus") {
+		t.Fatal("pre-checkout fast path answers")
+	}
 	// 7. successful_payment activates Plus; a re-delivery changes nothing.
 	pay := &bot.Update{UpdateID: 2, Message: &bot.Message{MessageID: 3, From: from, Chat: chat, SuccessfulPayment: &bot.SuccessfulPayment{
 		Currency: "XTR", TotalAmount: 10, InvoicePayload: "sub:plus", TelegramPaymentChargeID: fmt.Sprintf("hc%d", tgID),

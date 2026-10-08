@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Bihan293/Juz40tester/internal/bot"
+	"github.com/Bihan293/Juz40tester/internal/config"
 )
 
 // postSeq makes every well-formed test update unique: the dispatcher drops
@@ -329,5 +331,54 @@ func TestUpdateWorkersReserveFollowsBackgroundWork(t *testing.T) {
 	}
 	if got := updateWorkersFor(20, 3); got != 12 {
 		t.Fatalf("the reserve never drops below 8: %d", got)
+	}
+}
+
+// ROLE=all + memory: a pre_checkout_query is answered in the webhook
+// request even when every worker is busy and the queue is full — it would
+// otherwise wait (or get 503) past Telegram's 10 s.
+func TestWebhookPreCheckoutFastPath(t *testing.T) {
+	release := make(chan struct{})
+	d := newUpdateDispatcher("", 1, 1, time.Minute, func(context.Context, *bot.Update) { <-release })
+	var answered atomic.Int32
+	d.preCheckout = func(_ context.Context, q *bot.PreCheckoutQuery) {
+		if q.ID == "pq" {
+			answered.Add(1)
+		}
+	}
+	postRaw(d, `{"update_id":1,"message":{"message_id":1,"from":{"id":1},"chat":{"id":1,"type":"private"},"text":"a"}}`, "")
+	postRaw(d, `{"update_id":2,"message":{"message_id":2,"from":{"id":1},"chat":{"id":1,"type":"private"},"text":"b"}}`, "")
+	if code := postRaw(d, `{"update_id":3,"pre_checkout_query":{"id":"pq","from":{"id":1},"currency":"XTR","total_amount":10,"invoice_payload":"sub:plus"}}`, ""); code != http.StatusOK {
+		t.Fatalf("pre-checkout with a busy queue: HTTP %d, want 200", code)
+	}
+	if answered.Load() != 1 {
+		t.Fatalf("pre-checkout answered %d time(s), want 1 (synchronously)", answered.Load())
+	}
+	// A re-delivery of the same update is a duplicate — not answered twice.
+	postRaw(d, `{"update_id":3,"pre_checkout_query":{"id":"pq","from":{"id":1}}}`, "")
+	if answered.Load() != 1 {
+		t.Fatalf("duplicate pre-checkout answered again")
+	}
+	close(release)
+	_ = d.Shutdown(context.Background())
+}
+
+// ROLE=web has no update handler: its payment-check handler refuses every
+// payment when subscriptions are off (same as the worker) and answers.
+func TestPreCheckoutHandlerWebRoleSubscriptionsOff(t *testing.T) {
+	var gotOK atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/answerPreCheckoutQuery") {
+			var p map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&p)
+			gotOK.Store(p["ok"])
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	defer srv.Close()
+	h := newPreCheckoutHandler(&config.Config{}, nil, bot.NewClient("T").WithBaseURL(srv.URL))
+	h.AnswerPreCheckout(context.Background(), &bot.PreCheckoutQuery{ID: "x", From: &bot.TgUser{ID: 5}, Currency: "XTR", TotalAmount: 10, InvoicePayload: "sub:plus"})
+	if v := gotOK.Load(); v != false {
+		t.Fatalf("answer ok = %v, want false", v)
 	}
 }

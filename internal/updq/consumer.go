@@ -18,9 +18,12 @@ const (
 	MetricProcessed = "tg_updates_processed_total" // label result=ok|retry|dead|dropped|released
 	MetricReaped    = "tg_updates_reaped_total"    // label result=requeued|dead
 	MetricEnqueued  = "tg_updates_enqueued_total"  // label result=new|duplicate|full|error|ignored
-	GaugePending    = "tg_update_queue_pending"
-	GaugeProcessing = "tg_update_queue_processing"
-	GaugeDead       = "tg_update_queue_dead"
+	// MetricPaymentDead counts successful_payment updates that ended in the
+	// dead letters (a charged payment that was never applied).
+	MetricPaymentDead = "tg_payment_updates_dead_total"
+	GaugePending      = "tg_update_queue_pending"
+	GaugeProcessing   = "tg_update_queue_processing"
+	GaugeDead         = "tg_update_queue_dead"
 )
 
 // ConsumerConfig configures a Consumer.
@@ -228,6 +231,12 @@ func (c *Consumer) process(it Item) {
 	})
 	if dead {
 		metrics.Inc(MetricProcessed, "result", "dead")
+		if m := upd.Message; m != nil && m.SuccessfulPayment != nil {
+			// The user paid and nothing was applied: never lose it silently.
+			metrics.Inc(MetricPaymentDead)
+			log.Printf("PAYMENT NOT APPLIED: update %d (tg user %d, charge %s, payload %q) moved to dead letters after %d attempt(s): %v — apply it by hand or refund it",
+				it.UpdateID, it.UserKey, m.SuccessfulPayment.TelegramPaymentChargeID, m.SuccessfulPayment.InvoicePayload, it.Attempts, herr)
+		}
 		log.Printf("update queue: update %d (user %d) moved to dead letters after %d attempt(s): %v",
 			it.UpdateID, it.UserKey, it.Attempts, herr)
 	} else {
