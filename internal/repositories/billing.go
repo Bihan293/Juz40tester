@@ -420,15 +420,27 @@ func scanPayments(rows pgx.Rows) ([]Payment, error) {
 }
 
 // MarkRefunded records a completed refund (idempotent). changed = this
-// call did the transition.
+// call did the transition. When the refunded payment is the one the
+// user's current subscription was bought / renewed with (an admin
+// /refund), that plan ends now — exactly like a refund Telegram reports
+// itself (OnExternalRefund): the Stars are back, so the paid access must
+// not stay. Refunds of payments that bought nothing (stale / duplicate
+// subscription payments) do not touch the subscription.
 func (r *BillingRepository) MarkRefunded(ctx context.Context, chargeID string) (bool, error) {
-	tag, err := r.pool.Exec(ctx, `
-		UPDATE payments SET status = 'refunded', refunded_at = now(), last_error = ''
-		WHERE charge_id = $1 AND status <> 'refunded'`, chargeID)
-	if err != nil {
-		return false, err
-	}
-	return tag.RowsAffected() == 1, nil
+	var changed bool
+	err := r.pool.QueryRow(ctx, `
+		WITH p AS (
+			UPDATE payments SET status = 'refunded', refunded_at = now(), last_error = ''
+			WHERE charge_id = $1 AND status <> 'refunded'
+			RETURNING user_id, kind
+		), s AS (
+			UPDATE user_subscriptions us SET status = 'revoked', expires_at = LEAST(us.expires_at, now()), updated_at = now()
+			FROM p
+			WHERE p.kind = 'subscription' AND us.user_id = p.user_id AND us.charge_id = $1 AND us.status = 'active'
+			RETURNING 1
+		)
+		SELECT EXISTS (SELECT 1 FROM p)`, chargeID).Scan(&changed)
+	return changed, err
 }
 
 // NoteRefundFailure keeps the refund pending and schedules the next try.
