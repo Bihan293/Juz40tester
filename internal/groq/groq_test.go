@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // TestPublishedLimits pins the free-tier numbers documented in
@@ -396,5 +397,16 @@ func TestClient429PerDayBlocksForAnHour(t *testing.T) {
 	}
 	if _, err := c.ChatJSON(context.Background(), req); !IsRateLimited(err) || atomic.LoadInt32(&calls) != 1 {
 		t.Fatalf("blocked model must not be called again: err=%v calls=%d", err, calls)
+	}
+}
+
+func TestAPIErrorMessageStaysValidUTF8(t *testing.T) {
+	msg := strings.Repeat("ы", 400) // 800 bytes, every rune 2 bytes
+	got := truncateUTF8("x"+msg, 500)
+	if len(got) > 500 || !utf8.ValidString(got) {
+		t.Fatalf("len=%d valid=%v", len(got), utf8.ValidString(got))
+	}
+	if truncateUTF8("short", 500) != "short" {
+		t.Fatal("short strings must be unchanged")
 	}
 }

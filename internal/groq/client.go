@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Bihan293/Juz40tester/internal/httpx"
 )
@@ -419,9 +420,7 @@ func (c *Client) do(ctx context.Context, r Request, maxTokens int, useSchema boo
 		if cr.Error != nil {
 			ae.Message, ae.Type, ae.Code = cr.Error.Message, cr.Error.Type, cr.Error.Code
 		}
-		if len(ae.Message) > 500 {
-			ae.Message = ae.Message[:500]
-		}
+		ae.Message = truncateUTF8(ae.Message, 500)
 		return nil, ae
 	}
 	if len(cr.Choices) == 0 {
@@ -458,6 +457,20 @@ func (c *Client) do(ctx context.Context, r Request, maxTokens int, useSchema boo
 		return nil, fmt.Errorf("groq: %s: empty content (finish_reason=%q)", r.Model, cr.Choices[0].FinishReason)
 	}
 	return res, nil
+}
+
+// truncateUTF8 cuts s to at most n bytes without splitting a multi-byte
+// character: a byte cut in the middle of a Cyrillic letter (Groq quotes the
+// failed model output in its 400 messages) produced invalid UTF-8, which
+// PostgreSQL then refused to store as the job's last_error.
+func truncateUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 // IsRateLimited reports whether err is a (local or remote) quota error.

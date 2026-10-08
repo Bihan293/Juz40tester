@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -707,8 +709,28 @@ func (r *GenerationRepository) FailJob(ctx context.Context, jobID int64, jobErr 
 		    not_before = CASE WHEN attempts >= $2 THEN not_before ELSE now() + make_interval(secs => $4) END,
 		    updated_at = now()
 		WHERE id = $1`,
-		jobID, maxAttempts, fmt.Sprintf("%v", jobErr), durationSecs(retryDelay))
+		jobID, maxAttempts, jobErrorText(jobErr), durationSecs(retryDelay))
 	return err
+}
+
+// maxJobErrorLen caps generation_jobs.last_error (bytes): provider errors
+// may carry a whole raw response body.
+const maxJobErrorLen = 2000
+
+// jobErrorText renders a job error for last_error: valid UTF-8 (PostgreSQL
+// rejects anything else, and a provider message cut in the middle of a
+// Cyrillic letter made FailJob itself fail — the job then stayed 'running'
+// until the stuck-job reaper) and at most maxJobErrorLen bytes.
+func jobErrorText(err error) string {
+	s := strings.ToValidUTF8(fmt.Sprintf("%v", err), "\uFFFD")
+	if len(s) > maxJobErrorLen {
+		cut := maxJobErrorLen
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		s = s[:cut] + "…"
+	}
+	return s
 }
 
 // CreateGeneratedTest atomically inserts a generated test with its questions
@@ -932,6 +954,18 @@ func (r *GenerationRepository) NoteQualityAttempt(ctx context.Context, id int64,
 		SET quality_attempts = quality_attempts + 1,
 		    quality_checked_at = CASE WHEN quality_attempts + 1 >= $2 THEN now() ELSE NULL END
 		WHERE id = $1`, id, maxAttempts)
+	return err
+}
+
+// GiveUpQualityCheck stamps a flagged question that can not be repaired
+// (e.g. shared by several tests) as checked AND as given up
+// (quality_attempts = QualityGiveUpAttempts): the sweep stops paying for
+// it, and the question bank does not hand it out (it still fails the audit).
+func (r *GenerationRepository) GiveUpQualityCheck(ctx context.Context, id int64) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE questions
+		SET quality_attempts = GREATEST(quality_attempts, $2), quality_checked_at = now()
+		WHERE id = $1`, id, QualityGiveUpAttempts)
 	return err
 }
 

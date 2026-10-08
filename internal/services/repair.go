@@ -186,6 +186,9 @@ func (g *GeneratorService) rewriteQuestions(ctx context.Context, task, subjectNa
 // job is retried and the test never reaches a student); soft issues are
 // fixed when the model manages to, and tolerated otherwise.
 func (g *GeneratorService) repairFlagged(ctx context.Context, task, subjectName string, gt *generatedTest) error {
+	// budgetHit: a repair call failed on the daily DeepSeek cap — the final
+	// error wraps ErrBudgetExceeded so the job is deferred, not failed.
+	budgetHit := false
 	for round := 1; round <= repairRounds; round++ {
 		reports := auditGenerated(gt)
 		if len(reports) == 0 {
@@ -216,6 +219,9 @@ func (g *GeneratorService) repairFlagged(ctx context.Context, task, subjectName 
 			}
 			fixed, err := g.rewriteQuestions(ctx, fmt.Sprintf("%s repair r%d", task, round), subjectName, items)
 			if err != nil {
+				if errors.Is(err, deepseek.ErrBudgetExceeded) {
+					budgetHit = true
+				}
 				log.Printf("quality[%s]: repair round %d failed: %v", task, round, err)
 				continue
 			}
@@ -233,6 +239,9 @@ func (g *GeneratorService) repairFlagged(ctx context.Context, task, subjectName 
 			}
 		}
 		sort.Strings(parts)
+		if budgetHit {
+			return fmt.Errorf("%d question(s) still fail the quality audit after repair: %s: %w", n, strings.Join(parts, " | "), deepseek.ErrBudgetExceeded)
+		}
 		return fmt.Errorf("%d question(s) still fail the quality audit after repair: %s", n, strings.Join(parts, " | "))
 	}
 	if len(reports) > 0 {
@@ -250,7 +259,7 @@ const (
 	sweepScanLimit = 300
 	// sweepMaxQuestionAttempts: after this many failed repairs a question is
 	// left as is (logged) — the sweep must not spend money on it forever.
-	sweepMaxQuestionAttempts = 3
+	sweepMaxQuestionAttempts = repositories.QualityGiveUpAttempts
 	// sweepBusyPostpone: a flagged question that is on screen in an
 	// unfinished attempt is skipped by the sweep for this long (no AI call).
 	sweepBusyPostpone = 6 * time.Hour
@@ -383,7 +392,8 @@ func (g *GeneratorService) RunQualitySweep(ctx context.Context) (int, error) {
 				}
 				if errors.Is(err, repositories.ErrQuestionShared) {
 					// R-8b: shared by several clones — never rewrite in place.
-					if err := g.gen.MarkQuestionsChecked(ctx, []int64{q.ID}); err != nil {
+					// Given up (not "clean"): the bank must not hand it out.
+					if err := g.gen.GiveUpQualityCheck(ctx, q.ID); err != nil {
 						return repaired, err
 					}
 					log.Printf("quality sweep: question %d is shared by several tests — left as is", q.ID)
