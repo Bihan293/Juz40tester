@@ -130,12 +130,17 @@ func questionStems(qs []models.Question) []string {
 	return out
 }
 
-// validateNoRepeats rejects a reply that repeats a question of the previous
-// chain test, or contains two near-identical questions.
+// validateNoRepeats rejects a reply that repeats a question of an earlier
+// chain test (prevStems: the previous test and the older ones of the repeat
+// window), or contains two near-identical questions.
 func validateNoRepeats(gt *generatedTest, prevStems []string) error {
 	for i, q := range gt.Questions {
 		if j := repeatsAny(q.Text, prevStems); j >= 0 {
-			return rejectf(rejectRepeat, "question %d repeats question %d of the previous test", i+1, j+1)
+			stem := prevStems[j]
+			if r := []rune(stem); len(r) > 80 {
+				stem = string(r[:80]) + "…"
+			}
+			return rejectf(rejectRepeat, "question %d repeats a question of an earlier chain test («%s»)", i+1, stem)
 		}
 		for k := 0; k < i; k++ {
 			if similarStems(q.Text, gt.Questions[k].Text) {

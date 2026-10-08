@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Bihan293/Juz40tester/internal/bot"
 	"github.com/Bihan293/Juz40tester/internal/models"
@@ -204,8 +205,15 @@ func (h *Handler) handlePendingTest(ctx context.Context, cb *bot.CallbackQuery, 
 	}
 	// One pass (A5): the existing test, or revive/queue its generation.
 	// The test may have been generated a moment ago — open it right away.
-	if test, err := h.quiz.ChainTestOrRevive(ctx, subjectID, testNumber, user.ID); err == nil && test != nil {
+	test, retryAt, err := h.quiz.ChainTestOrRevive(ctx, subjectID, testNumber, user.ID)
+	if err == nil && test != nil {
 		h.openTest(ctx, cb, user, test.ID)
+		return
+	}
+	// The generation of this test failed recently and its retry pause is
+	// still running: nothing was queued, so do not pretend it is generating.
+	if err == nil && !retryAt.IsZero() {
+		h.answerAlert(ctx, cb, retryLaterText(testNumber, time.Until(retryAt)))
 		return
 	}
 
@@ -236,4 +244,19 @@ func (h *Handler) flipSubjectPage(ctx context.Context, cb *bot.CallbackQuery, us
 		return
 	}
 	h.editMessage(ctx, cb, text, kb)
+}
+
+// retryLaterText is the alert for a ⏳ tap on a chain test whose generation
+// failed recently (the next attempt is allowed only after a pause).
+func retryLaterText(testNumber int, wait time.Duration) string {
+	var when string
+	switch {
+	case wait < 2*time.Minute:
+		when = "через пару минут"
+	case wait < time.Hour:
+		when = fmt.Sprintf("примерно через %d мин", int(wait.Round(time.Minute)/time.Minute))
+	default:
+		when = fmt.Sprintf("примерно через %d ч", int((wait+30*time.Minute)/time.Hour))
+	}
+	return fmt.Sprintf("😔 «Тест %d» пока не удалось сгенерировать. Новая попытка — %s: загляни позже, а пока повтори уже открытые тесты.", testNumber, when)
 }

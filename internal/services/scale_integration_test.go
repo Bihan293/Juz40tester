@@ -37,6 +37,9 @@ type batchFakeAI struct {
 	failFrom int32
 	mu       sync.Mutex
 	prompts  []string
+	// override (optional) may replace the text of the first question of a
+	// reply (n = call number, user = the prompt); "" keeps it.
+	override func(n int32, user string) string
 }
 
 func (f *batchFakeAI) server(t *testing.T) *httptest.Server {
@@ -67,6 +70,11 @@ func (f *batchFakeAI) server(t *testing.T) *httptest.Server {
 					Options: []string{"первый " + keys[s%4], "второй " + keys[s%4], "третий " + keys[s%4], "четвёртый " + keys[s%4]},
 					Correct: int(s % 4), Topic: topic, Difficulty: d,
 				})
+			}
+			if f.override != nil && len(qs) > 0 {
+				if txt := f.override(n, user); txt != "" {
+					qs[0].Text = txt
+				}
 			}
 			b, _ := json.Marshal(generatedTest{Questions: qs})
 			content = string(b)
@@ -390,4 +398,56 @@ func TestPersonalQueueBackpressure(t *testing.T) {
 		t.Fatalf("A again: %v %v", pending, err)
 	}
 	_, _ = e.pool.Exec(ctx, `UPDATE generation_jobs SET status = 'failed' WHERE subject_id = $1 AND status IN ('pending','running')`, e.sid)
+}
+
+// Q3 of the test-logic audit: a new chain test must not repeat a question
+// of an OLDER chain test either (the prompt shows only the previous test,
+// so the check is local and costs no prompt tokens). Before the fix a
+// question of Тест 1 was accepted into Тест 3.
+func TestChainTestDoesNotRepeatOlderChainTests(t *testing.T) {
+	f := &batchFakeAI{}
+	e, g := scaleEnv(t, f, batchCfg())
+	g.cfg.GenBatchParallel = 1
+	ctx := context.Background()
+	gen := func(n int) int64 {
+		t.Helper()
+		job := newChainJob(t, e, n)
+		id, err := g.runJob(ctx, job)
+		if err != nil {
+			t.Fatalf("Тест %d: %v", n, err)
+		}
+		if err := e.gen.CompleteJob(ctx, job.ID, id); err != nil {
+			t.Fatal(err)
+		}
+		repositories.InvalidateChainCache(e.sid)
+		return id
+	}
+	t1 := gen(1)
+	gen(2)
+	q1, err := e.subjects.TestQuestions(ctx, t1)
+	if err != nil || len(q1) == 0 {
+		t.Fatalf("Тест 1 questions: %v", err)
+	}
+	old := q1[0].Text
+	injected := false
+	f.override = func(n int32, user string) string {
+		if !injected && strings.Contains(user, "Тест №3") {
+			injected = true
+			return old // the model repeats a question of Тест 1
+		}
+		return ""
+	}
+	t3 := gen(3)
+	if !injected {
+		t.Fatal("the repeat was never injected")
+	}
+	q3, err := e.subjects.TestQuestions(ctx, t3)
+	if err != nil || len(q3) != GeneratedQuestionsPerTest {
+		t.Fatalf("Тест 3: %d questions, %v", len(q3), err)
+	}
+	for _, q := range q3 {
+		if similarStems(q.Text, old) {
+			t.Fatalf("Тест 3 repeats a question of Тест 1: %q", q.Text)
+		}
+	}
 }
