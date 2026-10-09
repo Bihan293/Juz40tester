@@ -31,6 +31,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -357,13 +358,23 @@ func TestLoadAnswers(t *testing.T) {
 		_ = tg.Close(sctx)
 		waitTimeout(&bgWG, 5*time.Second)
 	}()
+	client := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{MaxIdleConnsPerHost: users, MaxConnsPerHost: 0}}
 	time.Sleep(500 * time.Millisecond) // let the startup loops settle
+	goroutines0 := runtime.NumGoroutine()
+	defer func() {
+		// Leak check: after the load everything transient must be gone.
+		time.Sleep(3 * time.Second)
+		client.CloseIdleConnections()
+		runtime.GC()
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		t.Logf("goroutines: %d before the load, %d after; heap in use %.1f MB", goroutines0, runtime.NumGoroutine(), float64(ms.HeapInuse)/(1<<20))
+	}()
 	t.Logf("config: users=%d rounds=%d update workers=%d DB_MAX_CONNS=%d RTT=%s TG latency=%s TG_MAX_RPS=%d",
 		users, rounds, w.updateWorkers, cfg.DBMaxConns, rtt, tgLatency, cfg.TGMaxRPS)
 
 	var updateID atomic.Int64
 	updateID.Store(time.Now().UnixNano() % 1_000_000_000)
-	client := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{MaxIdleConnsPerHost: users, MaxConnsPerHost: 0}}
 	attempt := make([]int64, users)
 	tgID := func(i int) int64 { return 7100000000 + int64(i) }
 

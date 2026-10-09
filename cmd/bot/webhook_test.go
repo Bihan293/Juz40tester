@@ -382,3 +382,16 @@ func TestPreCheckoutHandlerWebRoleSubscriptionsOff(t *testing.T) {
 		t.Fatalf("answer ok = %v, want false", v)
 	}
 }
+
+// A client that never finishes its request body must not hold a server
+// goroutine and connection forever (only ReadHeaderTimeout was set).
+func TestHTTPServerTimeoutsBounded(t *testing.T) {
+	srv := newHTTPServer(":0", http.NewServeMux())
+	if srv.ReadHeaderTimeout <= 0 || srv.ReadTimeout <= 0 || srv.WriteTimeout <= 0 || srv.IdleTimeout <= 0 {
+		t.Fatalf("unbounded server timeouts: header %s, read %s, write %s, idle %s",
+			srv.ReadHeaderTimeout, srv.ReadTimeout, srv.WriteTimeout, srv.IdleTimeout)
+	}
+	if srv.ReadTimeout > time.Minute || srv.IdleTimeout > 5*time.Minute {
+		t.Fatalf("timeouts too long: read %s, idle %s", srv.ReadTimeout, srv.IdleTimeout)
+	}
+}

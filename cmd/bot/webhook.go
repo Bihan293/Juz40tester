@@ -59,7 +59,27 @@ type updateDispatcher struct {
 	// update when our 200 got lost (timeout, deploy) — the duplicate is
 	// acknowledged without processing it twice (idempotency).
 	seen *recentIDs
+
+	// spill (optional) persists updates that were acknowledged with 200
+	// but cannot be processed before the shutdown deadline. Before, they
+	// were silently dropped: Telegram already had its 200, so the user's
+	// answer / tap was lost for good (a deploy or a restart during a busy
+	// minute lost up to the whole backlog). Spilled updates are stored in
+	// tg_update_queue and replayed by the next instance (replaySpilled).
+	spill    updateSpiller
+	spilling atomic.Bool
+	spilled  atomic.Int64 // updates handed to spill
+	dropped  atomic.Int64 // updates lost (no spill, or the spill failed and time ran out)
 }
+
+// updateSpiller stores an update for a later instance (updq.Postgres).
+type updateSpiller interface {
+	Enqueue(ctx context.Context, updateID, userKey int64, payload []byte) (bool, error)
+}
+
+// spillReserve is the part of the shutdown grace period kept for spilling
+// the not-yet-processed updates to the database.
+var spillReserve = 5 * time.Second
 
 // recentIDs is a bounded set of the last N update ids (ring buffer + map).
 type recentIDs struct {
@@ -211,12 +231,52 @@ func (d *updateDispatcher) enqueue(upd *bot.Update) enqueueResult {
 func (d *updateDispatcher) worker() {
 	defer d.wg.Done()
 	for upd := range d.queue {
+		if d.spilling.Load() && d.spillOne(upd) {
+			continue // persisted: the next instance processes it
+		}
 		if d.base.Err() != nil {
+			d.dropped.Add(1)
 			continue // forced stop: drop what is left, do not start new work
 		}
 		d.process(upd)
 	}
 }
+
+// spillOne persists one accepted-but-unprocessed update; false when it
+// could not be stored (the caller then processes it, as before).
+func (d *updateDispatcher) spillOne(upd *bot.Update) bool {
+	if d.spill == nil || upd.UpdateID == 0 {
+		return false
+	}
+	body, err := json.Marshal(upd)
+	if err != nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := d.spill.Enqueue(ctx, upd.UpdateID, upd.UserKey(), body); err != nil {
+		log.Printf("webhook: spill of update %d failed: %v", upd.UpdateID, err)
+		return false
+	}
+	d.spilled.Add(1)
+	return true
+}
+
+// enqueueReplayed puts an update spilled by an earlier instance into the
+// queue (it was acknowledged long ago — it bypasses the webhook path).
+func (d *updateDispatcher) enqueueReplayed(upd *bot.Update) enqueueResult {
+	if upd.UpdateID != 0 && !d.seen.add(upd.UpdateID) {
+		return enqueued // Telegram re-delivered it meanwhile: already queued
+	}
+	res := d.enqueue(upd)
+	if res != enqueued && upd.UpdateID != 0 {
+		d.seen.forget(upd.UpdateID)
+	}
+	return res
+}
+
+// freeSlots is how many updates the queue can take right now.
+func (d *updateDispatcher) freeSlots() int { return cap(d.queue) - len(d.queue) }
 
 func (d *updateDispatcher) process(upd *bot.Update) {
 	defer func() {
@@ -251,6 +311,33 @@ func (d *updateDispatcher) Shutdown(ctx context.Context) error {
 		d.wg.Wait()
 		close(done)
 	}()
+	defer func() {
+		if n := d.spilled.Load(); n > 0 {
+			log.Printf("shutdown: %d acknowledged update(s) saved to tg_update_queue — the next instance processes them", n)
+		}
+		if n := d.dropped.Load(); n > 0 {
+			log.Printf("shutdown: %d acknowledged update(s) were DROPPED unprocessed", n)
+		}
+	}()
+	if d.spill != nil {
+		// Process locally while there is time; spillReserve before the
+		// deadline every update not started yet is persisted instead.
+		var spillAt <-chan time.Time
+		if dl, ok := ctx.Deadline(); ok {
+			t := time.NewTimer(max(time.Until(dl)-spillReserve, 0))
+			defer t.Stop()
+			spillAt = t.C
+		}
+		select {
+		case <-done:
+			d.cancelBase()
+			return nil
+		case <-spillAt:
+			d.spilling.Store(true)
+		case <-ctx.Done():
+			d.spilling.Store(true)
+		}
+	}
 	select {
 	case <-done:
 		d.cancelBase()
