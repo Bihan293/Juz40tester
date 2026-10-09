@@ -85,17 +85,70 @@ func TestLimiterContextCancelStopsWait(t *testing.T) {
 	}
 }
 
-// TestLimiter429PausesAll: a 429 pauses the limiter for other chats too.
-func TestLimiter429PausesAll(t *testing.T) {
+// TestLimiter429PerChatDoesNotPauseOthers: a lone 429 is per-chat flood
+// control — the chat itself waits retry_after, the other chats do not.
+func TestLimiter429PerChatDoesNotPauseOthers(t *testing.T) {
 	c, _ := fakeTelegram(t, 1, 1)
 	start := time.Now()
 	if _, err := c.SendMessage(context.Background(), 1, "a", nil); err != nil {
 		t.Fatal(err)
 	}
+	if time.Since(start) < 900*time.Millisecond {
+		t.Fatal("the flooded chat must wait retry_after before its retry")
+	}
+	t2 := time.Now()
 	if _, err := c.SendMessage(context.Background(), 2, "b", nil); err != nil {
 		t.Fatal(err)
 	}
-	if time.Since(start) < 900*time.Millisecond {
-		t.Fatal("429 did not pause the limiter")
+	if d := time.Since(t2); d > 500*time.Millisecond {
+		t.Fatalf("another chat waited %s after a per-chat 429", d)
+	}
+}
+
+// TestLimiter429ManyChatsPausesAll: 429s for several different chats at
+// once are the bot-wide limit — everybody waits.
+func TestLimiter429ManyChatsPausesAll(t *testing.T) {
+	c, _ := fakeTelegram(t, globalFloodChats, 1)
+	c.limiter = newRateLimiter(1000, 1000)
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	for chat := int64(1); chat <= globalFloodChats; chat++ {
+		wg.Add(1)
+		go func(chat int64) { defer wg.Done(); _, _ = c.SendMessage(context.Background(), chat, "x", nil) }(chat)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for c.limiter.reserve() <= 0 {
+		c.limiter.cancel()
+		if time.Now().After(deadline) {
+			t.Fatal("429s of several chats did not pause the limiter")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestFloodDetector(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	d := newFloodDetector()
+	d.now = func() time.Time { return now }
+	if !d.global(0) {
+		t.Fatal("a 429 without a chat is bot-wide")
+	}
+	for i := 0; i < 10; i++ {
+		if d.global(42) {
+			t.Fatal("repeated 429s of ONE chat are per-chat flood control")
+		}
+	}
+	if d.global(43) {
+		t.Fatal("two chats are not enough")
+	}
+	if !d.global(44) {
+		t.Fatalf("%d chats within %s must pause everybody", globalFloodChats, globalFloodWindow)
+	}
+	now = now.Add(globalFloodWindow + time.Millisecond)
+	if d.global(45) {
+		t.Fatal("old 429s must expire")
+	}
+	if len(d.recent) > globalFloodChats*4 {
+		t.Fatalf("detector grows: %d", len(d.recent))
 	}
 }

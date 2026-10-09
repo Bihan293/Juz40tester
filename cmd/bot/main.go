@@ -332,6 +332,14 @@ type workerSide struct {
 	h             *handlers.Handler
 	consumer      *updq.Consumer // nil with QUEUE_BACKEND=memory
 	updateWorkers int
+	broadcasts    *services.BroadcastService
+}
+
+// wakeBroadcasts makes the broadcast sender look for work at once.
+func (w *workerSide) wakeBroadcasts() {
+	if w != nil && w.broadcasts != nil {
+		w.broadcasts.Wake()
+	}
 }
 
 // startWorkerSide wires the services and starts every background loop of
@@ -501,7 +509,7 @@ func startWorkerSide(ctx, workerCtx context.Context, bgWG *sync.WaitGroup, cfg *
 		}
 	})
 
-	ws := &workerSide{h: h, updateWorkers: cfg.UpdateWorkers}
+	ws := &workerSide{h: h, updateWorkers: cfg.UpdateWorkers, broadcasts: bcSvc}
 	if ws.updateWorkers <= 0 {
 		ws.updateWorkers = updateWorkersFor(cfg.DBMaxConns, cfg.BackgroundConns())
 	}
