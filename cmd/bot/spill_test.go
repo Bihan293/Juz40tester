@@ -138,7 +138,12 @@ func TestSpillReplayPostgres(t *testing.T) {
 
 	// Instance 1: its handler is stuck, everything queued gets spilled.
 	stuck := make(chan struct{})
+	started := make(chan struct{}, 1)
 	d1 := newUpdateDispatcher("", 1, 100, time.Hour, func(ctx context.Context, _ *bot.Update) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
 		select {
 		case <-stuck:
 		case <-ctx.Done():
@@ -152,6 +157,13 @@ func TestSpillReplayPostgres(t *testing.T) {
 		if code := postRaw(d1, body, ""); code != 200 {
 			t.Fatalf("post %d: HTTP %d", i, code)
 		}
+	}
+	// The single worker must hold update 1 before the shutdown starts,
+	// otherwise update 1 is spilled too (timing, not a product bug).
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the worker never started the first update")
 	}
 	sctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	_ = d1.Shutdown(sctx)
@@ -181,6 +193,11 @@ func TestSpillReplayPostgres(t *testing.T) {
 	}
 	if len(got) != n-1 || got[0] != "ans:1:2:0" || got[len(got)-1] != fmt.Sprintf("ans:1:%d:0", n) {
 		t.Fatalf("replayed payloads: %v", got)
+	}
+	for i, data := range got {
+		if want := fmt.Sprintf("ans:1:%d:0", i+2); data != want {
+			t.Fatalf("replay order broken at %d: %s, want %s (all: %v)", i, data, want, got)
+		}
 	}
 	var left int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM tg_update_queue`).Scan(&left); err != nil || left != 0 {

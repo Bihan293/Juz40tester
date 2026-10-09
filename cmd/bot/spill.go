@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -55,6 +56,10 @@ func claimSpilled(ctx context.Context, pool *pgxpool.Pool, n int) ([]*bot.Update
 		upd.UpdateID = id
 		out = append(out, upd)
 	}
+	// DELETE … RETURNING does not keep the ORDER BY of its subquery: sort,
+	// so the updates of one user are replayed in the order they were sent
+	// (answers out of order would be refused as stale).
+	sort.Slice(out, func(i, j int) bool { return out[i].UpdateID < out[j].UpdateID })
 	return out, rows.Err()
 }
 
