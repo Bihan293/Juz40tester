@@ -15,9 +15,9 @@ import (
 )
 
 // TestPublishedLimits pins the free-tier numbers documented in
-// docs/GROQ_LIMITS.md — changing them must be a deliberate decision.
+// docs/AI_PROVIDERS.md — changing them must be a deliberate decision.
 func TestPublishedLimits(t *testing.T) {
-	for _, m := range []string{ModelGPTOSS120B, ModelQwen27B} {
+	for _, m := range []string{ModelQwen27B} {
 		l := LimitsFor(m)
 		if l.RPM != 30 || l.RPD != 1000 || l.TPM != 8000 || l.TPD != 200000 {
 			t.Fatalf("%s: unexpected free-tier limits %+v", m, l)
@@ -26,7 +26,7 @@ func TestPublishedLimits(t *testing.T) {
 			t.Fatalf("%s: a single request must stay below TPM (413 guard)", m)
 		}
 	}
-	if LimitsFor(ModelQwen27B).MaxCompletion != 16384 || LimitsFor(ModelGPTOSS120B).MaxCompletion != 65536 {
+	if LimitsFor(ModelQwen27B).MaxCompletion != 16384 {
 		t.Fatal("max completion tokens changed")
 	}
 }
@@ -34,7 +34,7 @@ func TestPublishedLimits(t *testing.T) {
 func TestEnvOverride(t *testing.T) {
 	t.Setenv("GROQ_TPM", "250000")
 	t.Setenv("GROQ_RPM", "1000")
-	l := LimitsFor(ModelGPTOSS120B)
+	l := LimitsFor(ModelQwen27B)
 	if l.TPM != 250000 || l.RPM != 1000 || l.RPD != 1000 {
 		t.Fatalf("override not applied: %+v", l)
 	}
@@ -186,8 +186,8 @@ func TestClientSuccessAndRequestShape(t *testing.T) {
 	defer srv.Close()
 	c := New("k", srv.URL)
 	res, err := c.ChatJSON(context.Background(), Request{
-		Model: ModelGPTOSS120B, Messages: []Message{{Role: "user", Content: "hi"}},
-		MaxTokens: 100000, Effort: EffortLow,
+		Model: ModelQwen27B, Messages: []Message{{Role: "user", Content: "hi"}},
+		MaxTokens: 100000, Effort: EffortNone,
 		Schema: map[string]any{"type": "object"},
 	})
 	if err != nil || res.Content != `{"ok":true}` {
@@ -197,8 +197,8 @@ func TestClientSuccessAndRequestShape(t *testing.T) {
 	if mt <= 0 || mt >= 8000 {
 		t.Fatalf("max_completion_tokens must be clamped under TPM, got %d", mt)
 	}
-	if got["reasoning_effort"] != "low" || got["include_reasoning"] != false {
-		t.Fatalf("gpt-oss knobs wrong: %v", got)
+	if got["reasoning_effort"] != "none" {
+		t.Fatalf("qwen must run in instruct mode: %v", got)
 	}
 	rf := got["response_format"].(map[string]any)
 	if rf["type"] != "json_schema" {
@@ -228,7 +228,7 @@ func TestClient429BlocksModel(t *testing.T) {
 		t.Fatalf("blocked model must not be called again, calls=%d", calls)
 	}
 	// The other model has its own bucket.
-	req.Model = ModelGPTOSS120B
+	req.Model = "other/model"
 	_, _ = c.ChatJSON(context.Background(), req)
 	if atomic.LoadInt32(&calls) != 2 {
 		t.Fatal("other model must still be callable")
@@ -341,7 +341,7 @@ func TestSchemaAndEffortErrorClassification(t *testing.T) {
 func TestLimiterAfterRestart(t *testing.T) {
 	// "Before restart": the old process used most of the daily quota.
 	// "After restart": a brand-new limiter has empty windows.
-	fresh, clk := newTestLimiter(LimitsFor(ModelGPTOSS120B))
+	fresh, clk := newTestLimiter(LimitsFor(ModelQwen27B))
 	if _, _, reqDay, _ := fresh.snapshot(); reqDay != 0 {
 		t.Fatalf("fresh limiter must start empty, got %d", reqDay)
 	}
@@ -361,7 +361,7 @@ func TestLimiterAfterRestart(t *testing.T) {
 	}
 
 	// 2. A "per day" 429 on another fresh limiter → long local block.
-	lim2, clk2 := newTestLimiter(LimitsFor(ModelGPTOSS120B))
+	lim2, clk2 := newTestLimiter(LimitsFor(ModelQwen27B))
 	lim2.block(time.Hour, "429 per day")
 	start := time.Now()
 	if _, err := lim2.acquire(context.Background(), 10, 24*time.Hour); !IsRateLimited(err) {

@@ -47,8 +47,9 @@ func pinTopic(gt *generatedTest, title string) {
 }
 
 // runTopicBatch (B4a) generates TopicBatchSize questions on one catalog
-// topic and stores them in the bank (no test row). Same provider route,
-// limits, daily DeepSeek budget and quality audit as the test jobs; banked
+// topic and stores them in the bank (no test row). Same model (DeepSeek
+// flash, thinking high), limits, daily DeepSeek budget and quality audit
+// as the test jobs; banked
 // duplicates (same text within the topic) are skipped by SaveBankQuestions.
 func (g *GeneratorService) runTopicBatch(ctx context.Context, job *models.GenerationJob, subjectName string) error {
 	if job.TopicKey == "" {
@@ -81,7 +82,7 @@ func (g *GeneratorService) runTopicBatch(ctx context.Context, job *models.Genera
 		return nil
 	}
 	task := fmt.Sprintf("gen %s job %d", job.Kind, job.ID)
-	if _, _, err := runSteps(ctx, task, g.generationSteps(messages, job.Kind, job.Attempts), validate); err != nil {
+	if _, _, err := runSteps(ctx, task, g.genSteps(func() []deepseek.Message { return messages }, genMaxTokens, 0, true), validate); err != nil {
 		return fmt.Errorf("generate: %w", err)
 	}
 	if err := g.repairFlagged(ctx, task, subjectName, final); err != nil {

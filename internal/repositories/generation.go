@@ -679,8 +679,8 @@ func (r *GenerationRepository) HasPendingOrRunningPersonalJob(ctx context.Contex
 
 // HasUrgentWork reports whether a user-facing (urgent) job is due in the
 // queue or currently running. The low-priority quality sweep yields to such
-// work: it would otherwise compete with user generations for the Groq quota
-// (and spill them over to the paid DeepSeek fallback).
+// work: it would otherwise compete with user generations for DeepSeek
+// calls (and the daily spending cap).
 func (r *GenerationRepository) HasUrgentWork(ctx context.Context) (bool, error) {
 	var exists bool
 	err := r.pool.QueryRow(ctx, `

@@ -323,7 +323,7 @@ func TestDeepSeekSpendingCap(t *testing.T) {
 	day := time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC).Add(time.Duration(time.Now().UnixNano()%100000) * 24 * time.Hour)
 	b := NewDailyBudget(repo, 0.01)
 	b.now = func() time.Time { return day.Add(time.Hour) }
-	ds := deepseek.New("k", "deepseek-v4-pro", "deepseek-flash", srv.URL).WithBudget(b, nil)
+	ds := deepseek.New("k", srv.URL).WithBudget(b, nil)
 
 	// worst case of one call: max_tokens 1000 out at peak flash ≈ $0.0012 +
 	// input → ~8 calls fit under $0.01 before settling; after settling at
@@ -334,7 +334,7 @@ func TestDeepSeekSpendingCap(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := ds.GenerateJSON(ctx, []deepseek.Message{{Role: "user", Content: "x"}}, 1000, deepseek.ThinkingEffortLow)
+			_, err := ds.GenerateJSON(ctx, []deepseek.Message{{Role: "user", Content: "x"}}, 1000)
 			switch {
 			case err == nil:
 				atomic.AddInt32(&ok, 1)
@@ -367,7 +367,7 @@ func TestDeepSeekSpendingCap(t *testing.T) {
 	stopped := false
 	for i := 0; i < 10 && !stopped; i++ {
 		before := atomic.LoadInt32(&hits)
-		_, err := ds.GenerateJSON(ctx, []deepseek.Message{{Role: "user", Content: "x"}}, 1000, deepseek.ThinkingEffortLow)
+		_, err := ds.GenerateJSON(ctx, []deepseek.Message{{Role: "user", Content: "x"}}, 1000)
 		switch {
 		case errors.Is(err, deepseek.ErrBudgetExceeded):
 			if atomic.LoadInt32(&hits) != before {
@@ -383,7 +383,7 @@ func TestDeepSeekSpendingCap(t *testing.T) {
 	}
 	// Next day: budget is fresh again.
 	b.now = func() time.Time { return day.Add(25 * time.Hour) }
-	if _, err := ds.GenerateJSON(ctx, []deepseek.Message{{Role: "user", Content: "x"}}, 1000, deepseek.ThinkingEffortLow); err != nil {
+	if _, err := ds.GenerateJSON(ctx, []deepseek.Message{{Role: "user", Content: "x"}}, 1000); err != nil {
 		t.Fatalf("next day must be allowed: %v", err)
 	}
 }
@@ -401,9 +401,9 @@ func TestCappedJobIsDeferredNotFailed(t *testing.T) {
 	day := time.Date(2200, 1, 1, 0, 0, 0, 0, time.UTC).Add(time.Duration(time.Now().UnixNano()%100000) * 24 * time.Hour)
 	b := NewDailyBudget(repo, 0.000001) // nothing fits
 	b.now = func() time.Time { return day }
-	ds := deepseek.New("k", "deepseek-v4-pro", "deepseek-flash", srv.URL).WithBudget(b, nil)
+	ds := deepseek.New("k", srv.URL).WithBudget(b, nil)
 	state := repositories.NewStateRepository(e.pool)
-	g := NewGeneratorService(ds, &config.Config{}, e.gen, e.subjects, state).WithBudget(b) // DeepSeek only, no Groq
+	g := NewGeneratorService(ds, &config.Config{}, e.gen, e.subjects, state).WithBudget(b)
 	if _, err := e.gen.EnqueueChainJobNow(ctx, e.sid, 1); err != nil {
 		t.Fatal(err)
 	}

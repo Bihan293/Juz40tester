@@ -1,6 +1,6 @@
 package services
 
-// End-to-end test of the generation pipeline with a fake Groq server and a
+// End-to-end test of the generation pipeline with a fake DeepSeek server and a
 // real PostgreSQL (skipped without TEST_DATABASE_URL):
 //
 //	model writes a test with the reported «тире» giveaway question →
@@ -22,7 +22,7 @@ import (
 
 	"github.com/Bihan293/Juz40tester/internal/config"
 	"github.com/Bihan293/Juz40tester/internal/database"
-	"github.com/Bihan293/Juz40tester/internal/groq"
+	"github.com/Bihan293/Juz40tester/internal/deepseek"
 	"github.com/Bihan293/Juz40tester/internal/models"
 	"github.com/Bihan293/Juz40tester/internal/repositories"
 	"github.com/Bihan293/Juz40tester/internal/testutil"
@@ -40,7 +40,7 @@ var goodDash = generatedQuestion{
 	Correct: 1, Topic: "Тире", Difficulty: 1,
 }
 
-func fakeGroq(t *testing.T, genCalls, repairCalls *int32) *httptest.Server {
+func fakeDeepSeek(t *testing.T, genCalls, repairCalls *int32) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		var req struct {
@@ -94,13 +94,13 @@ func TestPipelineRepairsGiveawayQuestion(t *testing.T) {
 	}
 
 	var genCalls, repairCalls int32
-	srv := fakeGroq(t, &genCalls, &repairCalls)
+	srv := fakeDeepSeek(t, &genCalls, &repairCalls)
 	defer srv.Close()
 
 	subjects := repositories.NewSubjectRepository(pool)
 	gen := repositories.NewGenerationRepository(pool)
 	state := repositories.NewStateRepository(pool)
-	g := NewGeneratorService(nil, &config.Config{}, gen, subjects, state).WithGroq(groq.New("k", srv.URL))
+	g := NewGeneratorService(deepseek.New("k", srv.URL), &config.Config{}, gen, subjects, state)
 
 	sid, err := testutil.CreateSubject(ctx, pool, "Русский язык "+time.Now().Format("150405.000000"))
 	if err != nil {

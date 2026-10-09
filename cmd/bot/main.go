@@ -349,14 +349,16 @@ func startWorkerSide(ctx, workerCtx context.Context, bgWG *sync.WaitGroup, cfg *
 	genRepo := repositories.NewGenerationRepository(pool).WithLockURL(migURL)
 	translationRepo := repositories.NewTranslationRepository(pool)
 
-	// DeepSeek AI test generation. Optional: without DEEPSEEK_API_KEY the bot
-	// still works with the seeded tests, AI generation is simply disabled.
+	// DeepSeek: the ONLY test generator (deepseek-flash, thinking,
+	// reasoning_effort=high) and the paid fallback of the Kazakh translation
+	// (deepseek-flash, non-thinking). Optional: without DEEPSEEK_API_KEY the
+	// bot still works with the seeded tests, AI generation is disabled.
 	// R-9: global daily DeepSeek spending cap, kept in PostgreSQL
 	// (ai_spend_daily) and fed by the client's per-call cost estimate.
 	budget := services.NewDailyBudget(repositories.NewSpendRepository(pool), cfg.DeepSeekDailyCapUSD)
 	var ds *deepseek.Client
 	if cfg.DeepSeekAPIKey != "" {
-		ds = deepseek.New(cfg.DeepSeekAPIKey, cfg.DeepSeekModel, cfg.DeepSeekReasonerModel, cfg.DeepSeekBaseURL)
+		ds = deepseek.New(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL)
 		if budget != nil {
 			ds.WithBudget(budget, cfg.IsOffPeak)
 			log.Printf("deepseek: daily spending cap $%.2f (UTC day)", cfg.DeepSeekDailyCapUSD)
@@ -367,36 +369,36 @@ func startWorkerSide(ctx, workerCtx context.Context, bgWG *sync.WaitGroup, cfg *
 		if cfg.OffPeakCustom {
 			offPeak = fmt.Sprintf("custom window %02d:00-%02d:00 server-local", cfg.OffPeakStartHour, cfg.OffPeakEndHour)
 		}
-		log.Printf("deepseek: configured (thinking=%s, fallback=%s, off-peak=%s)",
-			ds.ReasonerModel(), ds.Model(), offPeak)
+		log.Printf("deepseek: configured (generation=%s thinking/%s, translation fallback=%s non-thinking, off-peak=%s)",
+			deepseek.Model, deepseek.GenerationEffort, deepseek.Model, offPeak)
 	} else {
-		log.Println("deepseek: DEEPSEEK_API_KEY not set — no paid fallback (Groq only, if configured)")
+		log.Println("deepseek: DEEPSEEK_API_KEY not set — AI test generation is DISABLED")
 	}
-	// Groq free tier: primary provider for translation (Qwen 3.8 27B) and
-	// generation (GPT-OSS 120B). Every request is kept inside the published
-	// free-tier quota by the client's local limiter (RPM/RPD/TPM/TPD); when
-	// the quota runs out the work falls through to paid DeepSeek, so the bot
-	// never breaks. Optional: without GROQ_API_KEY nothing changes.
+	for _, k := range config.RemovedEnvVars() {
+		log.Printf("config: %s is no longer used — remove it from the environment", k)
+	}
+	// Groq free tier: the primary Kazakh translator (Qwen 3.8 27B, instruct
+	// mode), kept inside the published free-tier quota by the client's local
+	// limiter (RPM/RPD/TPM/TPD). When the quota runs out or a call fails, the
+	// translation falls back to DeepSeek flash (non-thinking). Generation
+	// never uses Groq.
 	var gq *groq.Client
 	if cfg.GroqAPIKey != "" {
 		gq = groq.New(cfg.GroqAPIKey, cfg.GroqBaseURL)
-		for _, m := range []string{groq.ModelQwen27B, groq.ModelGPTOSS120B} {
-			l := groq.LimitsFor(m)
-			log.Printf("groq: %s enabled (limits: %d RPM, %d RPD, %d TPM, %d TPD, max request %d tok)",
-				m, l.RPM, l.RPD, l.TPM, l.TPD, l.MaxRequestTokens())
-		}
+		l := groq.LimitsFor(groq.ModelQwen27B)
+		log.Printf("groq: %s enabled for translation (limits: %d RPM, %d RPD, %d TPM, %d TPD, max request %d tok)",
+			groq.ModelQwen27B, l.RPM, l.RPD, l.TPM, l.TPD, l.MaxRequestTokens())
 	} else {
-		log.Println("groq: GROQ_API_KEY not set — all AI work goes to DeepSeek (paid)")
+		log.Println("groq: GROQ_API_KEY not set — translations go to DeepSeek flash (non-thinking)")
 	}
-	genSvc := services.NewGeneratorService(ds, cfg, genRepo, subjectRepo, stateRepo).WithGroq(gq).WithBudget(budget)
-	// Kazakh test translations: reuse the same DeepSeek client (flash, low
-	// effort). A question is translated once, cached in the DB and shared by
-	// every user — no per-user API calls. The generator gets the translator
-	// too: when a personal weak-topics test is CLONED for another user with
-	// the same weakness profile (fresh question rows, new ids), the cached
-	// Kazakh translations are carried over to the clone — otherwise every
-	// Kazakh-speaking user of a clone would pay for translating the very
-	// same text again.
+	genSvc := services.NewGeneratorService(ds, cfg, genRepo, subjectRepo, stateRepo).WithBudget(budget)
+	// Kazakh test translations. A question is translated once, cached in
+	// the DB and shared by every user — no per-user API calls. The
+	// generator gets the translator too: when a personal weak-topics test
+	// is CLONED for another user with the same weakness profile (fresh
+	// question rows, new ids), the cached Kazakh translations are carried
+	// over to the clone — otherwise every Kazakh-speaking user of a clone
+	// would pay for translating the very same text again.
 	translatorSvc := services.NewTranslatorService(ds, translationRepo).WithGroq(gq)
 	genSvc.WithTranslator(translatorSvc)
 	quiz := services.NewQuizService(subjectRepo, attemptRepo, stateRepo, genRepo, genSvc, userRepo).
