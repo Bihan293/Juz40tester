@@ -13,8 +13,8 @@ import (
 
 // --- Result -----------------------------------------------------------------
 
-// showResult renders the attempt summary as a NEW message. cb may be nil
-// (called after an answer); in that case chatID must be provided.
+// showResult renders the attempt summary as a NEW message. cb may be nil;
+// in that case chatID must be provided.
 func (h *Handler) showResult(ctx context.Context, cb *bot.CallbackQuery, user *models.User, attemptID, chatID int64) {
 	sum, err := h.quiz.BuildSummary(ctx, attemptID, user.ID)
 	if err != nil {
@@ -34,6 +34,18 @@ func (h *Handler) showResult(ctx context.Context, cb *bot.CallbackQuery, user *m
 	h.renderSummary(ctx, sum, user, attemptID, target, "", services.CompletionOutcome{})
 }
 
+// showResultInto edits the message of cb into header + the attempt summary
+// (the answer flow, when the attempt turned out to be finished already).
+func (h *Handler) showResultInto(ctx context.Context, cb *bot.CallbackQuery, user *models.User, attemptID int64, header string) {
+	sum, err := h.quiz.BuildSummary(ctx, attemptID, user.ID)
+	if err != nil {
+		logf("summary: %v", err)
+		h.editMessage(ctx, cb, withHeader(header, "Ошибка загрузки результата 😔"), nil)
+		return
+	}
+	h.renderSummaryInto(ctx, cb, header, sum, user, attemptID, cb.Message.Chat.ID, "", services.CompletionOutcome{})
+}
+
 // renderSummary sends the attempt summary as a NEW message. It is separated
 // from showResult so the answer flow can reuse the summary it already built
 // (needed to decide whether the next test starts generating) without
@@ -42,6 +54,17 @@ func (h *Handler) showResult(ctx context.Context, cb *bot.CallbackQuery, user *m
 // outcome is what the completion of the attempt did (a new unlock, the next
 // test's generation) — the text never claims more than that.
 func (h *Handler) renderSummary(ctx context.Context, sum *services.AttemptSummary, user *models.User, attemptID, chatID int64, extra string, outcome services.CompletionOutcome) {
+	h.renderSummaryInto(ctx, nil, "", sum, user, attemptID, chatID, extra, outcome)
+}
+
+// renderSummaryInto renders the attempt summary. With cb (the answer flow)
+// the answered question message itself is EDITED into «verdict header +
+// result» — one Telegram call instead of an edit plus a new message; when
+// the edit is impossible editMessage sends the result as a new message.
+// Without cb the result is sent as a new message. Either way the bottom
+// menu (hidden during the test) is restored afterwards: a reply keyboard
+// can only come with a NEW message.
+func (h *Handler) renderSummaryInto(ctx context.Context, cb *bot.CallbackQuery, header string, sum *services.AttemptSummary, user *models.User, attemptID, chatID int64, extra string, outcome services.CompletionOutcome) {
 	target := chatID
 	var b strings.Builder
 	b.WriteString("🎉 Тест завершён!\n\n")
@@ -97,8 +120,9 @@ func (h *Handler) renderSummary(ctx context.Context, sum *services.AttemptSummar
 	}
 	rows = append(rows, bot.Row(bot.Btn("⬅️ Главное меню", cbMainMenu)))
 	kb := &bot.InlineKeyboardMarkup{InlineKeyboard: rows}
-	// Send as a new message so the answered question stays visible above.
-	if _, err := h.tg.SendMessage(ctx, target, b.String(), kb); err != nil {
+	if cb != nil && cb.Message != nil {
+		h.editMessage(ctx, cb, withHeader(header, b.String()), kb)
+	} else if _, err := h.tg.SendMessage(ctx, target, withHeader(header, b.String()), kb); err != nil {
 		logf("send result: %v", err)
 	}
 	// The run is over — the bottom menu (hidden at the start) comes back.

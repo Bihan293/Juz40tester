@@ -10,8 +10,9 @@ import (
 
 // DefaultMaxRPS is the default global rate of outgoing message-changing
 // Bot API calls (TG_MAX_RPS). Telegram allows ~30 messages per second per
-// bot; 25 leaves headroom for answerCallbackQuery and service calls.
-const DefaultMaxRPS = 25
+// bot; 28 keeps a small headroom for service calls (answerCallbackQuery
+// is not limited at all).
+const DefaultMaxRPS = 28
 
 // defaultBurst is the number of calls that may go out back-to-back after an
 // idle period.

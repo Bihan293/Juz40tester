@@ -167,21 +167,6 @@ func closedAttemptKeyboard(testID int64) *bot.InlineKeyboardMarkup {
 	}}
 }
 
-// sendCurrentQuestion sends the next unanswered question as a NEW message
-// (used after an answer, so the answered question above stays untouched).
-func (h *Handler) sendCurrentQuestion(ctx context.Context, chatID int64, user *models.User, attemptID int64) {
-	view := h.loadCurrentQuestion(ctx, nil, user, attemptID)
-	if view == nil {
-		// All questions answered -> show the result.
-		h.showResult(ctx, nil, user, attemptID, chatID)
-		return
-	}
-	admin := h.isAdminTG(user.TelegramID)
-	if _, err := h.tg.SendMessage(ctx, chatID, renderQuestionFor(view, admin), questionKeyboardFor(view, admin)); err != nil {
-		logf("send question: %v", err)
-	}
-}
-
 func renderQuestion(v *services.QuestionView) string { return renderQuestionFor(v, false) }
 
 // correctDisplayIndex is the displayed position of the correct option
@@ -306,24 +291,27 @@ func (h *Handler) handleAnswer(ctx context.Context, cb *bot.CallbackQuery, user 
 	}
 	// BUG FIX: the happy path never acknowledged the callback, so the tapped
 	// A/B/C/D button kept spinning for ~15 s after every single answer.
-	// From here on the single allowed answer is spent — later errors go to
-	// the chat as plain messages.
-	h.answerCallback(ctx, cb, "")
+	// The acknowledgement (answerCallbackQuery — free, outside the
+	// TG_MAX_RPS limiter) carries the verdict as a toast. From here on the
+	// single allowed answer is spent — later errors go to the chat.
+	h.answerCallback(ctx, cb, verdictToast(res))
 
-	// Finalize the answered message: verdict + option marks + question
-	// knowledge level, and REMOVE the A/B/C/D keyboard so the question
-	// cannot be answered twice. The message is never edited again.
-	h.editMessage(ctx, cb, renderAnswered(view, res), nil)
-
-	chatID := cb.Message.Chat.ID
+	// ONE rate-limited Telegram call per answer: the SAME message is edited
+	// into «verdict of the previous question + the next question with its
+	// keyboard» (before: an edit of the answered question + a NEW message
+	// with the next one = 2 calls). The chat no longer keeps the history of
+	// the answered questions — accepted by the owner for twice the
+	// throughput. The old A/B/C/D keyboard disappears with the edit, and a
+	// stale tap on a copy of it is refused by SubmitAnswer
+	// (ErrAnswerOutOfOrder / AlreadyAnswered) above.
+	header := answerHeader(view, res)
 	if res.Finished {
 		// Test over -> build the summary FIRST: the fresh 🟢/🟡 counts decide
-		// whether the next chain test starts generating (only at 15🟢+5🟡),
-		// then send the result as a new message below.
+		// whether the next chain test starts generating (only at 15🟢+5🟡).
 		sum, err := h.quiz.BuildSummary(ctx, attemptID, user.ID)
 		if err != nil {
 			logf("summary: %v", err)
-			h.sendText(ctx, chatID, "Ошибка загрузки результата 😔")
+			h.editMessage(ctx, cb, withHeader(header, "Ошибка загрузки результата 😔"), nil)
 			return
 		}
 		outcome := h.quiz.OnTestCompleted(ctx, user.ID, sum.Test,
@@ -332,47 +320,107 @@ func (h *Handler) handleAnswer(ctx context.Context, cb *bot.CallbackQuery, user 
 		if res.Charged {
 			extra = h.chargedLine(ctx, user)
 		}
-		h.renderSummary(ctx, sum, user, attemptID, chatID, extra, outcome)
+		// The last question turns into the result screen (one edit), then
+		// the bottom menu comes back (one send, as before).
+		h.renderSummaryInto(ctx, cb, header, sum, user, attemptID, cb.Message.Chat.ID, extra, outcome)
 		return
 	}
-	// The next question is sent as a NEW message right below the answered
-	// one; the answered message keeps its final state.
-	h.sendCurrentQuestion(ctx, chatID, user, attemptID)
+	h.showNextQuestion(ctx, cb, user, attemptID, view.Attempt, header)
 }
 
-// renderAnswered renders the question with the verdict and the correct
-// option revealed (🟢). The wrong selection is marked 🔴.
-func renderAnswered(v *services.QuestionView, res *repositories.AnswerResult) string {
-	var b strings.Builder
+// showNextQuestion edits the answered message into the verdict header plus
+// the next unanswered question (ONE Telegram call; editMessage falls back
+// to a new message when the edit is impossible, so the test never gets
+// stuck).
+func (h *Handler) showNextQuestion(ctx context.Context, cb *bot.CallbackQuery, user *models.User, attemptID int64, answered *models.TestAttempt, header string) {
+	next, err := h.quiz.CurrentQuestion(ctx, attemptID, user)
+	if err != nil {
+		logf("current question: %v", err)
+		// The answer is saved; offer to continue from the next question
+		// instead of leaving the answered keyboard on screen.
+		var kb *bot.InlineKeyboardMarkup
+		if answered != nil {
+			kb = &bot.InlineKeyboardMarkup{InlineKeyboard: [][]bot.InlineKeyboardButton{
+				bot.Row(bot.Btn("▶️ Продолжить тест", cbOpenTest+strconv.FormatInt(answered.TestID, 10))),
+				bot.Row(bot.Btn("⬅️ Главное меню", cbMainMenu)),
+			}}
+		}
+		h.editMessage(ctx, cb, withHeader(header, "Ошибка загрузки вопроса 😔 Нажми «Продолжить тест»."), kb)
+		return
+	}
+	if next == nil {
+		// Nothing left although this answer did not finish the attempt (a
+		// concurrent final answer): show the result in the same message.
+		h.showResultInto(ctx, cb, user, attemptID, header)
+		return
+	}
+	if next.Attempt != nil && next.Attempt.Status != models.AttemptInProgress {
+		h.editMessage(ctx, cb, withHeader(header, closedAttemptText), closedAttemptKeyboard(next.Attempt.TestID))
+		return
+	}
+	admin := h.isAdminTG(user.TelegramID)
+	h.editMessage(ctx, cb, withHeader(header, renderQuestionFor(next, admin)), questionKeyboardFor(next, admin))
+}
+
+// verdictToast is the callback toast shown right after an answer.
+func verdictToast(res *repositories.AnswerResult) string {
 	if res.Correct {
-		b.WriteString("🟢 Правильно\n\n")
-	} else {
-		b.WriteString("🔴 Неправильно\n\n")
+		return "🟢 Правильно"
 	}
-	fmt.Fprintf(&b, "❓ Вопрос %d/%d\n\n%s\n\n", v.AttemptQ.Position, v.Total, v.Text)
+	return "🔴 Неправильно"
+}
+
+// headerOptionMaxRunes caps the correct option quoted in the verdict header
+// (the full option is long only in rare generated tests).
+const headerOptionMaxRunes = 300
+
+// answerHeader is the short verdict of the previous question shown above
+// the next question: «🟢 Правильно» or «🔴 Неправильно — правильный ответ:
+// D) <text>».
+func answerHeader(v *services.QuestionView, res *repositories.AnswerResult) string {
+	if res.Correct {
+		return "🟢 Правильно"
+	}
+	if v == nil || v.AttemptQ == nil || v.Question == nil {
+		return "🔴 Неправильно"
+	}
 	for i, orig := range v.AttemptQ.OptionOrder {
-		mark := ""
-		switch {
-		case orig == v.Question.CorrectAnswer:
-			mark = " 🟢"
-		case orig == res.SelectedAnswer:
-			mark = " 🔴"
-		}
-		fmt.Fprintf(&b, "%s) %s%s\n", services.OptionLabels[i], v.DisplayTexts[i], mark)
-	}
-	if !res.Correct {
-		correctText := ""
-		for i, orig := range v.AttemptQ.OptionOrder {
-			if orig == v.Question.CorrectAnswer {
-				correctText = fmt.Sprintf("%s) %s", services.OptionLabels[i], v.DisplayTexts[i])
-				break
+		if orig == v.Question.CorrectAnswer && i < len(v.DisplayTexts) && i < len(services.OptionLabels) {
+			text := v.DisplayTexts[i]
+			if r := []rune(text); len(r) > headerOptionMaxRunes {
+				text = string(r[:headerOptionMaxRunes-1]) + "…"
 			}
+			return fmt.Sprintf("🔴 Неправильно — правильный ответ: %s) %s", services.OptionLabels[i], text)
 		}
-		fmt.Fprintf(&b, "\n🟢 Правильный ответ: %s", correctText)
 	}
-	// Current knowledge level of this question after the answer.
-	fmt.Fprintf(&b, "\n\nУровень вопроса: %s %d", models.StatusEmoji(res.NewStatus), res.NewStatus)
-	return b.String()
+	return "🔴 Неправильно"
+}
+
+// messageMaxUTF16 is the budget of one message text in UTF-16 code units
+// (Telegram's limit is 4096; a margin is kept for safety).
+const messageMaxUTF16 = 4000
+
+// withHeader puts the verdict header above body (separated by an empty
+// line) and keeps the whole text within Telegram's 4096 limit: the body
+// (the question and its options) wins — the header is shortened to the
+// bare verdict or dropped when the body is very long (the toast still
+// shows the verdict).
+func withHeader(header, body string) string {
+	if utf16Len(body) > messageMaxUTF16 {
+		body = truncateUTF16(body, messageMaxUTF16-1)
+	}
+	if header == "" {
+		return body
+	}
+	room := messageMaxUTF16 - utf16Len(body) - 2
+	if utf16Len(header) > room {
+		short, _, _ := strings.Cut(header, " — ")
+		if utf16Len(short) > room {
+			return body
+		}
+		header = short
+	}
+	return header + "\n\n" + body
 }
 
 func (h *Handler) retryTest(ctx context.Context, cb *bot.CallbackQuery, user *models.User, attemptID int64) {
