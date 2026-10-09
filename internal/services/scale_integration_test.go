@@ -21,7 +21,7 @@ import (
 	"testing"
 
 	"github.com/Bihan293/Juz40tester/internal/config"
-	"github.com/Bihan293/Juz40tester/internal/deepseek"
+	"github.com/Bihan293/Juz40tester/internal/groq"
 	"github.com/Bihan293/Juz40tester/internal/models"
 	"github.com/Bihan293/Juz40tester/internal/repositories"
 )
@@ -89,10 +89,11 @@ func (f *batchFakeAI) server(t *testing.T) *httptest.Server {
 
 func scaleEnv(t *testing.T, f *batchFakeAI, cfg *config.Config) (*flowEnv, *GeneratorService) {
 	t.Helper()
+	liftGroqLimits(t)
 	e := newFlowEnv(t)
 	srv := f.server(t)
 	t.Cleanup(srv.Close)
-	g := NewGeneratorService(deepseek.New("k", srv.URL), cfg, e.gen, e.subjects, repositories.NewStateRepository(e.pool))
+	g := NewGeneratorService(nil, cfg, e.gen, e.subjects, repositories.NewStateRepository(e.pool)).WithGroq(groq.New("k", srv.URL))
 	return e, g
 }
 

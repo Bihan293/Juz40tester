@@ -204,7 +204,7 @@ func (l *limiter) block(d time.Duration, reason string) {
 }
 
 // observeHeaders syncs the local limiter with the authoritative server
-// counters (x-ratelimit-*; see docs/AI_PROVIDERS.md). This also repairs the
+// counters (x-ratelimit-*; see docs/GROQ_LIMITS.md). This also repairs the
 // daily counters after a restart: the local 24h window starts empty, but
 // the first reply already reports how many daily requests are really left.
 func (l *limiter) observeHeaders(h http.Header) {

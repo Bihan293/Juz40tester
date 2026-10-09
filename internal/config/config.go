@@ -78,23 +78,25 @@ type Config struct {
 
 	// GenWorkers (GEN_WORKERS, default 4, max 16): number of concurrent
 	// generation-queue workers. Each claims jobs with FOR UPDATE SKIP LOCKED,
-	// so a job never runs twice.
+	// so a job never runs twice. Kept small on purpose: the Groq free tier
+	// serves ~1 test per minute per model, extra workers mostly spill over
+	// to the paid DeepSeek fallback.
 	GenWorkers int
-	// GenDeepSeekConcurrency (GEN_DEEPSEEK_CONCURRENCY, default 4): max
-	// number of DeepSeek generation calls in flight at once in this
-	// process — bounds the cost burst (DeepSeek is the only generator).
+	// GenDeepSeekConcurrency (GEN_DEEPSEEK_CONCURRENCY, default 2): max
+	// number of paid DeepSeek generation calls in flight at once across all
+	// workers — bounds the cost burst when Groq is saturated.
 	GenDeepSeekConcurrency int
 
-	// DeepSeek API: the only test generator (deepseek-flash, thinking,
-	// reasoning_effort=high) and the fallback translator (deepseek-flash,
-	// non-thinking). The model is fixed in code (deepseek.Model).
-	DeepSeekAPIKey  string
-	DeepSeekBaseURL string // overridable via DEEPSEEK_BASE_URL
+	// DeepSeek API settings for AI test generation.
+	DeepSeekAPIKey        string
+	DeepSeekModel         string // non-thinking fallback model (DEEPSEEK_MODEL), default deepseek-v4-pro
+	DeepSeekReasonerModel string // primary thinking model (DEEPSEEK_REASONER_MODEL), default deepseek-flash
+	DeepSeekBaseURL       string // overridable via DEEPSEEK_BASE_URL
 
-	// Groq API (free tier) — the primary Kazakh translator
-	// (qwen/qwen3.8-27b, instruct mode). Never used for generation.
-	// Optional: without GROQ_API_KEY every translation goes to DeepSeek
-	// flash (non-thinking). Quota: docs/AI_PROVIDERS.md.
+	// Groq API (free tier) — primary provider for Kazakh translation
+	// (qwen/qwen3.8-27b) and test generation (openai/gpt-oss-120b).
+	// DeepSeek becomes the paid fallback. Optional: without GROQ_API_KEY the
+	// bot behaves exactly as before (DeepSeek only). Quota: docs/GROQ_LIMITS.md.
 	GroqAPIKey  string
 	GroqBaseURL string // overridable via GROQ_BASE_URL
 
@@ -157,13 +159,14 @@ type Config struct {
 	// GenBatchSize (GEN_BATCH_SIZE, default 5, 2..10): questions per batch call.
 	GenBatchSize int
 	// GenBatchParallel (GEN_BATCH_PARALLEL, default 2, 1..4): batch calls of
-	// one job in flight at once (also bounded by GenDeepSeekConcurrency).
+	// one job in flight at once (they alternate between the two free Groq
+	// models, which have independent quotas).
 	GenBatchParallel int
 	// GenMaxActivePersonal (GEN_MAX_ACTIVE_PERSONAL, default 300, 0 = no
 	// limit): backpressure — when this many personal AI generations are
 	// already queued/running, new ones are refused with a friendly message
-	// instead of growing the queue without bound (generation throughput
-	// and the daily DeepSeek cap are the bottleneck with thousands of users).
+	// instead of growing the queue without bound (the free AI quota is the
+	// real bottleneck with thousands of users).
 	GenMaxActivePersonal int
 	// GenTemplateReuse (GEN_TEMPLATE_REUSE, default true): reuse generated
 	// tests via the weak-topics fingerprint (clone instead of regeneration).
@@ -362,6 +365,8 @@ func Load() (*Config, error) {
 		Port:                   os.Getenv("PORT"),
 		WebhookSecret:          strings.TrimSpace(os.Getenv("WEBHOOK_SECRET")),
 		DeepSeekAPIKey:         os.Getenv("DEEPSEEK_API_KEY"),
+		DeepSeekModel:          os.Getenv("DEEPSEEK_MODEL"),
+		DeepSeekReasonerModel:  os.Getenv("DEEPSEEK_REASONER_MODEL"),
 		DeepSeekBaseURL:        os.Getenv("DEEPSEEK_BASE_URL"),
 		GroqAPIKey:             strings.TrimSpace(os.Getenv("GROQ_API_KEY")),
 		GroqBaseURL:            strings.TrimSpace(os.Getenv("GROQ_BASE_URL")),
@@ -528,6 +533,12 @@ func Load() (*Config, error) {
 	if cfg.Port == "" {
 		cfg.Port = "8080"
 	}
+	if cfg.DeepSeekModel == "" {
+		cfg.DeepSeekModel = "deepseek-v4-pro"
+	}
+	if cfg.DeepSeekReasonerModel == "" {
+		cfg.DeepSeekReasonerModel = "deepseek-flash"
+	}
 	if cfg.DeepSeekBaseURL == "" {
 		cfg.DeepSeekBaseURL = "https://api.deepseek.com"
 	}
@@ -579,11 +590,10 @@ const (
 	// DefaultGenWorkers is the default size of the generation worker pool.
 	DefaultGenWorkers = 4
 	// MaxGenWorkers caps GEN_WORKERS: more workers than this only fight
-	// over the DB pool and multiply the DeepSeek burst.
+	// over the Groq quota and the DB pool and multiply DeepSeek spend.
 	MaxGenWorkers = 16
-	// DefaultGenDeepSeekConcurrency bounds parallel DeepSeek generation
-	// calls (one per worker by default — DeepSeek is the only generator).
-	DefaultGenDeepSeekConcurrency = 4
+	// DefaultGenDeepSeekConcurrency bounds parallel paid generations.
+	DefaultGenDeepSeekConcurrency = 2
 
 	// DefaultUserActionInterval: at most one action per user per 300ms.
 	DefaultUserActionInterval = 300 * time.Millisecond
@@ -850,19 +860,3 @@ func (c *Config) DurableQueue() bool { return c.QueueBackend != BackendMemory }
 // (split roles or a shared queue): cross-instance events are then
 // broadcast (generation / translation finished).
 func (c *Config) Clustered() bool { return c.Role != RoleAll || c.DurableQueue() }
-
-// removedEnvVars are environment variables of the old AI routing that the
-// bot no longer reads (logged at startup so they get removed on Render).
-var removedEnvVars = []string{"DEEPSEEK_MODEL", "DEEPSEEK_REASONER_MODEL"}
-
-// RemovedEnvVars returns the removed variables that are still SET in the
-// environment.
-func RemovedEnvVars() []string {
-	var out []string
-	for _, k := range removedEnvVars {
-		if _, ok := os.LookupEnv(k); ok {
-			out = append(out, k)
-		}
-	}
-	return out
-}

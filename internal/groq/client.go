@@ -23,9 +23,14 @@ type Message struct {
 	Content string `json:"content"`
 }
 
-// EffortNone is Qwen 3.8's instruct mode (reasoning_effort=none — no
-// reasoning tokens at all), the only mode the bot uses.
-const EffortNone = "none"
+// Reasoning effort values. GPT-OSS supports low/medium/high; Qwen 3.8
+// additionally supports "none" (instruct mode — no reasoning tokens at all).
+const (
+	EffortNone   = "none"
+	EffortLow    = "low"
+	EffortMedium = "medium"
+	EffortHigh   = "high"
+)
 
 // Request is one JSON-mode chat completion.
 type Request struct {
@@ -187,14 +192,15 @@ type jsonSchema struct {
 }
 
 type chatRequest struct {
-	Model           string          `json:"model"`
-	Messages        []Message       `json:"messages"`
-	MaxTokens       int             `json:"max_completion_tokens,omitempty"`
-	Temperature     *float64        `json:"temperature,omitempty"`
-	TopP            *float64        `json:"top_p,omitempty"`
-	ReasoningEffort string          `json:"reasoning_effort,omitempty"`
-	ResponseFormat  *responseFormat `json:"response_format,omitempty"`
-	Stream          bool            `json:"stream"`
+	Model            string          `json:"model"`
+	Messages         []Message       `json:"messages"`
+	MaxTokens        int             `json:"max_completion_tokens,omitempty"`
+	Temperature      *float64        `json:"temperature,omitempty"`
+	TopP             *float64        `json:"top_p,omitempty"`
+	ReasoningEffort  string          `json:"reasoning_effort,omitempty"`
+	IncludeReasoning *bool           `json:"include_reasoning,omitempty"`
+	ResponseFormat   *responseFormat `json:"response_format,omitempty"`
+	Stream           bool            `json:"stream"`
 }
 
 type chatResponse struct {
@@ -324,8 +330,14 @@ func (c *Client) do(ctx context.Context, r Request, maxTokens int, useSchema boo
 	if r.Effort != "" {
 		body.ReasoningEffort = r.Effort
 	}
+	// GPT-OSS: never ship the reasoning text back — it is not needed and
+	// only bloats the response (reasoning tokens are billed either way).
 	// Qwen: reasoning_format/include_reasoning are left at the JSON-mode
 	// default (parsed) — with effort "none" there is no reasoning anyway.
+	if strings.HasPrefix(r.Model, "openai/gpt-oss") {
+		f := false
+		body.IncludeReasoning = &f
+	}
 	if useSchema {
 		name := r.SchemaName
 		if name == "" {

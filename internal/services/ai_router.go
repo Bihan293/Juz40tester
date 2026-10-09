@@ -1,17 +1,17 @@
-// Package services — AI call steps.
+// Package services — AI provider routing (cost optimisation).
 //
-// Every AI task runs through a short, ordered list of "steps" (one
-// provider+model+mode each); the first step whose reply passes the task's
-// local validator wins. There are only two routes left:
+// Every AI task goes through a short, ordered list of "steps". A step is one
+// provider+model+effort combination; the first step whose reply passes the
+// task's local validator wins. The order is chosen by price:
 //
-//	test generation (every kind, retries, batches, repairs):
-//	    DeepSeek deepseek-flash, thinking, reasoning_effort=high — ONE step
-//	RU→KK translation:
-//	    Groq qwen/qwen3.8-27b (instruct) → DeepSeek deepseek-flash (non-thinking)
+//	Groq free tier (GPT-OSS 120B / Qwen 3.8 27B) → paid DeepSeek fallback.
 //
 // Groq quota is enforced locally by internal/groq (RPM/RPD/TPM/TPD), so a
-// translation step that would exceed the free-tier limits is SKIPPED
-// instantly (no HTTP call) and the DeepSeek fallback runs.
+// step that would exceed the free-tier limits is SKIPPED instantly (no HTTP
+// call, no error in the logs beyond one line) and the next step runs. The
+// bot therefore never gets stuck on a 429 and never breaks when the daily
+// free quota is exhausted — it just spends DeepSeek money for the rest of
+// the day, exactly like before this integration.
 package services
 
 import (
@@ -27,22 +27,46 @@ import (
 
 // aiStep is one attempt in a provider chain.
 type aiStep struct {
-	name string // for logs, e.g. "deepseek/deepseek-flash(thinking-high)"
+	name string // for logs, e.g. "groq/openai/gpt-oss-120b(medium)"
 	run  func(ctx context.Context) (string, error)
 	// timeout bounds this single step (0 = only the parent context).
 	timeout time.Duration
+	// reserve is the time this (paid) step needs to run. Every EARLIER step
+	// is cut so that at least `reserve` of the parent deadline is left for
+	// it — the free Groq steps can never eat the time of the paid DeepSeek
+	// fallback (or of the repair that follows the generation).
+	reserve time.Duration
 }
 
 // groqStepTimeout bounds one Groq step: the local rate-limiter wait
 // (MaxWait) plus the HTTP request itself.
 const groqStepTimeout = 150 * time.Second
 
-// stepContext derives the context of one step (its own timeout, if any).
-func stepContext(ctx context.Context, st aiStep) (context.Context, context.CancelFunc) {
-	if st.timeout <= 0 {
-		return ctx, func() {}
+// stepContext derives the context of step i: its own timeout, further cut
+// so that the largest reserve of the later steps stays available. ok=false
+// means there is no time left for this step at all (it is skipped).
+func stepContext(ctx context.Context, steps []aiStep, i int) (context.Context, context.CancelFunc, bool) {
+	var reserve time.Duration
+	for _, later := range steps[i+1:] {
+		if later.reserve > reserve {
+			reserve = later.reserve
+		}
 	}
-	return context.WithTimeout(ctx, st.timeout)
+	timeout := steps[i].timeout
+	if dl, has := ctx.Deadline(); has && reserve > 0 {
+		left := time.Until(dl) - reserve
+		if left <= 0 {
+			return ctx, func() {}, false
+		}
+		if timeout == 0 || left < timeout {
+			timeout = left
+		}
+	}
+	if timeout <= 0 {
+		return ctx, func() {}, true
+	}
+	sctx, cancel := context.WithTimeout(ctx, timeout)
+	return sctx, cancel, true
 }
 
 // runSteps executes steps in order until validate accepts a reply. It
@@ -63,12 +87,17 @@ func runSteps(ctx context.Context, task string, steps []aiStep, validate func(ra
 //	difficulty_violation task=… step=… err=…
 func runStepsFeedback(ctx context.Context, task string, steps []aiStep, validate func(raw string) error, onReject func(error)) (string, string, error) {
 	var errs []error
-	for _, st := range steps {
+	for i, st := range steps {
 		if ctx.Err() != nil {
 			errs = append(errs, ctx.Err())
 			break
 		}
-		sctx, cancel := stepContext(ctx, st)
+		sctx, cancel, ok := stepContext(ctx, steps, i)
+		if !ok {
+			log.Printf("ai[%s]: %s skipped — time is reserved for the next provider", task, st.name)
+			errs = append(errs, fmt.Errorf("%s: skipped (time reserved for fallback)", st.name))
+			continue
+		}
 		started := time.Now()
 		raw, err := st.run(sctx)
 		cancel()
@@ -92,7 +121,7 @@ func runStepsFeedback(ctx context.Context, task string, steps []aiStep, validate
 			return raw, st.name, nil
 		}
 		if groq.IsRateLimited(err) {
-			log.Printf("ai[%s]: %s skipped — Groq free-tier quota: %v", task, st.name, err)
+			log.Printf("ai[%s]: %s skipped — free-tier quota: %v", task, st.name, err)
 		} else {
 			log.Printf("ai[%s]: %s failed: %v", task, st.name, err)
 		}
@@ -127,40 +156,4 @@ func groqStep(gc *groq.Client, req groq.Request) aiStep {
 		noteTokens(ctx, res.PromptTokens, res.CompletionTokens)
 		return res.Content, nil
 	}}
-}
-
-// genStep is THE generation step: deepseek-flash in thinking mode with
-// reasoning_effort=high. Every generation (chain, personal, retry, batch,
-// topic batch, repair) uses it; there is no other provider and no lower
-// effort. When bounded is set, the call takes a slot of the paid-call
-// semaphore (GEN_DEEPSEEK_CONCURRENCY) — more workers must not mean a
-// proportional burst of parallel DeepSeek calls.
-func (g *GeneratorService) genStep(messages func() []deepseek.Message, maxTokens int, timeout time.Duration, bounded bool) aiStep {
-	ds := g.ds
-	return aiStep{
-		name:    genStepName,
-		timeout: timeout,
-		run: func(ctx context.Context) (string, error) {
-			if bounded {
-				release, err := g.acquireDeepSeek(ctx)
-				if err != nil {
-					return "", err
-				}
-				defer release()
-			}
-			return ds.GenerateJSON(ctx, messages(), maxTokens)
-		},
-	}
-}
-
-// genStepName is the log/metrics name of the generation step.
-const genStepName = "deepseek/" + deepseek.Model + "(thinking-" + deepseek.GenerationEffort + ")"
-
-// genSteps returns the generation route (empty without DEEPSEEK_API_KEY —
-// runSteps then reports "no AI provider configured").
-func (g *GeneratorService) genSteps(messages func() []deepseek.Message, maxTokens int, timeout time.Duration, bounded bool) []aiStep {
-	if g.ds == nil {
-		return nil
-	}
-	return []aiStep{g.genStep(messages, maxTokens, timeout, bounded)}
 }

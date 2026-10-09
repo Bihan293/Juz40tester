@@ -13,11 +13,21 @@ import (
 	"time"
 
 	"github.com/Bihan293/Juz40tester/internal/config"
-	"github.com/Bihan293/Juz40tester/internal/deepseek"
+	"github.com/Bihan293/Juz40tester/internal/groq"
 	"github.com/Bihan293/Juz40tester/internal/repositories"
 )
 
+// liftGroqLimits raises the local Groq quota for the fake provider: on the
+// free tier (TPM 8000) a second concurrent generation correctly waits for
+// the per-minute window, which is not what these tests measure.
+func liftGroqLimits(t *testing.T) {
+	t.Helper()
+	t.Setenv("GROQ_TPM", "10000000")
+	t.Setenv("GROQ_RPM", "100000")
+}
+
 func TestWorkerPoolDrainsQueueWithoutDuplicates(t *testing.T) {
+	liftGroqLimits(t)
 	e := newFlowEnv(t)
 	ctx := context.Background()
 	// Isolate from jobs of other tests/subjects in the shared database.
@@ -32,7 +42,7 @@ func TestWorkerPoolDrainsQueueWithoutDuplicates(t *testing.T) {
 	srv := e.ai.server(t)
 	defer srv.Close()
 	state := repositories.NewStateRepository(e.pool)
-	svc := NewGeneratorService(deepseek.New("k", srv.URL), &config.Config{GenWorkers: 4}, e.gen, e.subjects, state)
+	svc := NewGeneratorService(nil, &config.Config{GenWorkers: 4}, e.gen, e.subjects, state).WithGroq(groq.New("k", srv.URL))
 
 	// Count how often every job id is claimed — must be exactly once.
 	var mu sync.Mutex
@@ -97,6 +107,7 @@ func TestWorkerPoolDrainsQueueWithoutDuplicates(t *testing.T) {
 // RunWorker drains a burst immediately (well under the 20s fallback poll)
 // and stops cleanly on cancellation.
 func TestRunWorkerProcessesBurstImmediately(t *testing.T) {
+	liftGroqLimits(t)
 	e := newFlowEnv(t)
 	ctx := context.Background()
 	if _, err := e.pool.Exec(ctx, `UPDATE generation_jobs SET status = 'failed' WHERE status IN ('pending','running')`); err != nil {
@@ -105,7 +116,7 @@ func TestRunWorkerProcessesBurstImmediately(t *testing.T) {
 	srv := e.ai.server(t)
 	defer srv.Close()
 	state := repositories.NewStateRepository(e.pool)
-	svc := NewGeneratorService(deepseek.New("k", srv.URL), &config.Config{GenWorkers: 3}, e.gen, e.subjects, state)
+	svc := NewGeneratorService(nil, &config.Config{GenWorkers: 3}, e.gen, e.subjects, state).WithGroq(groq.New("k", srv.URL))
 
 	wctx, stop := context.WithCancel(ctx)
 	stopped := make(chan struct{})

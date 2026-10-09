@@ -5,13 +5,11 @@
 // every user forever — there is no per-user translation and no repeated
 // API call. The Russian question row always stays the master version.
 //
-// Provider route (translation is mechanical — no reasoning at all):
-//  1. Groq qwen/qwen3.8-27b, instruct mode (reasoning_effort=none) — free,
-//     fast, strong multilingual; the primary translator;
-//  2. DeepSeek deepseek-flash, NON-thinking (thinking disabled), with a
-//     tight max_tokens sized to the chunk — the cheapest possible paid
-//     call. Used only when Qwen is out of quota, failed, or returned an
-//     invalid reply.
+// Provider route (translation is mechanical — no paid reasoning needed):
+//  1. Groq Qwen 3.8 27B, instruct mode (reasoning_effort=none) — free, fast
+//     (~450 tok/s), strong multilingual; the primary translator;
+//  2. Groq GPT-OSS 120B (reasoning low) — separate free quota bucket;
+//  3. DeepSeek flash — the paid last resort (the old behaviour).
 //
 // The Groq free tier caps ONE request at 8000 tokens (prompt + max output),
 // so the questions are packed into chunks that provably fit that ceiling;
@@ -36,14 +34,19 @@ import (
 )
 
 const (
+	// translateMaxTokens caps one translation call (20 questions x
+	// question+4 options, plus the low-effort thinking tokens). Kazakh text
+	// is comparable in length to Russian, so 8000 tokens is generous.
+	translateMaxTokens = 8000
+
 	// Kazakh output is longer in tokens than the Russian input (agglutinative
 	// morphology, weaker tokenizer coverage): the reply of a chunk is
 	// budgeted at kkOutputFactor x the payload tokens + a fixed overhead.
 	kkOutputFactor   = 1.7
 	kkOutputOverhead = 150
 	// groqTranslateMaxWait: a user is waiting on the translation — never
-	// sit on the per-minute window for long; the DeepSeek fallback is
-	// tried instead.
+	// sit on the per-minute window for long; the next free bucket (or the
+	// paid fallback) is tried instead.
 	groqTranslateMaxWait = 8 * time.Second
 )
 
@@ -105,7 +108,7 @@ func NewTranslatorService(ds *deepseek.Client, repo *repositories.TranslationRep
 	return t
 }
 
-// WithGroq wires the primary translator (Groq Qwen).
+// WithGroq wires the free Groq provider (Qwen primary, GPT-OSS secondary).
 func (t *TranslatorService) WithGroq(gq *groq.Client) *TranslatorService {
 	if gq != nil && gq.Enabled() {
 		t.gq = gq
@@ -188,7 +191,7 @@ func (t *TranslatorService) QuestionIDsForTest(ctx context.Context, testID int64
 // CopyTranslationsToTest carries the cached Kazakh translations of a source
 // test over to a freshly CLONED test (same content, new question ids), so
 // Kazakh-speaking users reuse the existing translation instead of paying
-// for a new translation. Pure DB work — zero API cost.
+// for a new DeepSeek call. Pure DB work — zero API cost.
 func (t *TranslatorService) CopyTranslationsToTest(ctx context.Context, srcTestID int64, dstQuestionIDs []int64) (int64, error) {
 	if !t.Enabled() {
 		return 0, nil
@@ -243,6 +246,13 @@ func translationOutputBudget(payload []translationQuestion) int {
 	return int(float64(groq.EstimateTextTokens(string(body)))*kkOutputFactor) + kkOutputOverhead
 }
 
+// gptOSSTranslateHeadroom: GPT-OSS always spends some reasoning tokens even
+// at effort=low — extra output budget on top of the visible JSON.
+const (
+	gptOSSTranslateHeadroom    = 1200
+	gptOSSTranslateMinHeadroom = 300
+)
+
 // fitsOneGroqRequest reports whether a chunk (prompt + expected reply) fits
 // the per-request ceiling (free-tier TPM) of the primary Groq translator.
 func fitsOneGroqRequest(questions []models.Question) bool {
@@ -258,7 +268,6 @@ func fitsOneGroqRequest(questions []models.Question) bool {
 // each fit one Groq request (typically 2–3 chunks for a 20-question test).
 // A single oversized question still forms its own chunk — the Groq step
 // then reports ErrTooLarge locally (no HTTP call) and DeepSeek handles it.
-// The same chunks are used by the DeepSeek fallback (small max_tokens).
 func chunkForTranslation(questions []models.Question) [][]models.Question {
 	var chunks [][]models.Question
 	var cur []models.Question
@@ -277,30 +286,38 @@ func chunkForTranslation(questions []models.Question) [][]models.Question {
 	return chunks
 }
 
-// translationSteps returns the provider route of one chunk: Groq Qwen
-// (instruct) → DeepSeek flash (non-thinking). Both get the same tight
-// output cap: the estimate + 33% headroom.
+// translationSteps returns the provider route of one chunk.
 func (t *TranslatorService) translationSteps(msgs []deepseek.Message, outBudget int) []aiStep {
-	maxTokens := outBudget + outBudget/3
 	var steps []aiStep
 	if t.gq != nil {
-		steps = append(steps, groqStep(t.gq, groq.Request{
-			Model: groq.ModelQwen27B, Messages: toGroqMessages(msgs),
-			// Clamped to the per-request ceiling by the client; the limiter
-			// re-credits unused tokens.
-			MaxTokens: maxTokens, MinTokens: outBudget,
-			Effort:      groq.EffortNone, // instruct mode — translation needs no reasoning
-			Temperature: 0.3, TopP: 0.8,
-			Schema: translationJSONSchema, SchemaName: "kk_translation",
-			MaxWait: groqTranslateMaxWait,
-		}))
+		gm := toGroqMessages(msgs)
+		steps = append(steps,
+			groqStep(t.gq, groq.Request{
+				Model: groq.ModelQwen27B, Messages: gm,
+				// +33% headroom over the estimate (clamped to the per-request
+				// ceiling by the client); the limiter re-credits unused tokens.
+				MaxTokens: outBudget + outBudget/3, MinTokens: outBudget,
+				Effort:      groq.EffortNone, // instruct mode — translation needs no reasoning
+				Temperature: 0.3, TopP: 0.8,
+				Schema: translationJSONSchema, SchemaName: "kk_translation",
+				MaxWait: groqTranslateMaxWait,
+			}),
+			groqStep(t.gq, groq.Request{
+				Model: groq.ModelGPTOSS120B, Messages: gm,
+				MaxTokens: outBudget + gptOSSTranslateHeadroom,
+				MinTokens: outBudget + gptOSSTranslateMinHeadroom,
+				Effort:    groq.EffortLow,
+				Schema:    translationJSONSchema, SchemaName: "kk_translation",
+				MaxWait: groqTranslateMaxWait,
+			}),
+		)
 	}
 	if t.ds != nil {
 		ds := t.ds
 		steps = append(steps, aiStep{
-			name: "deepseek/" + deepseek.Model + "(non-thinking)",
+			name: "deepseek/" + ds.ReasonerModel() + "(translate)",
 			run: func(ctx context.Context) (string, error) {
-				return ds.TranslateJSON(ctx, msgs, maxTokens)
+				return ds.TranslateJSON(ctx, msgs, translateMaxTokens)
 			},
 		})
 	}

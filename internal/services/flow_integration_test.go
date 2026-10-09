@@ -31,7 +31,7 @@ import (
 
 	"github.com/Bihan293/Juz40tester/internal/config"
 	"github.com/Bihan293/Juz40tester/internal/database"
-	"github.com/Bihan293/Juz40tester/internal/deepseek"
+	"github.com/Bihan293/Juz40tester/internal/groq"
 	"github.com/Bihan293/Juz40tester/internal/models"
 	"github.com/Bihan293/Juz40tester/internal/repositories"
 	"github.com/Bihan293/Juz40tester/internal/testutil"
@@ -137,7 +137,7 @@ func newFlowEnv(t *testing.T) *flowEnv {
 	e.attempts = repositories.NewAttemptRepository(pool)
 	e.users = repositories.NewUserRepository(pool)
 	state := repositories.NewStateRepository(pool)
-	e.genSvc = NewGeneratorService(deepseek.New("k", srv.URL), &config.Config{}, e.gen, e.subjects, state)
+	e.genSvc = NewGeneratorService(nil, &config.Config{}, e.gen, e.subjects, state).WithGroq(groq.New("k", srv.URL))
 	e.quiz = NewQuizService(e.subjects, e.attempts, state, e.gen, e.genSvc, e.users)
 	e.sid, err = testutil.CreateSubject(ctx, pool, "Биология flow "+time.Now().Format("150405.000000"))
 	if err != nil {
