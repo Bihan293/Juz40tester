@@ -33,7 +33,16 @@ const (
 	// repairRounds bounds the targeted rewrite loop.
 	repairRounds = 2
 	// repairMaxTokens: up to ~6 questions per call — far below a full test.
+	// Budget of the free Groq repair steps.
 	repairMaxTokens = 4000
+	// dsRepairMaxTokens: max_tokens of the PAID DeepSeek repair (thinking +
+	// ~6 questions). Higher than the Groq budget: DeepSeek is the last
+	// provider, a truncated reply fails the repair. Only produced tokens
+	// are billed. Was 4000 (the same as Groq).
+	dsRepairMaxTokens = 8000
+	// deepseekRepairCallTimeout bounds one paid repair call including its
+	// truncation retry and transient-error retries.
+	deepseekRepairCallTimeout = 5 * time.Minute
 	// repairBatch caps the number of questions in one repair call.
 	repairBatch = 6
 )
@@ -97,7 +106,9 @@ func (g *GeneratorService) repairSteps(messages []deepseek.Message) []aiStep {
 			name:    "deepseek/" + ds.ReasonerModel() + "(low)",
 			reserve: deepseekRepairReserve,
 			run: func(ctx context.Context) (string, error) {
-				return ds.GenerateJSON(ctx, messages, repairMaxTokens, deepseek.ThinkingEffortLow)
+				cctx, cancel := context.WithTimeout(ctx, deepseekRepairCallTimeout)
+				defer cancel()
+				return ds.GenerateJSON(cctx, messages, dsRepairMaxTokens, deepseek.ThinkingEffortLow)
 			},
 		})
 	}
@@ -264,8 +275,9 @@ const (
 	// unfinished attempt is skipped by the sweep for this long (no AI call).
 	sweepBusyPostpone = 6 * time.Hour
 	// deepseekRepairReserve: time guaranteed to the paid DeepSeek repair
-	// step — the free Groq repair steps are cut to leave it.
-	deepseekRepairReserve = 3 * time.Minute
+	// step — the free Groq repair steps are cut to leave it (was 3 min;
+	// now fits a thinking reply plus one retry).
+	deepseekRepairReserve = 5 * time.Minute
 )
 
 // RunQualitySweep audits stored questions that have not been checked yet.

@@ -236,6 +236,35 @@ const weakCoverageNeed = 3
 // topicMatches reports whether the question topic is the wanted topic
 // (normalised spelling or the same catalog topic_key).
 func topicMatches(got, want string, catalog *models.TopicCatalog) bool {
+	if topicMatchesExact(got, want, catalog) {
+		return true
+	}
+	// A model often adds a qualifier to the requested topic: «X (уточнение)»,
+	// «X: подтема», «X — подтема». It is still a question on topic X.
+	if b := topicBase(got); b != "" && b != strings.TrimSpace(got) {
+		return topicMatchesExact(b, want, catalog)
+	}
+	return false
+}
+
+// topicBase strips a trailing qualifier from a model-written topic:
+// «Генетика (законы Менделя)» → «Генетика», «Генетика: законы» →
+// «Генетика», «Генетика — законы» → «Генетика». Only the GOT side is ever
+// stripped — a requested topic keeps its full meaning.
+func topicBase(t string) string {
+	t = strings.TrimSpace(t)
+	if i := strings.Index(t, "("); i > 0 {
+		t = t[:i]
+	}
+	for _, sep := range []string{":", " — ", " – ", " - "} {
+		if i := strings.Index(t, sep); i > 0 {
+			t = t[:i]
+		}
+	}
+	return strings.TrimSpace(t)
+}
+
+func topicMatchesExact(got, want string, catalog *models.TopicCatalog) bool {
 	if models.NormalizeTopic(got) == models.NormalizeTopic(want) {
 		return true
 	}

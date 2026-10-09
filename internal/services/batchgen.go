@@ -53,10 +53,28 @@ const (
 	groqBatchStepTimeout = 90 * time.Second
 	// groqBatchMaxWait bounds the local rate-limiter wait of a batch call.
 	groqBatchMaxWait = 45 * time.Second
-	// deepseekBatchTimeout bounds one paid batch call.
-	deepseekBatchTimeout = 2 * time.Minute
+	// dsBatchMaxTokens: max_tokens of one PAID DeepSeek batch call (thinking
+	// + ~1000 visible tokens). The Groq batch budget stays genBatchMaxTokens;
+	// DeepSeek is the last provider, so its reply must not be cut off by the
+	// cap (prod: «truncated at max_tokens, 0 visible chars» — the thinking
+	// ate the whole budget). Only produced tokens are billed. Was 3500.
+	dsBatchMaxTokens = 8000
+	// deepseekBatchCallTimeout bounds one paid batch call INCLUDING its
+	// truncation retry and transient-error retries. It starts after the
+	// paid-call semaphore slot is acquired (was 2 min including the queue).
+	deepseekBatchCallTimeout = 5 * time.Minute
 	// batchMaxRounds: how many times the still-missing slots are re-asked.
 	batchMaxRounds = 4
+	// batchRescueMaxMissing / batchRescueRounds / batchRescueSize: when
+	// only a few slots are still empty after batchMaxRounds, they are asked
+	// again in small batches with relaxed checks (rescue) instead of
+	// failing the whole 20-question test.
+	batchRescueMaxMissing = 6
+	batchRescueRounds     = 2
+	batchRescueSize       = 2
+	// batchRescueDifficultySlack: the per-question difficulty slack of a
+	// rescue round (the test-level difficulty contract still applies).
+	batchRescueDifficultySlack = 2
 	// maxHardFlaggedPerBatchReply: a batch reply with more giveaway
 	// questions than this is sloppy as a whole (the rest are repaired).
 	maxHardFlaggedPerBatchReply = 2
@@ -304,12 +322,46 @@ func (spec *genSpec) acceptTopic(q *generatedQuestion, slot genSlot) bool {
 	return true
 }
 
+// acceptTopicRelaxed is acceptTopic of a RESCUE round (only a few slots
+// left): a required-topic slot of a personal test also takes a question on
+// ANY of the requested weak topics, and a weak-topic slot of a chain test
+// also takes a question on any acceptable free topic. The test-level
+// contract (all personal topics covered, weak coverage of the chain) is
+// still checked on the assembled test.
+func (spec *genSpec) acceptTopicRelaxed(q *generatedQuestion, slot genSlot) bool {
+	if spec.acceptTopic(q, slot) {
+		return true
+	}
+	if slot.Topic == "" {
+		return false
+	}
+	if len(spec.personalTopics) > 0 {
+		for _, t := range spec.personalTopics {
+			if topicMatches(q.Topic, t, spec.catalog) {
+				q.Topic = t
+				return true
+			}
+		}
+		return false
+	}
+	return spec.acceptTopic(q, genSlot{Difficulty: slot.Difficulty})
+}
+
 // matchBatch validates a batch reply question by question and assigns the
 // usable questions to the slots of the group. The reply as a whole is
 // rejected when fewer than half of the slots got a usable question (or it
 // is sloppy: too many giveaway questions) — the reason goes back to the
 // model as feedback.
-func (g *GeneratorService) matchBatch(ctx context.Context, spec *genSpec, group []int, raw string, avoid []string) (map[int]*generatedQuestion, error) {
+//
+// relaxed (rescue round): difficulty slack batchRescueDifficultySlack and
+// acceptTopicRelaxed.
+func (g *GeneratorService) matchBatch(ctx context.Context, spec *genSpec, group []int, raw string, avoid []string, relaxed bool) (map[int]*generatedQuestion, error) {
+	slack := batchDifficultySlack
+	accept := spec.acceptTopic
+	if relaxed {
+		slack = batchRescueDifficultySlack
+		accept = spec.acceptTopicRelaxed
+	}
 	gt, err := parseLooseJSON(raw)
 	if err != nil {
 		return nil, err
@@ -341,7 +393,7 @@ func (g *GeneratorService) matchBatch(ctx context.Context, spec *genSpec, group 
 		diffMiss, topicMiss := false, false
 		// Two passes: an exact-difficulty slot first, then one within the
 		// slack — a greedy first fit wasted exact slots on near matches.
-		for pass := 0; pass <= batchDifficultySlack && !placed; pass++ {
+		for pass := 0; pass <= slack && !placed; pass++ {
 			for _, si := range group {
 				if out[si] != nil {
 					continue
@@ -349,14 +401,14 @@ func (g *GeneratorService) matchBatch(ctx context.Context, spec *genSpec, group 
 				slot := spec.slots[si]
 				cand := q
 				if d := abs(cand.Difficulty - slot.Difficulty); d != pass {
-					if d > batchDifficultySlack {
+					if d > slack {
 						diffMiss = true
 					}
 					continue
 				}
 				// Required-topic slots only take their topic; a question on a
 				// required topic may still fill a free slot.
-				if !spec.acceptTopic(&cand, slot) {
+				if !accept(&cand, slot) {
 					topicMiss = true
 					continue
 				}
@@ -456,15 +508,18 @@ func (g *GeneratorService) batchSteps(messages func() []deepseek.Message, kind s
 		}
 		ds := g.ds
 		steps = append(steps, aiStep{
-			name:    "deepseek/" + ds.ReasonerModel() + "(" + effort + ")",
-			timeout: deepseekBatchTimeout,
+			name: "deepseek/" + ds.ReasonerModel() + "(" + effort + ")",
+			// No step timeout: waiting for a semaphore slot must not eat
+			// the call's time — the timeout starts after the slot.
 			run: func(ctx context.Context) (string, error) {
 				release, err := g.acquireDeepSeek(ctx)
 				if err != nil {
 					return "", err
 				}
 				defer release()
-				return ds.GenerateJSON(ctx, messages(), genBatchMaxTokens, effort)
+				cctx, cancel := context.WithTimeout(ctx, deepseekBatchCallTimeout)
+				defer cancel()
+				return ds.GenerateJSON(cctx, messages(), dsBatchMaxTokens, effort)
 			},
 		})
 	}
@@ -499,7 +554,7 @@ func groqDynStep(gc *groq.Client, model, effort string, temp, topP float64, mess
 }
 
 // runBatch asks the providers for the questions of one group of slots.
-func (g *GeneratorService) runBatch(ctx context.Context, job *models.GenerationJob, spec *genSpec, group []int, avoid []string, alt int) (map[int]*generatedQuestion, string, error) {
+func (g *GeneratorService) runBatch(ctx context.Context, job *models.GenerationJob, spec *genSpec, group []int, avoid []string, alt int, relaxed bool) (map[int]*generatedQuestion, string, error) {
 	var feedback string
 	var result map[int]*generatedQuestion
 	messages := func() []deepseek.Message {
@@ -509,7 +564,7 @@ func (g *GeneratorService) runBatch(ctx context.Context, job *models.GenerationJ
 		}
 	}
 	validate := func(raw string) error {
-		got, err := g.matchBatch(ctx, spec, group, raw, avoid)
+		got, err := g.matchBatch(ctx, spec, group, raw, avoid, relaxed)
 		if err != nil {
 			return err
 		}
@@ -517,6 +572,9 @@ func (g *GeneratorService) runBatch(ctx context.Context, job *models.GenerationJ
 		return nil
 	}
 	task := fmt.Sprintf("gen %s job %d batch %v", job.Kind, job.ID, group)
+	if relaxed {
+		task += " (rescue)"
+	}
 	_, provider, err := runStepsFeedback(ctx, task, g.batchSteps(messages, spec.kind, job.Attempts, alt), validate,
 		func(e error) { feedback = e.Error() })
 	return result, provider, err
@@ -584,19 +642,21 @@ func (g *GeneratorService) generateBatched(ctx context.Context, job *models.Gene
 	// same R-9 behaviour as the full strategy (whose runSteps error already
 	// wraps ErrBudgetExceeded).
 	var budgetHit atomic.Bool
-	for round := 0; round < batchMaxRounds && ctx.Err() == nil; round++ {
+	missingSlots := func() []int {
 		var missing []int
 		for i, q := range filled {
 			if q == nil {
 				missing = append(missing, i)
 			}
 		}
-		if len(missing) == 0 {
-			break
-		}
+		return missing
+	}
+	// runRound asks the providers for the missing slots in groups of size
+	// (up to par groups in parallel).
+	runRound := func(missing []int, size int, relaxed bool) {
 		var groups [][]int
-		for i := 0; i < len(missing); i += bs {
-			groups = append(groups, missing[i:min(i+bs, len(missing))])
+		for i := 0; i < len(missing); i += size {
+			groups = append(groups, missing[i:min(i+size, len(missing))])
 		}
 		var mu sync.Mutex
 		var wg sync.WaitGroup
@@ -617,7 +677,7 @@ func (g *GeneratorService) generateBatched(ctx context.Context, job *models.Gene
 				mu.Lock()
 				avoid := stems()
 				mu.Unlock()
-				got, provider, err := g.runBatch(ctx, job, spec, grp, avoid, myAlt)
+				got, provider, err := g.runBatch(ctx, job, spec, grp, avoid, myAlt, relaxed)
 				if err != nil {
 					if errors.Is(err, deepseek.ErrBudgetExceeded) {
 						budgetHit.Store(true)
@@ -645,6 +705,26 @@ func (g *GeneratorService) generateBatched(ctx context.Context, job *models.Gene
 			}()
 		}
 		wg.Wait()
+	}
+	for round := 0; round < batchMaxRounds && ctx.Err() == nil; round++ {
+		missing := missingSlots()
+		if len(missing) == 0 {
+			break
+		}
+		runRound(missing, bs, false)
+	}
+	// Rescue: only a few of the questions are still missing — the test must
+	// not fail as a whole because of them. Ask again in small batches (a
+	// small reply is never truncated and needs only one usable question)
+	// with relaxed per-question checks.
+	for round := 0; round < batchRescueRounds && ctx.Err() == nil; round++ {
+		missing := missingSlots()
+		if len(missing) == 0 || len(missing) > batchRescueMaxMissing {
+			break
+		}
+		log.Printf("generator: job %d: rescue round %d for %d missing question(s)", job.ID, round+1, len(missing))
+		metrics.Add(metrics.BatchRescue, float64(len(missing)), "kind", job.Kind)
+		runRound(missing, batchRescueSize, true)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err

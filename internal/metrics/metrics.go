@@ -37,6 +37,9 @@ const (
 	TemplateSaves = "gen_template_saves_total"
 	// BatchReuse: batches of a retried job reused instead of regenerated.
 	BatchReuse = "gen_batch_reuse_total"
+	// BatchRescue: questions asked again in a relaxed rescue round (only a
+	// few slots of a batched test were still missing).
+	BatchRescue = "gen_batch_rescue_total"
 	// QueueBackpressure: personal generations refused because the queue is full.
 	QueueBackpressure = "gen_queue_backpressure_total"
 	// DuplicateUpdates: Telegram updates dropped as already seen (update_id).
