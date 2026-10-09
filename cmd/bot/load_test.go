@@ -153,9 +153,9 @@ type fakeTG struct {
 	flooded  sync.Map // chat -> phase already 429ed
 	phase    atomic.Int64
 	n429     atomic.Int64
-	mu      sync.Mutex
-	waiters map[int64]chan string
-	calls   atomic.Int64
+	mu       sync.Mutex
+	waiters  map[int64]chan string
+	calls    atomic.Int64
 }
 
 func (f *fakeTG) expect(chatID int64) chan string {
@@ -443,7 +443,7 @@ func TestLoadAnswers(t *testing.T) {
 			name, wall.Round(time.Millisecond), pct(ok, .5).Round(time.Millisecond), pct(ok, .95).Round(time.Millisecond),
 			pct(ok, 1).Round(time.Millisecond), len(ok), users, rejected.Load(), lost.Load(), q, float64(q)/float64(users),
 			tgSrv.calls.Load()-calls0, tgSrv.n429.Load()-n4290, st.EmptyAcquireCount()-st0.EmptyAcquireCount(),
-			float64((st.AcquireDuration()-st0.AcquireDuration()).Milliseconds()))
+			float64((st.AcquireDuration() - st0.AcquireDuration()).Milliseconds()))
 		if testing.Verbose() {
 			t.Logf("top statements of %s:\n%s", name, tracer.top(12))
 		}
