@@ -168,7 +168,7 @@ func TestSubscriptionFlowThroughHandler(t *testing.T) {
 	}
 	// 2. The final answer charges one completion.
 	calls = answerAll()
-	if findCall(calls, "sendMessage", "списано 1 прохождение. Осталось сегодня: 0/1") == nil {
+	if findCall(calls, "editMessageText", "списано 1 прохождение. Осталось сегодня: 0/1") == nil {
 		t.Fatalf("charge line missing:\n%s", dumpCalls(calls))
 	}
 	var attemptID int64

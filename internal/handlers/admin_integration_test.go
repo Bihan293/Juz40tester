@@ -238,7 +238,7 @@ func TestAdminPanelThroughHandler(t *testing.T) {
 		t.Fatal(err)
 	}
 	calls = tapAs(adminFrom, fmt.Sprintf("%s%d:1:0", cbAnswer, attemptID))
-	if findCall(calls, "sendMessage", "списано 1 прохождение") == nil {
+	if findCall(calls, "editMessageText", "списано 1 прохождение") == nil {
 		t.Fatalf("admin completion:\n%s", dumpCalls(calls))
 	}
 
