@@ -369,6 +369,10 @@ func TestLoadAnswers(t *testing.T) {
 		var ms runtime.MemStats
 		runtime.ReadMemStats(&ms)
 		t.Logf("goroutines: %d before the load, %d after; heap in use %.1f MB", goroutines0, runtime.NumGoroutine(), float64(ms.HeapInuse)/(1<<20))
+		if os.Getenv("LOADTEST_GOROUTINES") != "" {
+			buf := make([]byte, 1<<20)
+			t.Logf("%s", buf[:runtime.Stack(buf, true)])
+		}
 	}()
 	t.Logf("config: users=%d rounds=%d update workers=%d DB_MAX_CONNS=%d RTT=%s TG latency=%s TG_MAX_RPS=%d",
 		users, rounds, w.updateWorkers, cfg.DBMaxConns, rtt, tgLatency, cfg.TGMaxRPS)
