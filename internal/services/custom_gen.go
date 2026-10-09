@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -36,12 +37,21 @@ const (
 	customCheckTimeout = 50 * time.Second
 	// customCheckMaxWait: a free model busy longer than this is skipped.
 	customCheckMaxWait = 10 * time.Second
-	// maxDisputedKeys: a test where the checker disputes more keys than
-	// this is sloppy as a whole — the job retries the generation instead
-	// of patching half of it.
-	maxDisputedKeys = 6
+	// maxDisputedKeys: a test where MORE keys than this stay disputed after
+	// the second opinion is sloppy as a whole — the job retries the
+	// generation instead of patching half of it. It counts only keys that
+	// two independent checks both reject, never the raw first-pass
+	// disagreements: a fast low-effort checker alone is wrong on many
+	// correct questions (it used to fail whole tests with «disputes 12 of
+	// 20 answer keys»).
+	maxDisputedKeys = 10
 	// verifyMaxTokens: the answer-key check output (reasoning included).
 	verifyMaxTokens = 5000
+	// secondOpinionMaxTokens: output budget of the second opinion, which
+	// re-solves only the disputed questions with more reasoning.
+	secondOpinionMaxTokens = 6000
+	// keyFixRounds bounds the rewrite → re-check loop of disputed keys.
+	keyFixRounds = 2
 )
 
 // sanitizeUntrusted removes the prompt markers (and the «<<<»/«>>>»
@@ -292,11 +302,11 @@ func parseVerify(raw string, want int) ([]int, error) {
 	return out, nil
 }
 
-// verifySteps is the provider route of the answer-key check: the models of
-// the generation route, the model that WROTE the test last (a second,
-// independent model checks it first). Free Groq models come first; the paid
-// DeepSeek flash is the fallback (its cost is logged by the client and
-// capped by the daily DeepSeek budget).
+// verifySteps is the provider route of the FIRST answer-key check: the
+// models of the generation route, the model that WROTE the test last (a
+// second, independent model checks it first). Free Groq models come first;
+// the paid DeepSeek flash is the fallback (its cost is logged by the client
+// and capped by the daily DeepSeek budget).
 func (g *GeneratorService) verifySteps(messages []deepseek.Message, writer string) []aiStep {
 	var first, last []aiStep
 	add := func(s aiStep) {
@@ -317,36 +327,81 @@ func (g *GeneratorService) verifySteps(messages []deepseek.Message, writer strin
 		add(groqStep(g.gq, qw))
 	}
 	if g.ds != nil {
-		ds := g.ds
-		add(aiStep{name: "deepseek/" + ds.ReasonerModel(), reserve: deepseekRepairReserve, paid: true, run: func(ctx context.Context) (string, error) {
-			if err := takePaidCall(ctx); err != nil {
-				return "", err
-			}
-			cctx, cancel := context.WithTimeout(ctx, deepseekRepairCallTimeout)
-			defer cancel()
-			return ds.GenerateJSON(cctx, messages, dsRepairMaxTokens, deepseek.ThinkingEffortLow)
-		}})
+		add(g.deepseekVerifyStep(messages))
 	}
 	// The writer itself only as a last resort (better than no check).
 	return append(first, last...)
 }
 
-// checkKeys runs one answer-key check over the questions idx and returns
-// the positions (indexes into qs) whose key the checker disputes, with the
-// checker's letter.
-func (g *GeneratorService) checkKeys(ctx context.Context, task, subjectName string, spec *genSpec, qs []generatedQuestion, idx []int) (map[int]int, string, error) {
+// deepseekVerifyStep is the paid DeepSeek step of an answer-key check.
+func (g *GeneratorService) deepseekVerifyStep(messages []deepseek.Message) aiStep {
+	ds := g.ds
+	return aiStep{name: "deepseek/" + ds.ReasonerModel(), reserve: deepseekRepairReserve, paid: true, run: func(ctx context.Context) (string, error) {
+		if err := takePaidCall(ctx); err != nil {
+			return "", err
+		}
+		cctx, cancel := context.WithTimeout(ctx, deepseekRepairCallTimeout)
+		defer cancel()
+		return ds.GenerateJSON(cctx, messages, dsRepairMaxTokens, deepseek.ThinkingEffortLow)
+	}}
+}
+
+// secondOpinionSteps is the route of the SECOND opinion on keys the first
+// checker disputed. It must be stronger than the first pass, not another
+// quick guess: GPT-OSS 120B with MEDIUM reasoning (it re-solves only the
+// disputed few, so the prompt and the thinking are small), then the paid
+// DeepSeek flash, then Qwen as a last resort.
+func (g *GeneratorService) secondOpinionSteps(messages []deepseek.Message) []aiStep {
+	var steps []aiStep
+	if g.gq != nil {
+		base := groq.Request{Messages: toGroqMessages(messages), MaxTokens: secondOpinionMaxTokens, MinTokens: 1500,
+			Schema: verifySchema, SchemaName: "ent_verify2", MaxWait: groqGenMaxWait}
+		oss := base
+		oss.Model, oss.Effort = groq.ModelGPTOSS120B, groq.EffortMedium
+		steps = append(steps, groqStep(g.gq, oss))
+	}
+	if g.ds != nil {
+		steps = append(steps, g.deepseekVerifyStep(messages))
+	}
+	if g.gq != nil {
+		qw := groq.Request{Messages: toGroqMessages(messages), MaxTokens: verifyMaxTokens, MinTokens: 1500,
+			Schema: verifySchema, SchemaName: "ent_verify2", MaxWait: groqGenMaxWait,
+			Model: groq.ModelQwen27B, Effort: groq.EffortNone, Temperature: 0.2}
+		steps = append(steps, groqStep(g.gq, qw))
+	}
+	return steps
+}
+
+// solveKeys asks the checker (the route built by stepsFor) to solve the
+// questions idx without their keys and returns, per position in idx, the
+// checker's letter index (0..3, -1 = «no single correct option»).
+func (g *GeneratorService) solveKeys(ctx context.Context, task, subjectName string, qs []generatedQuestion, idx []int,
+	stepsFor func([]deepseek.Message) []aiStep) ([]int, string, error) {
 	messages := []deepseek.Message{
 		{Role: "system", Content: verifySystemPrompt},
 		{Role: "user", Content: verifyPrompt(subjectName, qs, idx)},
 	}
 	var got []int
-	_, by, err := runSteps(ctx, task, g.verifySteps(messages, spec.servedBy), func(raw string) error {
+	_, by, err := runSteps(ctx, task, stepsFor(messages), func(raw string) error {
 		v, err := parseVerify(raw, len(idx))
 		if err != nil {
 			return err
 		}
 		got = v
 		return nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	return got, by, nil
+}
+
+// checkKeys runs one answer-key check over the questions idx and returns
+// the positions (indexes into qs) whose key the checker disputes, with the
+// checker's letter.
+func (g *GeneratorService) checkKeys(ctx context.Context, task, subjectName string, spec *genSpec, qs []generatedQuestion, idx []int) (map[int]int, string, error) {
+	got, by, err := g.solveKeys(ctx, task, subjectName, qs, idx, func(m []deepseek.Message) []aiStep {
+		return g.verifySteps(m, spec.servedBy)
 	})
 	if err != nil {
 		return nil, "", err
@@ -360,6 +415,53 @@ func (g *GeneratorService) checkKeys(ctx context.Context, task, subjectName stri
 	return disputed, by, nil
 }
 
+// confirmDisputes turns the first checker's disagreements into CONFIRMED
+// bad keys. A single fast pass is noisy (it contradicted 12 of 20 mostly
+// correct keys), so each disputed question is solved once more by a
+// stronger second opinion: if it sides with the writer's key, the first
+// checker was wrong and the question stays as it is (two votes against
+// one); only a question the second opinion also does not confirm (it agrees
+// with the first checker, or finds yet another answer / none) is bad.
+// When no second opinion is available at all the first checker's disputes
+// stand (the previous, stricter behaviour).
+func (g *GeneratorService) confirmDisputes(ctx context.Context, task, subjectName string, qs []generatedQuestion, disputed map[int]int) (map[int]int, string) {
+	if len(disputed) == 0 {
+		return disputed, ""
+	}
+	idx := make([]int, 0, len(disputed))
+	for i := range qs {
+		if _, ok := disputed[i]; ok {
+			idx = append(idx, i)
+		}
+	}
+	got, by, err := g.solveKeys(ctx, task+" 2nd-opinion", subjectName, qs, idx, g.secondOpinionSteps)
+	if err != nil {
+		log.Printf("custom-verify[%s]: no second opinion (%v) — the first checker's %d dispute(s) stand", task, err, len(disputed))
+		return disputed, ""
+	}
+	confirmed := map[int]int{}
+	for k, i := range idx {
+		if got[k] == qs[i].Correct {
+			log.Printf("custom-verify[%s]: q%d key %s upheld by %s (first checker said %s)", task, i+1, letterOf(qs[i].Correct), by, letterOf(disputed[i]))
+			continue
+		}
+		confirmed[i] = disputed[i]
+		log.Printf("custom-verify[%s]: q%d key %s NOT confirmed (first: %s, second %s: %s)", task, i+1, letterOf(qs[i].Correct), letterOf(disputed[i]), by, letterOf(got[k]))
+	}
+	return confirmed, by
+}
+
+// confirmedBadKeys is the full check of the questions idx: first pass,
+// then the second opinion on whatever the first pass disputed.
+func (g *GeneratorService) confirmedBadKeys(ctx context.Context, task, subjectName string, spec *genSpec, qs []generatedQuestion, idx []int) (bad map[int]int, firstBy string, firstDisputed int, err error) {
+	disputed, by, err := g.checkKeys(ctx, task, subjectName, spec, qs, idx)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	bad, _ = g.confirmDisputes(ctx, task, subjectName, qs, disputed)
+	return bad, by, len(disputed), nil
+}
+
 // letterOf renders a checker answer for prompts / logs.
 func letterOf(i int) string {
 	if i < 0 || i > 3 {
@@ -369,9 +471,11 @@ func letterOf(i int) string {
 }
 
 // verifyAnswerKeys is the second-model answer-key check of a custom test:
-// another model solves every question without the key; each disputed
-// question is rewritten (repair route) and checked again. A test whose keys
-// still disagree — or with too many disputes at once — fails this attempt
+// another model solves every question without the key; whatever it disputes
+// gets a stronger second opinion (a lone fast checker is often wrong), and
+// only keys NOT confirmed by that second look are rewritten (repair route)
+// and checked again. A test whose keys still disagree after the rewrite
+// rounds — or with too many confirmed problems at once — fails this attempt
 // (the job is retried), so a wrong key never reaches the student. Tokens
 // and the serving models are logged (Groq is free; the DeepSeek client
 // logs the $ cost of its calls).
@@ -385,55 +489,86 @@ func (g *GeneratorService) verifyAnswerKeys(ctx context.Context, task, subjectNa
 	for i := range all {
 		all[i] = i
 	}
-	disputed, by, err := g.checkKeys(ctx, task+" verify", subjectName, spec, gt.Questions, all)
-	if err != nil {
-		return err
-	}
-	logCost := func(stage string, n int, by string) {
+	logCost := func(stage string, first, confirmed int, by string) {
 		var in, out int64
 		if run != nil {
 			in, out = run.promptTok.Load()-in0, run.complTok.Load()-out0
 		}
-		log.Printf("custom-verify[%s]: %s checker=%s writer=%s disputed=%d/%d tokens_in=%d tokens_out=%d (groq free; deepseek $ see its log line)",
-			task, stage, by, spec.servedBy, n, len(gt.Questions), in, out)
+		log.Printf("custom-verify[%s]: %s checker=%s writer=%s first-pass-disputed=%d confirmed-bad=%d of %d tokens_in=%d tokens_out=%d (groq free; deepseek $ see its log line)",
+			task, stage, by, spec.servedBy, first, confirmed, len(gt.Questions), in, out)
 	}
-	logCost("check", len(disputed), by)
-	if len(disputed) == 0 {
-		return nil
-	}
-	if len(disputed) > maxDisputedKeys {
-		return fmt.Errorf("checker %s disputes %d of %d answer keys", by, len(disputed), len(gt.Questions))
-	}
-	idx := make([]int, 0, len(disputed))
-	items := make([]repairItem, 0, len(disputed))
-	for i := 0; i < len(gt.Questions); i++ {
-		alt, ok := disputed[i]
-		if !ok {
-			continue
-		}
-		idx = append(idx, i)
-		reason := fmt.Sprintf("независимая проверка считает верным вариант %s, а в ключе %s — вопрос неоднозначен или ключ неверен; перепиши вопрос так, чтобы верный ответ был ровно один и correct_index указывал на него",
-			letterOf(alt), letterOf(gt.Questions[i].Correct))
-		items = append(items, repairItem{Q: gt.Questions[i], Reasons: reason})
-		log.Printf("custom-verify[%s]: q%d key %s disputed (checker: %s)", task, i+1, letterOf(gt.Questions[i].Correct), letterOf(alt))
-	}
-	fixed, err := g.rewriteQuestions(ctx, task+" key-fix", subjectName, items)
-	if err != nil {
-		return fmt.Errorf("rewrite disputed questions: %w", err)
-	}
-	if len(fixed) != len(items) {
-		return fmt.Errorf("%d of %d disputed questions could not be rewritten", len(items)-len(fixed), len(items))
-	}
-	for k, q := range fixed {
-		gt.Questions[idx[k]] = q
-	}
-	again, by2, err := g.checkKeys(ctx, task+" re-verify", subjectName, spec, gt.Questions, idx)
+	bad, by, first, err := g.confirmedBadKeys(ctx, task+" verify", subjectName, spec, gt.Questions, all)
 	if err != nil {
 		return err
 	}
-	logCost("re-check", len(again), by2)
-	if len(again) > 0 {
-		return fmt.Errorf("%d rewritten question(s) still disputed by %s", len(again), by2)
+	logCost("check", first, len(bad), by)
+	for round := 1; len(bad) > 0; round++ {
+		if len(bad) > maxDisputedKeys {
+			return fmt.Errorf("checker %s: %d of %d answer keys are wrong or ambiguous", by, len(bad), len(gt.Questions))
+		}
+		if round > keyFixRounds {
+			return fmt.Errorf("%d question(s) still have a disputed answer key after %d rewrite round(s)", len(bad), keyFixRounds)
+		}
+		idx := make([]int, 0, len(bad))
+		for i := range gt.Questions {
+			if _, ok := bad[i]; ok {
+				idx = append(idx, i)
+			}
+		}
+		// Rewrite in the batches the repair route is sized for.
+		replaced := make([]int, 0, len(idx))
+		for start := 0; start < len(idx); start += repairBatch {
+			end := start + repairBatch
+			if end > len(idx) {
+				end = len(idx)
+			}
+			part := idx[start:end]
+			items := make([]repairItem, len(part))
+			for k, i := range part {
+				reason := fmt.Sprintf("независимая проверка считает верным вариант %s, а в ключе %s — вопрос неоднозначен или ключ неверен; перепиши вопрос так, чтобы верный ответ был ровно один и correct_index указывал на него",
+					letterOf(bad[i]), letterOf(gt.Questions[i].Correct))
+				items[k] = repairItem{Q: gt.Questions[i], Reasons: reason}
+				log.Printf("custom-verify[%s]: q%d key %s disputed (checker: %s), round %d", task, i+1, letterOf(gt.Questions[i].Correct), letterOf(bad[i]), round)
+			}
+			fixed, err := g.rewriteQuestions(ctx, fmt.Sprintf("%s key-fix r%d", task, round), subjectName, items)
+			if err != nil {
+				return fmt.Errorf("rewrite disputed questions: %w", err)
+			}
+			for k, q := range fixed {
+				gt.Questions[part[k]] = q
+				replaced = append(replaced, part[k])
+			}
+		}
+		if len(replaced) == 0 {
+			return fmt.Errorf("%d disputed questions could not be rewritten", len(bad))
+		}
+		sort.Ints(replaced)
+		again, by2, first2, err := g.confirmedBadKeys(ctx, fmt.Sprintf("%s re-verify r%d", task, round), subjectName, spec, gt.Questions, replaced)
+		if err != nil {
+			return err
+		}
+		logCost(fmt.Sprintf("re-check r%d", round), first2, len(again), by2)
+		// What could not be rewritten stays bad; rewritten ones are bad
+		// only if the re-check does not confirm them.
+		next := map[int]int{}
+		for i, alt := range bad {
+			if !contains(replaced, i) {
+				next[i] = alt
+			}
+		}
+		for i, alt := range again {
+			next[i] = alt
+		}
+		bad = next
 	}
 	return nil
+}
+
+func contains(xs []int, v int) bool {
+	for _, x := range xs {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
