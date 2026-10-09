@@ -10,16 +10,17 @@ package services
 //     slot difficulty ±1, no repeat of the previous test or of the questions
 //     already in this test, quality audit). Good questions are kept even if
 //     their neighbours are bad; only the missing slots are asked again.
-//   - A rejected batch reply is retried by the next provider step WITH the
-//     rejection reason (feedback) — models ignore instructions most often
-//     on a blind retry.
+//   - When a batch reply is rejected as a whole, the next round re-asks the
+//     same slots WITH the rejection reason (feedback) — models ignore
+//     instructions most often on a blind retry.
 //   - Accepted questions are persisted per slot (gen_job_batches): a job
 //     retried after a failure, timeout or deploy reuses them.
 //   - Prompt caching: the long prefix (system prompt + subject + scale +
 //     previous test + topic list) is byte-identical across the batches of a
-//     job; only the short batch spec at the END differs, so Groq/DeepSeek
-//     prefix caching serves the prefix from cache (cheaper, and on Groq
-//     cached tokens do not count toward the rate limits).
+//     job; only the short batch spec at the END differs, so DeepSeek
+//     context caching serves the prefix from cache (cache-hit input is
+//     ~50x cheaper).
+//   - Every batch call is deepseek-flash, thinking, reasoning_effort=high.
 
 import (
 	"context"
@@ -36,25 +37,17 @@ import (
 
 	"github.com/Bihan293/Juz40tester/internal/config"
 	"github.com/Bihan293/Juz40tester/internal/deepseek"
-	"github.com/Bihan293/Juz40tester/internal/groq"
 	"github.com/Bihan293/Juz40tester/internal/metrics"
 	"github.com/Bihan293/Juz40tester/internal/models"
 )
 
 const (
 	// genBatchMaxTokens caps one batch call (5 questions ≈ 900–1100
-	// visible tokens + the reasoning pass).
-	genBatchMaxTokens = 3500
-	// groqBatchMinTokens: a batch request whose output budget would shrink
-	// below this is skipped without an HTTP call (next provider).
-	groqBatchMinTokens = 2000
-	// groqBatchStepTimeout bounds one Groq batch step (limiter wait + HTTP):
-	// a slow/bad Groq reply is abandoned quickly in favour of the next step.
-	groqBatchStepTimeout = 90 * time.Second
-	// groqBatchMaxWait bounds the local rate-limiter wait of a batch call.
-	groqBatchMaxWait = 45 * time.Second
-	// deepseekBatchTimeout bounds one paid batch call.
-	deepseekBatchTimeout = 2 * time.Minute
+	// visible tokens + the high-effort reasoning pass). Worst case of one
+	// call at peak flash pricing ≈ $0.0048.
+	genBatchMaxTokens = 4000
+	// deepseekBatchTimeout bounds one batch call.
+	deepseekBatchTimeout = 3 * time.Minute
 	// batchMaxRounds: how many times the still-missing slots are re-asked.
 	batchMaxRounds = 4
 	// maxHardFlaggedPerBatchReply: a batch reply with more giveaway
@@ -428,80 +421,11 @@ func reasonString(r map[string]int) string {
 	return strings.Join(parts, ", ")
 }
 
-// batchSteps is the provider route of one batch call: at most TWO Groq
-// attempts (then the paid DeepSeek fallback). Chain batches always start on
-// GPT-OSS 120B (quality of the shared chain); other batches alternate the
-// first model by `alt`, so parallel batches use the two independent free
-// quotas at once. messages is evaluated at step run time (feedback).
-func (g *GeneratorService) batchSteps(messages func() []deepseek.Message, kind string, attempts, alt int) []aiStep {
-	retry := attempts > 1
-	var steps []aiStep
-	if g.gq != nil {
-		ossEffort := groq.EffortLow
-		if kind == models.TestKindChain && !retry {
-			ossEffort = groq.EffortMedium
-		}
-		oss := groqDynStep(g.gq, groq.ModelGPTOSS120B, ossEffort, 0, 0, messages)
-		qw := groqDynStep(g.gq, groq.ModelQwen27B, groq.EffortNone, 0.7, 0.8, messages)
-		if kind != models.TestKindChain && alt%2 == 1 {
-			steps = append(steps, qw, oss)
-		} else {
-			steps = append(steps, oss, qw)
-		}
-	}
-	if g.ds != nil {
-		effort := deepseek.ThinkingEffortLow
-		if kind == models.TestKindChain && !retry {
-			effort = deepseek.ThinkingEffortHigh
-		}
-		ds := g.ds
-		steps = append(steps, aiStep{
-			name:    "deepseek/" + ds.ReasonerModel() + "(" + effort + ")",
-			timeout: deepseekBatchTimeout,
-			run: func(ctx context.Context) (string, error) {
-				release, err := g.acquireDeepSeek(ctx)
-				if err != nil {
-					return "", err
-				}
-				defer release()
-				return ds.GenerateJSON(ctx, messages(), genBatchMaxTokens, effort)
-			},
-		})
-	}
-	return steps
-}
-
-// groqDynStep is a Groq batch step whose messages are built at run time.
-func groqDynStep(gc *groq.Client, model, effort string, temp, topP float64, messages func() []deepseek.Message) aiStep {
-	name := "groq/" + model
-	if effort != "" {
-		name += "(" + effort + ")"
-	}
-	return aiStep{name: name, timeout: groqBatchStepTimeout, run: func(ctx context.Context) (string, error) {
-		res, err := gc.ChatJSON(ctx, groq.Request{
-			Model:       model,
-			Messages:    toGroqMessages(messages()),
-			MaxTokens:   genBatchMaxTokens,
-			MinTokens:   groqBatchMinTokens,
-			Effort:      effort,
-			Temperature: temp,
-			TopP:        topP,
-			Schema:      testJSONSchema,
-			SchemaName:  "ent_test_batch",
-			MaxWait:     groqBatchMaxWait,
-		})
-		if err != nil {
-			return "", err
-		}
-		noteTokens(ctx, res.PromptTokens, res.CompletionTokens)
-		return res.Content, nil
-	}}
-}
-
-// runBatch asks the providers for the questions of one group of slots.
-func (g *GeneratorService) runBatch(ctx context.Context, job *models.GenerationJob, spec *genSpec, group []int, avoid []string, alt int) (map[int]*generatedQuestion, string, error) {
-	var feedback string
-	var result map[int]*generatedQuestion
+// runBatch asks the model for the questions of one group of slots.
+// feedback is the rejection reason of the previous round's reply for the
+// same slots ("" = none); the returned rejected is this reply's rejection
+// reason (for the next round).
+func (g *GeneratorService) runBatch(ctx context.Context, job *models.GenerationJob, spec *genSpec, group []int, avoid []string, feedback string) (result map[int]*generatedQuestion, provider, rejected string, err error) {
 	messages := func() []deepseek.Message {
 		return []deepseek.Message{
 			{Role: "system", Content: genSystemPrompt},
@@ -517,9 +441,9 @@ func (g *GeneratorService) runBatch(ctx context.Context, job *models.GenerationJ
 		return nil
 	}
 	task := fmt.Sprintf("gen %s job %d batch %v", job.Kind, job.ID, group)
-	_, provider, err := runStepsFeedback(ctx, task, g.batchSteps(messages, spec.kind, job.Attempts, alt), validate,
-		func(e error) { feedback = e.Error() })
-	return result, provider, err
+	_, provider, err = runStepsFeedback(ctx, task, g.genSteps(messages, genBatchMaxTokens, deepseekBatchTimeout, true), validate,
+		func(e error) { rejected = e.Error() })
+	return result, provider, rejected, err
 }
 
 func seedToGenerated(sq models.SeedQuestion) generatedQuestion {
@@ -577,9 +501,10 @@ func (g *GeneratorService) generateBatched(ctx context.Context, job *models.Gene
 	}
 
 	bs, par := g.batchSize(), g.batchParallel()
-	alt := 0
-	// budgetHit: a batch failed because the paid fallback hit the daily
-	// DeepSeek cap. The error is surfaced (wrapped) when the test can not be
+	// feedback: rejection reason of the last reply per group of slots
+	// (key fmt.Sprint(group)), fed into the next round's prompt.
+	feedback := map[string]string{}
+	// budgetHit: a batch failed because of the daily DeepSeek cap. The error is surfaced (wrapped) when the test can not be
 	// completed, so executeJob DEFERS the job instead of failing it — the
 	// same R-9 behaviour as the full strategy (whose runSteps error already
 	// wraps ErrBudgetExceeded).
@@ -603,8 +528,6 @@ func (g *GeneratorService) generateBatched(ctx context.Context, job *models.Gene
 		sem := make(chan struct{}, par)
 		for _, grp := range groups {
 			grp := grp
-			myAlt := alt
-			alt++
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -614,10 +537,17 @@ func (g *GeneratorService) generateBatched(ctx context.Context, job *models.Gene
 					return
 				}
 				defer func() { <-sem }()
+				key := fmt.Sprint(grp)
 				mu.Lock()
 				avoid := stems()
+				fb := feedback[key]
 				mu.Unlock()
-				got, provider, err := g.runBatch(ctx, job, spec, grp, avoid, myAlt)
+				got, provider, rejected, err := g.runBatch(ctx, job, spec, grp, avoid, fb)
+				if rejected != "" {
+					mu.Lock()
+					feedback[key] = rejected
+					mu.Unlock()
+				}
 				if err != nil {
 					if errors.Is(err, deepseek.ErrBudgetExceeded) {
 						budgetHit.Store(true)

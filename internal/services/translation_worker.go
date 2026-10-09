@@ -25,7 +25,7 @@ import (
 
 const (
 	// translationWorkers is the size of the translation worker pool. A
-	// translation is short (2–3 Groq calls) — two workers drain a burst of
+	// translation is short (2–3 calls) — two workers drain a burst of
 	// freshly opened tests without competing with generation for quota.
 	translationWorkers = 2
 	// translationJobTimeout bounds one translation run (all chunks, every

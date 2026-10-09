@@ -5,8 +5,10 @@
 // questions are sent back to the model with the concrete reasons, and the
 // model rewrites them (same topic, same difficulty). Every rewritten
 // question must pass both the structural checks and the quality audit
-// again; otherwise another round is tried. The same routine fixes legacy
-// questions already stored in the database (RunQualitySweep).
+// again; otherwise another round is tried. Repairs use the same model and
+// mode as generation (deepseek-flash, thinking, reasoning_effort=high).
+// The same routine fixes legacy questions already stored in the database
+// (RunQualitySweep).
 package services
 
 import (
@@ -20,20 +22,20 @@ import (
 	"time"
 
 	"github.com/Bihan293/Juz40tester/internal/deepseek"
-	"github.com/Bihan293/Juz40tester/internal/groq"
 	"github.com/Bihan293/Juz40tester/internal/models"
 	"github.com/Bihan293/Juz40tester/internal/repositories"
 )
 
 const (
 	// maxHardFlaggedPerReply: a reply with more giveaway questions than this
-	// is considered sloppy as a whole — the next provider writes the test
-	// from scratch instead of patching half of it.
+	// is considered sloppy as a whole — the test is written again from
+	// scratch instead of patching half of it.
 	maxHardFlaggedPerReply = 6
 	// repairRounds bounds the targeted rewrite loop.
 	repairRounds = 2
-	// repairMaxTokens: up to ~6 questions per call — far below a full test.
-	repairMaxTokens = 4000
+	// repairMaxTokens: up to ~6 questions per call (+ the high-effort
+	// thinking pass) — far below a full test.
+	repairMaxTokens = 5000
 	// repairBatch caps the number of questions in one repair call.
 	repairBatch = 6
 )
@@ -68,40 +70,11 @@ func repairPrompt(subjectName string, items []repairItem) string {
 	return b.String()
 }
 
-// repairSteps is the provider route of a repair call (free Groq first).
+// repairSteps is the route of a repair call: the generation step
+// (deepseek-flash, thinking high). As before, repairs do not take a slot
+// of the GEN_DEEPSEEK_CONCURRENCY semaphore.
 func (g *GeneratorService) repairSteps(messages []deepseek.Message) []aiStep {
-	var steps []aiStep
-	if g.gq != nil {
-		base := groq.Request{
-			Messages:   toGroqMessages(messages),
-			MaxTokens:  repairMaxTokens,
-			MinTokens:  1500,
-			Schema:     testJSONSchema,
-			SchemaName: "ent_repair",
-			MaxWait:    groqGenMaxWait,
-		}
-		oss := base
-		oss.Model = groq.ModelGPTOSS120B
-		oss.Effort = groq.EffortLow
-		steps = append(steps, groqStep(g.gq, oss))
-		qw := base
-		qw.Model = groq.ModelQwen27B
-		qw.Effort = groq.EffortNone
-		qw.Temperature = 0.7
-		qw.TopP = 0.8
-		steps = append(steps, groqStep(g.gq, qw))
-	}
-	if g.ds != nil {
-		ds := g.ds
-		steps = append(steps, aiStep{
-			name:    "deepseek/" + ds.ReasonerModel() + "(low)",
-			reserve: deepseekRepairReserve,
-			run: func(ctx context.Context) (string, error) {
-				return ds.GenerateJSON(ctx, messages, repairMaxTokens, deepseek.ThinkingEffortLow)
-			},
-		})
-	}
-	return steps
+	return g.genSteps(func() []deepseek.Message { return messages }, repairMaxTokens, 0, false)
 }
 
 // checkRewrite validates one rewritten question against its original:
@@ -263,9 +236,6 @@ const (
 	// sweepBusyPostpone: a flagged question that is on screen in an
 	// unfinished attempt is skipped by the sweep for this long (no AI call).
 	sweepBusyPostpone = 6 * time.Hour
-	// deepseekRepairReserve: time guaranteed to the paid DeepSeek repair
-	// step — the free Groq repair steps are cut to leave it.
-	deepseekRepairReserve = 3 * time.Minute
 )
 
 // RunQualitySweep audits stored questions that have not been checked yet.
@@ -341,9 +311,9 @@ func (g *GeneratorService) RunQualitySweep(ctx context.Context) (int, error) {
 			if ctx.Err() != nil {
 				return repaired, ctx.Err()
 			}
-			// Low priority: stop paying for repairs (and eating the Groq
-			// quota) as soon as a user is waiting for a generation. The
-			// remaining questions stay unchecked for the next sweep.
+			// Low priority: stop paying for repairs as soon as a user is
+			// waiting for a generation. The remaining questions stay
+			// unchecked for the next sweep.
 			if g.urgentWorkPending(ctx) {
 				log.Printf("quality sweep: yielding to urgent user generations — %d repair(s) left for later", len(list)-start)
 				return repaired, nil

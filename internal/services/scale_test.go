@@ -3,14 +3,11 @@ package services
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"math"
 	"strings"
 	"testing"
 
 	"github.com/Bihan293/Juz40tester/internal/config"
-	"github.com/Bihan293/Juz40tester/internal/deepseek"
-	"github.com/Bihan293/Juz40tester/internal/groq"
 	"github.com/Bihan293/Juz40tester/internal/metrics"
 	"github.com/Bihan293/Juz40tester/internal/models"
 )
@@ -318,35 +315,5 @@ func TestMetricsPrometheusFormat(t *testing.T) {
 	}
 	if metrics.Sum(metrics.DifficultyViolations) != 2 {
 		t.Fatal("sum")
-	}
-}
-
-// A worst-case batch prompt (20 long previous stems, a long topic list,
-// 15 already written questions, feedback) must leave the batch output
-// budget on the free tier.
-func TestBatchPromptFitsGroq(t *testing.T) {
-	prev := make([]models.Question, 20)
-	marks := make([]float64, 20)
-	for i := range prev {
-		prev[i] = models.Question{Topic: "Молекулярная генетика", Text: strings.Repeat("Какой процесс происходит ", 10)}
-	}
-	cat := &models.TopicCatalog{Aliases: map[string]string{"x": "x"}}
-	for i := 0; i < maxPromptTopics; i++ {
-		cat.Titles = append(cat.Titles, fmt.Sprintf("Длинное название темы номер %d", i))
-	}
-	spec := &genSpec{basePrompt: chainGenContext("Биология", 40, prev, marks, []string{"Генетика", "Клетка", "Экология"}) + topicListPrompt(cat)}
-	spec.slots = planChainSlots(40, []string{"Генетика"}, 20, 5)
-	avoid := make([]string, 15)
-	for i := range avoid {
-		avoid[i] = strings.Repeat("Уже написанный вопрос теста ", 4)
-	}
-	msgs := toGroqMessages([]deepseek.Message{
-		{Role: "system", Content: genSystemPrompt},
-		{Role: "user", Content: batchPrompt(spec, []int{0, 1, 2, 3, 4}, avoid, strings.Repeat("причина ", 30))},
-	})
-	for _, m := range []string{groq.ModelGPTOSS120B, groq.ModelQwen27B} {
-		if b := groq.Budget(m, msgs); b < groqBatchMinTokens {
-			t.Fatalf("%s: only %d output tokens left, need %d", m, b, groqBatchMinTokens)
-		}
 	}
 }

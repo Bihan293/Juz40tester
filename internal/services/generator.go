@@ -7,21 +7,18 @@
 // fingerprint templates (templates.go); the chain validators live in
 // chain_validate.go.
 //
-// Cost discipline (the pipeline was redesigned after burning ~$0.10 per
-// test; a generated 20-question test costs roughly $0.002–0.006 now):
-//   - ONE model call per test: deepseek-flash (V4.1-Flash) IN THINKING MODE
-//     writes the whole test and self-checks the answer keys. Effort is
-//     adaptive: chain tests (one per subject, shared by every user) get
-//     reasoning_effort=high — the "medium" level, best quality where the
-//     cost is amortised across all users; personal weak-topics tests get
-//     effort=low (a simpler, topics-only task); every RETRY of a failed
-//     job also drops to low — when a harder pass blew the token budget, a
-//     shorter thinking pass is what actually fits the budget;
+// Provider: EVERY generation (chain tests, personal weak-topics tests,
+// retries, batches, topic-bank batches, repairs of flagged questions) is
+// written by deepseek-flash (V4.1-Flash) IN THINKING MODE with
+// reasoning_effort=high — one model, one mode, no lower effort, no Groq.
+// A generated 20-question test costs roughly $0.005 off-peak / $0.01 peak.
+//
+// Cost discipline:
 //   - compact prompts: the previous test is passed as topic + short stem +
 //     the user's knowledge marks (0/1/2), never as full questions with all
 //     answer options; the polish step and the `why` field are gone;
 //   - max_tokens is a hard cap that also covers the hidden thinking tokens
-//     (8000 output tokens ≈ $0.0096 worst-case at peak flash pricing);
+//     (genMaxTokens / genBatchMaxTokens / repairMaxTokens);
 //   - locked chain tests are pre-generated only in off-peak hours (DeepSeek
 //     charges half price outside 01:00–04:00 and 06:00–10:00 UTC on
 //     weekdays); a test the user can already open is generated URGENTLY,
@@ -49,7 +46,6 @@ import (
 
 	"github.com/Bihan293/Juz40tester/internal/config"
 	"github.com/Bihan293/Juz40tester/internal/deepseek"
-	"github.com/Bihan293/Juz40tester/internal/groq"
 	"github.com/Bihan293/Juz40tester/internal/metrics"
 	"github.com/Bihan293/Juz40tester/internal/models"
 	"github.com/Bihan293/Juz40tester/internal/repositories"
@@ -66,45 +62,27 @@ const (
 	maxJobAttempts = 3
 	// retryDelay is the backoff applied between job retries.
 	retryDelay = 10 * time.Minute
-	// jobTimeout bounds a single generation run. It covers the whole
-	// provider route (up to 3 Groq steps of groqStepTimeout each, then the
-	// DeepSeek fallback, then the repair of flagged questions) and stays
-	// below stuckJobTimeout (the heartbeat keeps a live job fresh anyway).
-	// The Groq steps are cut so that deepseekGenReserve is always left for
-	// the paid fallback + repair (see aiStep.reserve).
+	// jobTimeout bounds a single generation run (all DeepSeek calls of the
+	// job plus the repair of flagged questions) and stays below
+	// stuckJobTimeout (the heartbeat keeps a live job fresh anyway).
 	jobTimeout = 14 * time.Minute
 	// stuckJobTimeout: a 'running' job idle longer than this is returned to
 	// 'pending' (the worker died mid-generation — deploy, restart, OOM).
 	stuckJobTimeout = 20 * time.Minute
-	// deepseekGenReserve: time guaranteed to the DeepSeek generation step
-	// (and the repair round after it) — the free Groq steps never use it.
-	deepseekGenReserve = 4 * time.Minute
 	// genMaxTokens caps the model output INCLUDING the hidden thinking
 	// tokens — the hard cost limiter of one FULL (20-question) generation
 	// (strategy "full" and the 10-question topic batches). 20 questions
-	// with 4 options need ~3000–3800 visible tokens; 6000 (was 8000) leaves
-	// a short thinking pass — a model that needs more is cut off and the
-	// next step runs instead of burning the budget. The batch strategy uses
-	// genBatchMaxTokens per 5 questions. Worst case of one call at peak
-	// flash pricing ≈ $0.0072.
-	genMaxTokens = 6000
-
-	// groqGenMinTokens is the smallest output budget a full Groq generation
-	// request may run with (was 4500). If the prompt leaves less than that
-	// under the free-tier per-request ceiling (TPM 8000), the Groq step is
-	// skipped without an HTTP call and the next provider runs; a reply cut
-	// off by the cap fails fast as truncated.
-	groqGenMinTokens = 3000
-	// groqGenMaxWait: the worker is a background process, so it may wait
-	// for the per-minute window (TPM 8000 ≈ one test per minute per model)
-	// instead of paying DeepSeek. Daily-quota exhaustion never waits.
-	groqGenMaxWait = 65 * time.Second
+	// with 4 options need ~3000–3800 visible tokens; 8000 leaves room for
+	// the high-effort thinking pass. A reply cut off by the cap fails fast
+	// (finish_reason=length) and the job is retried. The batch strategy
+	// uses genBatchMaxTokens per 5 questions. Worst case of one call at
+	// peak flash pricing ≈ $0.0096.
+	genMaxTokens = 8000
 )
 
 // GeneratorService generates tests with DeepSeek and manages the job queue.
 type GeneratorService struct {
 	ds         *deepseek.Client // nil when DEEPSEEK_API_KEY is not set
-	gq         *groq.Client     // nil / disabled when GROQ_API_KEY is not set
 	cfg        *config.Config
 	gen        *repositories.GenerationRepository
 	subjects   *repositories.SubjectRepository
@@ -248,17 +226,8 @@ func (g *GeneratorService) WithTranslator(t *TranslatorService) *GeneratorServic
 	return g
 }
 
-// WithGroq wires the free Groq provider (GPT-OSS 120B primary, Qwen 3.8
-// 27B secondary). DeepSeek then becomes the paid last-resort fallback.
-func (g *GeneratorService) WithGroq(gq *groq.Client) *GeneratorService {
-	if gq != nil && gq.Enabled() {
-		g.gq = gq
-	}
-	return g
-}
-
-// Enabled reports whether AI generation is configured (any provider).
-func (g *GeneratorService) Enabled() bool { return g != nil && (g.ds != nil || g.gq != nil) }
+// Enabled reports whether AI generation is configured (DEEPSEEK_API_KEY).
+func (g *GeneratorService) Enabled() bool { return g != nil && g.ds != nil }
 
 // ---------------------------------------------------------------------------
 // Prompts (kept deliberately compact — prompt tokens are billed too)
@@ -985,8 +954,8 @@ func (g *GeneratorService) ensurePersonalTest(ctx context.Context, userID, subje
 			return nil, false, topics, ErrPersonalGenLimit
 		}
 	}
-	// Backpressure (thousands of users vs a free AI quota of a few hundred
-	// tests a day): beyond GEN_MAX_ACTIVE_PERSONAL queued/running personal
+	// Backpressure (thousands of users vs a bounded generation throughput
+	// and daily DeepSeek cap): beyond GEN_MAX_ACTIVE_PERSONAL queued/running personal
 	// generations a new one is refused instead of growing the queue (and
 	// the wait of everybody in it) without bound. An already queued job of
 	// this user was handled above.
@@ -1040,15 +1009,8 @@ func (g *GeneratorService) RunWorker(ctx context.Context) {
 	if !g.Enabled() {
 		return
 	}
-	route := []string{}
-	if g.gq != nil {
-		route = append(route, "groq "+groq.ModelGPTOSS120B, "groq "+groq.ModelQwen27B)
-	}
-	if g.ds != nil {
-		route = append(route, "deepseek "+g.ds.ReasonerModel()+" (paid fallback)")
-	}
 	n := g.workerCount()
-	log.Printf("generator: starting %d worker(s) + quality sweep, provider route: %s", n, strings.Join(route, " → "))
+	log.Printf("generator: starting %d worker(s) + quality sweep, model: %s", n, genStepName)
 	var wg sync.WaitGroup
 	for i := 1; i <= n; i++ {
 		wg.Add(1)
@@ -1161,7 +1123,7 @@ const qualitySweepEvery = 5 * time.Minute
 // separate from the generation workers, so a long sweep (bounded by
 // jobTimeout) never delays a user's test; and it is skipped (and aborted
 // between repair batches) while urgent user jobs are due or running, so it
-// never competes with them for the Groq quota.
+// never competes with them for DeepSeek calls (and the daily cap).
 func (g *GeneratorService) runSweepLoop(ctx context.Context) (panicked bool) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -1351,17 +1313,14 @@ func (g *GeneratorService) executeJob(ctx context.Context, job *models.Generatio
 	bctx, bcancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer bcancel()
 	if runErr != nil && errors.Is(runErr, deepseek.ErrBudgetExceeded) {
-		// R-9: every free provider failed and the paid fallback is capped
-		// for today. Not a real failure — park the job (attempt not
-		// counted) and retry later: the free Groq quota may come back, and
-		// the DeepSeek budget resets at the next UTC day.
+		// R-9: the DeepSeek daily cap is reached. Not a real failure —
+		// park the job (attempt not counted) until the budget resets at
+		// the next UTC day.
 		until := g.now().Add(retryDelay)
 		if g.budget != nil {
-			if next := g.budget.NextDay(); next.Before(until) || g.gq == nil {
-				until = next
-			}
+			until = g.budget.NextDay()
 		}
-		log.Printf("generator: job %d deferred until %s — DeepSeek daily cap reached and no free provider succeeded", job.ID, until.Format(time.RFC3339))
+		log.Printf("generator: job %d deferred until %s — DeepSeek daily cap reached", job.ID, until.Format(time.RFC3339))
 		if derr := g.gen.DeferJob(bctx, job.ID, until); derr != nil {
 			log.Printf("generator: defer job %d: %v", job.ID, derr)
 		}
@@ -1660,8 +1619,8 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 }
 
 // generateFull is the original one-call strategy: the model writes all 20
-// questions; the reply is validated as a whole (and rejected as a whole).
-// A rejected reply's reason is fed back to the next provider step.
+// questions; the reply is validated as a whole (and rejected as a whole —
+// the job is then retried).
 func (g *GeneratorService) generateFull(ctx context.Context, job *models.GenerationJob, spec *genSpec, task string) (*generatedTest, error) {
 	var prompt string
 	if job.Kind == models.TestKindChain {
@@ -1669,16 +1628,11 @@ func (g *GeneratorService) generateFull(ctx context.Context, job *models.Generat
 	} else {
 		prompt = spec.basePrompt + personalOutputLine
 	}
-	var feedback string
 	messages := func() []deepseek.Message {
-		m := []deepseek.Message{
+		return []deepseek.Message{
 			{Role: "system", Content: genSystemPrompt},
 			{Role: "user", Content: prompt},
 		}
-		if feedback != "" {
-			m[1].Content += "\nВНИМАНИЕ: предыдущий вариант этого теста ОТКЛОНЁН проверкой: " + feedback + ". Напиши тест заново и исправь именно это."
-		}
-		return m
 	}
 	var final *generatedTest
 	validate := func(raw string) error {
@@ -1692,7 +1646,7 @@ func (g *GeneratorService) generateFull(ctx context.Context, job *models.Generat
 		// Quality gate: a reply where many questions give the answer away
 		// by the options' format (only the key has the dash, the key is the
 		// only filled-in gap, duplicate options, «все ответы верны»…) is
-		// sloppy as a whole — let the next provider write it from scratch.
+		// sloppy as a whole — the test is written again from scratch.
 		// A few flagged questions are rewritten afterwards (targeted repair).
 		if n := countHard(auditGenerated(gt)); n > maxHardFlaggedPerReply {
 			return rejectf(rejectQuality, "quality audit: %d of %d questions reveal the answer or have broken options", n, len(gt.Questions))
@@ -1700,8 +1654,7 @@ func (g *GeneratorService) generateFull(ctx context.Context, job *models.Generat
 		final = gt
 		return nil
 	}
-	if _, _, err := runStepsFeedback(ctx, task, g.generationStepsDyn(messages, job.Kind, job.Attempts), validate,
-		func(e error) { feedback = e.Error() }); err != nil {
+	if _, _, err := runSteps(ctx, task, g.genSteps(messages, genMaxTokens, 0, true), validate); err != nil {
 		return nil, fmt.Errorf("generate: %w", err)
 	}
 	return final, nil
@@ -1720,7 +1673,7 @@ func (g *GeneratorService) validateReply(gt *generatedTest, spec *genSpec) error
 	case models.TestKindChain:
 		// Chain tests must match the difficulty of their chain position:
 		// a model that writes a beginner test for Тест 40 (or an olympiad
-		// for Тест 2) is rejected and the next provider writes it.
+		// for Тест 2) is rejected and written again.
 		if err := validateChainDifficulty(gt, spec.testNumber); err != nil {
 			return err
 		}
@@ -1771,113 +1724,6 @@ func (g *GeneratorService) subjectWeakTitles(ctx context.Context, subjectID int6
 	}
 	subjectWeakCache.put(subjectID, out)
 	return out
-}
-
-// generationSteps returns the ordered provider route for one generation
-// with fixed messages (topic batches, tests).
-func (g *GeneratorService) generationSteps(messages []deepseek.Message, kind string, attempts int) []aiStep {
-	return g.generationStepsDyn(func() []deepseek.Message { return messages }, kind, attempts)
-}
-
-// generationStepsDyn returns the provider route; messages is evaluated when
-// a step runs (so a rejected reply's feedback reaches the next step).
-//
-// Route (audit: at most TWO Groq attempts, then the paid DeepSeek):
-//
-//	chain, first attempt: GPT-OSS 120B (medium) → Qwen 3.8 27B → DeepSeek (high)
-//	chain retry / personal / topic batch: GPT-OSS 120B (low) → Qwen → DeepSeek (low)
-//
-// Qwen is the second attempt (not GPT-OSS at a lower effort): it has its
-// own free quota and fails differently, so a bad GPT-OSS reply is not
-// followed by a near-identical one.
-func (g *GeneratorService) generationStepsDyn(messages func() []deepseek.Message, kind string, attempts int) []aiStep {
-	retry := attempts > 1
-	var steps []aiStep
-	if g.gq != nil {
-		ossEffort := groq.EffortLow
-		if kind == models.TestKindChain && !retry {
-			ossEffort = groq.EffortMedium
-		}
-		oss := groqFullStep(g.gq, groq.ModelGPTOSS120B, ossEffort, 0, 0, messages)
-		qw := groqFullStep(g.gq, groq.ModelQwen27B, groq.EffortNone, 0.7, 0.8, messages) // instruct mode: no reasoning tokens
-		steps = append(steps, oss, qw)
-	}
-	if g.ds != nil {
-		effort := deepseek.ThinkingEffortHigh
-		if kind == models.TestKindPersonal || kind == models.JobKindTopicBatch || retry {
-			effort = deepseek.ThinkingEffortLow
-		}
-		ds := g.ds
-		steps = append(steps, aiStep{
-			name:    "deepseek/" + ds.ReasonerModel() + "(" + effort + ")",
-			reserve: deepseekGenReserve,
-			run: func(ctx context.Context) (string, error) {
-				// Bound the paid calls in flight across the worker pool:
-				// more workers must not mean a proportional DeepSeek burst.
-				release, err := g.acquireDeepSeek(ctx)
-				if err != nil {
-					return "", err
-				}
-				defer release()
-				return ds.GenerateJSON(ctx, messages(), genMaxTokens, effort)
-			},
-		})
-	}
-	return steps
-}
-
-// groqFullStep is a Groq step of a full (20/10-question) generation.
-func groqFullStep(gc *groq.Client, model, effort string, temp, topP float64, messages func() []deepseek.Message) aiStep {
-	name := "groq/" + model
-	if effort != "" {
-		name += "(" + effort + ")"
-	}
-	return aiStep{name: name, timeout: groqStepTimeout, run: func(ctx context.Context) (string, error) {
-		res, err := gc.ChatJSON(ctx, groq.Request{
-			Model:       model,
-			Messages:    toGroqMessages(messages()),
-			MaxTokens:   genMaxTokens,
-			MinTokens:   groqGenMinTokens,
-			Effort:      effort,
-			Temperature: temp,
-			TopP:        topP,
-			Schema:      testJSONSchema,
-			SchemaName:  "ent_test",
-			MaxWait:     groqGenMaxWait,
-		})
-		if err != nil {
-			return "", err
-		}
-		noteTokens(ctx, res.PromptTokens, res.CompletionTokens)
-		return res.Content, nil
-	}}
-}
-
-// testJSONSchema is the Structured Outputs schema of a generated test
-// (strict mode: every field required, no extra properties). Groq's
-// constrained decoding then guarantees a parseable reply; the semantic
-// checks (count, balance, duplicates, topics) stay in validateTest.
-var testJSONSchema = map[string]any{
-	"type": "object",
-	"properties": map[string]any{
-		"questions": map[string]any{
-			"type": "array",
-			"items": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"question":      map[string]any{"type": "string"},
-					"options":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-					"correct_index": map[string]any{"type": "integer"},
-					"topic":         map[string]any{"type": "string"},
-					"difficulty":    map[string]any{"type": "integer"},
-				},
-				"required":             []string{"question", "options", "correct_index", "topic", "difficulty"},
-				"additionalProperties": false,
-			},
-		},
-	},
-	"required":             []string{"questions"},
-	"additionalProperties": false,
 }
 
 // questionMarks maps each question of the previous chain test to the

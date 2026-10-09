@@ -13,7 +13,7 @@ import (
 
 	"github.com/Bihan293/Juz40tester/internal/config"
 	"github.com/Bihan293/Juz40tester/internal/database"
-	"github.com/Bihan293/Juz40tester/internal/groq"
+	"github.com/Bihan293/Juz40tester/internal/deepseek"
 	"github.com/Bihan293/Juz40tester/internal/models"
 	"github.com/Bihan293/Juz40tester/internal/repositories"
 	"github.com/Bihan293/Juz40tester/internal/testutil"
@@ -64,7 +64,7 @@ func TestTopicBatchWorkerB4a(t *testing.T) {
 	subjects := repositories.NewSubjectRepository(pool)
 	gen := repositories.NewGenerationRepository(pool)
 	state := repositories.NewStateRepository(pool)
-	g := NewGeneratorService(nil, &config.Config{}, gen, subjects, state).WithGroq(groq.New("k", srv.URL))
+	g := NewGeneratorService(deepseek.New("k", srv.URL), &config.Config{}, gen, subjects, state)
 
 	sid, err := testutil.CreateSubject(ctx, pool, "Биология B4a "+time.Now().Format("150405.000000"))
 	if err != nil {

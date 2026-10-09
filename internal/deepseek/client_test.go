@@ -3,11 +3,12 @@ package deepseek
 import (
 	"context"
 	"encoding/json"
-	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 )
 
 // TestEstimateCost guards the per-test price target: a typical 20-question
@@ -32,114 +33,143 @@ func TestEstimateCost(t *testing.T) {
 		t.Fatalf("worst-case peak cost exceeded the hard ceiling: $%.6f", worstPeak)
 	}
 
-	// Unknown models must not crash the estimator (they log without a price).
+	// An unknown model must not crash the estimator (logged without a price).
 	if off, peak := estimateCost("some-proxy-model", typical); off != 0 || peak != 0 {
 		t.Fatal("unknown model must estimate as 0")
 	}
 }
 
-// TestDefaults ensures the legacy model names removed from the DeepSeek API
-// on 2026-07-24 never come back as defaults — every request with them
-// fails with "model not found" and test generation silently dies.
-func TestDefaults(t *testing.T) {
-	if DefaultReasonerModel == "deepseek-reasoner" || DefaultModel == "deepseek-chat" {
-		t.Fatalf("legacy retired model names must not be defaults: %s / %s", DefaultReasonerModel, DefaultModel)
+// TestModelIsFlash: the bot calls exactly one model, and it is never one
+// of the legacy names removed from the DeepSeek API on 2026-07-24.
+func TestModelIsFlash(t *testing.T) {
+	if Model != "deepseek-flash" {
+		t.Fatalf("Model = %q, want deepseek-flash", Model)
 	}
-	c := New("key", "", "", "")
-	if c.ReasonerModel() != DefaultReasonerModel || c.Model() != DefaultModel {
-		t.Fatal("empty env model names must fall back to the defaults")
+	if len(prices) != 1 {
+		t.Fatalf("only the flash price must be known, got %d entries", len(prices))
 	}
 }
 
-func TestThinkingParamErrorClassification(t *testing.T) {
-	if isThinkingParamError(errors.New("deepseek: HTTP 400: maximum context length exceeded")) {
-		t.Fatal("a context-length 400 must not disable thinking")
-	}
-	if !isThinkingParamError(errors.New("deepseek: unknown field reasoning_effort (invalid_request_error)")) {
-		t.Fatal("explicit reasoning_effort rejection must be detected")
-	}
-	if isParamError(errors.New("deepseek: HTTP 400: This model's maximum context length is 128k")) {
-		t.Fatal("context-length errors must not route to the pricier fallback")
-	}
-	if isParamError(context.DeadlineExceeded) || isParamError(errors.New("deepseek: HTTP 500: oops")) {
-		t.Fatal("timeouts / 5xx must not route to the pricier fallback")
-	}
-}
-
-// TestFallbackRouting: a 5xx on the reasoner must NOT go to the pricier
-// fallback model, and an explicit thinking rejection disables thinking
-// once — the next call goes straight to the reasoner without thinking.
-func TestFallbackRouting(t *testing.T) {
+// TestModes: generation is ALWAYS thinking with effort "high"; the
+// translation fallback is ALWAYS non-thinking (thinking explicitly
+// disabled, no reasoning_effort). Errors are returned as is — no retry
+// without thinking, no other model.
+func TestModes(t *testing.T) {
 	var mu sync.Mutex
-	var calls []string
-	mode := "5xx"
+	var reqs []map[string]any
+	fail := false
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&req)
-		_, thinking := req["thinking"]
 		mu.Lock()
-		tag := req["model"].(string)
-		if thinking {
-			tag += "+thinking"
-		}
-		calls = append(calls, tag)
-		m := mode
+		reqs = append(reqs, req)
+		f := fail
 		mu.Unlock()
-		switch {
-		case m == "5xx":
-			w.WriteHeader(500)
-			_, _ = w.Write([]byte(`{"error":{"message":"overloaded","type":"server_error"}}`))
-		case m == "reject-thinking" && thinking:
+		if f {
 			w.WriteHeader(400)
 			_, _ = w.Write([]byte(`{"error":{"message":"unknown field thinking","type":"invalid_request_error"}}`))
-		default:
-			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"ok\":true}"},"finish_reason":"stop"}]}`))
+			return
 		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"ok\":true}"},"finish_reason":"stop"}]}`))
 	}))
 	defer srv.Close()
-	c := New("k", "pro", "flash", srv.URL)
+	c := New("k", srv.URL)
+	msgs := []Message{{Role: "user", Content: "x"}}
 
-	if _, err := c.GenerateJSON(context.Background(), []Message{{Role: "user", Content: "x"}}, 100, ThinkingEffortLow); err == nil {
-		t.Fatal("5xx must be returned as an error")
-	}
-	if len(calls) != 1 || calls[0] != "flash+thinking" || c.thinkingDisabled() {
-		t.Fatalf("5xx must not retry / fall back / disable thinking: %v", calls)
-	}
-
-	calls, mode = nil, "reject-thinking"
-	if _, err := c.GenerateJSON(context.Background(), []Message{{Role: "user", Content: "x"}}, 100, ThinkingEffortLow); err != nil {
+	if _, err := c.GenerateJSON(context.Background(), msgs, 100); err != nil {
 		t.Fatal(err)
 	}
-	if len(calls) != 2 || calls[1] != "flash" || !c.thinkingDisabled() {
-		t.Fatalf("thinking rejection must retry reasoner without thinking: %v", calls)
+	g := reqs[0]
+	if g["model"] != Model || g["reasoning_effort"] != "high" || g["thinking"].(map[string]any)["type"] != "enabled" {
+		t.Fatalf("generation must be flash thinking(high): %v", g)
 	}
-	calls = nil
-	if _, err := c.GenerateJSON(context.Background(), []Message{{Role: "user", Content: "x"}}, 100, ThinkingEffortLow); err != nil {
+	if _, ok := g["temperature"]; ok {
+		t.Fatalf("thinking mode must not send temperature: %v", g)
+	}
+
+	if _, err := c.TranslateJSON(context.Background(), msgs, 100); err != nil {
 		t.Fatal(err)
 	}
-	if len(calls) != 1 || calls[0] != "flash" {
-		t.Fatalf("with thinking disabled the first call must go without thinking: %v", calls)
+	tr := reqs[1]
+	if tr["model"] != Model || tr["thinking"].(map[string]any)["type"] != "disabled" {
+		t.Fatalf("translation must be flash non-thinking: %v", tr)
+	}
+	if _, ok := tr["reasoning_effort"]; ok {
+		t.Fatalf("non-thinking mode must not send reasoning_effort: %v", tr)
+	}
+	if tr["max_tokens"].(float64) != 100 {
+		t.Fatalf("max_tokens must be passed through: %v", tr)
+	}
+
+	reqs, fail = nil, true
+	if _, err := c.GenerateJSON(context.Background(), msgs, 100); err == nil {
+		t.Fatal("a rejected request must be returned as an error")
+	}
+	if len(reqs) != 1 {
+		t.Fatalf("a rejected request must not be retried in another mode/model: %d calls", len(reqs))
+	}
+}
+
+// fixedBudget records reservations/settlements.
+type fixedBudget struct {
+	mu                sync.Mutex
+	reserved, settled float64
+}
+
+func (b *fixedBudget) Reserve(_ context.Context, amount float64) error {
+	b.mu.Lock()
+	b.reserved += amount
+	b.mu.Unlock()
+	return nil
+}
+
+func (b *fixedBudget) Settle(_ context.Context, reserved, actual float64) {
+	b.mu.Lock()
+	b.settled += actual
+	b.mu.Unlock()
+}
+
+// TestNonThinkingBudget: the non-thinking translation fallback is booked
+// against the daily cap with the flash price (same per-token price as
+// thinking), and its worst case is bounded by its own (tight) max_tokens.
+func TestNonThinkingBudget(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"ok\":true}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":2000}}`))
+	}))
+	defer srv.Close()
+	b := &fixedBudget{}
+	c := New("k", srv.URL).WithBudget(b, func(time.Time) bool { return true })
+	if _, err := c.TranslateJSON(context.Background(), []Message{{Role: "user", Content: "x"}}, 2500); err != nil {
+		t.Fatal(err)
+	}
+	want := 1000*0.15e-6 + 2000*0.60e-6 // off-peak flash
+	if math.Abs(b.settled-want) > 1e-12 {
+		t.Fatalf("settled $%.8f, want $%.8f", b.settled, want)
+	}
+	// Worst case booked before the call: 2x (bytes*inMiss + 2500*out).
+	if b.reserved <= 2*2500*0.60e-6 || b.reserved > 0.004 {
+		t.Fatalf("unexpected worst-case reservation $%.6f", b.reserved)
 	}
 }
 
 // The per-job statistics of the generator learn the tokens of paid calls
-// through WithUsageHook (they used to count only the free Groq tokens).
+// through WithUsageHook.
 func TestUsageHookReportsTokens(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"ok\":true}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1200,"completion_tokens":800,"total_tokens":2000}}`))
 	}))
 	defer srv.Close()
-	c := New("k", "pro", "flash", srv.URL)
+	c := New("k", srv.URL)
 	var in, out int
 	ctx := WithUsageHook(context.Background(), func(p, c int) { in += p; out += c })
-	if _, err := c.GenerateJSON(ctx, []Message{{Role: "user", Content: "x"}}, 100, ThinkingEffortLow); err != nil {
+	if _, err := c.GenerateJSON(ctx, []Message{{Role: "user", Content: "x"}}, 100); err != nil {
 		t.Fatal(err)
 	}
 	if in != 1200 || out != 800 {
 		t.Fatalf("hook got in=%d out=%d, want 1200/800", in, out)
 	}
 	// No hook: nothing breaks.
-	if _, err := c.GenerateJSON(context.Background(), []Message{{Role: "user", Content: "x"}}, 100, ThinkingEffortLow); err != nil {
+	if _, err := c.GenerateJSON(context.Background(), []Message{{Role: "user", Content: "x"}}, 100); err != nil {
 		t.Fatal(err)
 	}
 }

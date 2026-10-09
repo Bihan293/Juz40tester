@@ -19,7 +19,7 @@ func (capBudget) Settle(context.Context, float64, float64) {}
 // ErrBudgetExceeded) so executeJob defers the job instead of burning one
 // of its attempts — exactly like the full strategy.
 func TestGenerateBatchedSurfacesBudgetExceeded(t *testing.T) {
-	ds := deepseek.New("test-key", "m", "r", "http://127.0.0.1:1").WithBudget(capBudget{}, nil)
+	ds := deepseek.New("test-key", "http://127.0.0.1:1").WithBudget(capBudget{}, nil)
 	g := &GeneratorService{ds: ds}
 	spec := &genSpec{
 		kind:           models.TestKindPersonal,
@@ -40,7 +40,7 @@ func TestGenerateBatchedSurfacesBudgetExceeded(t *testing.T) {
 // A repair that could not run because of the daily cap must also be
 // reported as ErrBudgetExceeded (deferral, not a failed attempt).
 func TestRepairFlaggedSurfacesBudgetExceeded(t *testing.T) {
-	ds := deepseek.New("test-key", "m", "r", "http://127.0.0.1:1").WithBudget(capBudget{}, nil)
+	ds := deepseek.New("test-key", "http://127.0.0.1:1").WithBudget(capBudget{}, nil)
 	g := &GeneratorService{ds: ds}
 	qs := validQuestions()
 	// A giveaway: two identical options (hard quality issue).
