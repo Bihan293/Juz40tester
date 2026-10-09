@@ -159,7 +159,9 @@ func TestOpenTestDoesNotWaitForTranslation(t *testing.T) {
 	// The question arrives by itself — in Kazakh.
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		if txt := f.last(); strings.HasPrefix(txt, "❓ Вопрос 1/20") {
+		// The question, then (test mode) the menu is replaced by
+		// «🚪 Выйти из теста».
+		if txt := f.find("❓ Вопрос 1/20"); txt != "" && f.find(testModeNotice) != "" {
 			if !strings.Contains(txt, "KK Вопрос номер") {
 				t.Fatalf("question shown untranslated:\n%s", txt)
 			}

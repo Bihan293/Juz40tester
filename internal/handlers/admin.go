@@ -145,7 +145,7 @@ func (h *Handler) handleAdminMessage(ctx context.Context, m *bot.Message, user *
 
 func isMenuButton(text string) bool {
 	switch text {
-	case kbSubjects, kbWeak, kbProgress, kbTop, kbSettings, kbPlans, kbAdmin:
+	case kbSubjects, kbWeak, kbCustom, kbProgress, kbTop, kbSettings, kbPlans, kbAdmin:
 		return true
 	}
 	return false

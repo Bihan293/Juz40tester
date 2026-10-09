@@ -41,6 +41,18 @@ func (f *fakeTG) last() string {
 	return f.texts[len(f.texts)-1]
 }
 
+// find returns the latest message text starting with prefix ("" = none).
+func (f *fakeTG) find(prefix string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := len(f.texts) - 1; i >= 0; i-- {
+		if strings.HasPrefix(f.texts[i], prefix) {
+			return f.texts[i]
+		}
+	}
+	return ""
+}
+
 func TestStatisticsShowsStreak(t *testing.T) {
 	url := os.Getenv("TEST_DATABASE_URL")
 	if url == "" {

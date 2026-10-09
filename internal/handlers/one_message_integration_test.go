@@ -149,7 +149,11 @@ func TestOneTelegramCallPerAnswer(t *testing.T) {
 		return id
 	}
 
-	if calls := tap(cbOpenTest + itoa(test.ID)); findCall(calls, "editMessageText", fmt.Sprintf("Вопрос 1/%d", total)) == nil {
+	// Opening the test: the question (one edit) + test mode on — the main
+	// menu is REPLACED by the single «🚪 Выйти из теста» button (one send,
+	// once per entry, never per answer).
+	if calls := tap(cbOpenTest + itoa(test.ID)); findCall(calls, "editMessageText", fmt.Sprintf("Вопрос 1/%d", total)) == nil ||
+		len(limited(calls)) != 2 || !isTestModeKeyboard(findCall(calls, "sendMessage", testModeNotice)) {
 		t.Fatalf("first question:\n%s", dumpCalls(calls))
 	}
 	aid := attemptID()
@@ -184,9 +188,10 @@ func TestOneTelegramCallPerAnswer(t *testing.T) {
 		}
 		// Last answer: the question turns into the result ABOVE the
 		// subject's tests grid (ONE edit) — the user is back in the subject
-		// menu, and nothing touches the reply keyboard.
+		// menu — and the main menu keyboard comes back (one send).
 		res := findCall(lim, "editMessageText", "Тест завершён")
-		if len(lim) != 1 || res == nil {
+		back := findCall(lim, "sendMessage", menuBackNotice)
+		if len(lim) != 2 || res == nil || back == nil || !strings.Contains(fmt.Sprint(back.p["reply_markup"]), kbSubjects) {
 			t.Fatalf("final answer = %d limited calls:\n%s", len(lim), dumpCalls(calls))
 		}
 		kb := fmt.Sprint(res.p["reply_markup"])
@@ -224,7 +229,7 @@ func TestOneTelegramCallPerAnswer(t *testing.T) {
 	}
 	calls = tap(cbExitYes + itoa(aid))
 	ex := findCall(calls, "editMessageText", "Вы вышли из теста")
-	if ex == nil || len(limited(calls)) != 1 {
+	if ex == nil || len(limited(calls)) != 2 || findCall(calls, "sendMessage", menuBackNotice) == nil {
 		t.Fatalf("exit:\n%s", dumpCalls(calls))
 	}
 	if kb := fmt.Sprint(ex.p["reply_markup"]); !strings.Contains(fmt.Sprint(ex.p["text"]), "Открыто тестов") ||
@@ -232,7 +237,9 @@ func TestOneTelegramCallPerAnswer(t *testing.T) {
 		t.Fatalf("exit must show the subject's tests list:\n%s", dumpCalls(calls))
 	}
 
-	// Nothing in the whole flow may pop up a keyboard on the phone.
+	// Nothing in the whole flow may pop up the system keyboard on the
+	// phone: the reply keyboard is only ever REPLACED (test mode ↔ main
+	// menu), never removed, and no force_reply / placeholder.
 	for _, c := range f.since(0) {
 		for _, bad := range []string{"remove_keyboard", "force_reply", "input_field_placeholder"} {
 			if strings.Contains(fmt.Sprint(c.p), bad) {
@@ -240,7 +247,20 @@ func TestOneTelegramCallPerAnswer(t *testing.T) {
 			}
 		}
 		if rm, ok := c.p["reply_markup"].(map[string]any); ok && rm["keyboard"] != nil {
-			t.Fatalf("%s re-sent the reply keyboard during a test: %v", c.method, c.p)
+			text := fmt.Sprint(c.p["text"])
+			if text != testModeNotice && text != menuBackNotice {
+				t.Fatalf("%s sent a reply keyboard outside the test-mode switch: %v", c.method, c.p)
+			}
 		}
 	}
+}
+
+// isTestModeKeyboard: the call carries the test-mode reply keyboard — one
+// «🚪 Выйти из теста» button and nothing of the main menu.
+func isTestModeKeyboard(c *tgCall) bool {
+	if c == nil {
+		return false
+	}
+	kb := fmt.Sprint(c.p["reply_markup"])
+	return strings.Contains(kb, kbExitTest) && !strings.Contains(kb, kbSubjects) && !strings.Contains(kb, kbWeak)
 }

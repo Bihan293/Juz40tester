@@ -232,6 +232,14 @@ func TestAdminPanelThroughHandler(t *testing.T) {
 	if q := question(userFrom); strings.Contains(q, "✅") || strings.Contains(q, "правильный ответ") {
 		t.Fatalf("user question shows the answer:\n%s", q)
 	}
+	// The student leaves the test (🚪 → ✅ Да, выйти) — test mode off.
+	var userAttempt int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM test_attempts WHERE user_id = $1 AND status = 'in_progress'`, userRow.ID).Scan(&userAttempt); err != nil {
+		t.Fatal(err)
+	}
+	if calls := tapAs(userFrom, cbExitYes+itoa(userAttempt)); findCall(calls, "sendMessage", menuBackNotice) == nil {
+		t.Fatalf("user exit:\n%s", dumpCalls(calls))
+	}
 	// The admin's completion is charged like anybody's (documented choice).
 	var attemptID int64
 	if err := pool.QueryRow(ctx, `SELECT id FROM test_attempts WHERE user_id = $1 AND status = 'in_progress'`, adminRow.ID).Scan(&attemptID); err != nil {

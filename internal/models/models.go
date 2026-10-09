@@ -62,6 +62,12 @@ type User struct {
 	// TestLang is the language of the TEST CONTENT only ("ru" or "kk") — the
 	// bot interface (buttons, menus, system messages) always stays Russian.
 	TestLang string
+	// ActiveAttemptID is the attempt the user is inside right now («test
+	// mode»: the main menu is hidden, no other test opens). 0 = none. Read
+	// by UserRepository.Upsert so the router decides with ZERO extra
+	// queries when no test is open; it may point to an attempt that has
+	// been closed meanwhile (the router re-checks via ActiveTestOf).
+	ActiveAttemptID int64
 }
 
 // Test content languages (settings screen). The interface language is NOT

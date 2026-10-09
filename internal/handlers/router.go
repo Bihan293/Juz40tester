@@ -72,6 +72,11 @@ func (h *Handler) handleMessage(ctx context.Context, m *bot.Message) {
 	}
 
 	text := strings.TrimSpace(m.Text)
+	// Test mode: while a test is active the menu, the commands and free
+	// text only get «Сначала заверши текущий тест или выйди из него».
+	if h.guardMessage(ctx, m, user, text) {
+		return
+	}
 	// Admin panel: /admin, «🛠 Админка» and the input of an admin dialog
 	// step (search query, broadcast text / media / buttons). Only for
 	// ADMIN_IDS — for everybody else this is a no-op.
@@ -91,6 +96,10 @@ func (h *Handler) handleMessage(ctx context.Context, m *bot.Message) {
 	switch cmd {
 	case "/start":
 		h.sendMainMenu(ctx, m.Chat.ID, user, true)
+	case kbExitTest, "/exit", "/menu":
+		// «🚪 Выйти из теста» of a keyboard left over from a test that is
+		// already closed: just bring the main menu back.
+		h.sendMainMenu(ctx, m.Chat.ID, user, false)
 	case kbSubjects, "/subjects":
 		h.showSubjects(ctx, m.Chat.ID)
 	case kbWeak, "/weak":
@@ -118,7 +127,7 @@ func (h *Handler) handleMessage(ctx context.Context, m *bot.Message) {
 // isMenuCommand reports a reply-keyboard button or a known command.
 func isMenuCommand(cmd string) bool {
 	switch cmd {
-	case "/start", kbSubjects, "/subjects", kbWeak, "/weak", kbCustom, "/custom", kbProgress, "/progress",
+	case "/start", "/menu", "/exit", kbExitTest, kbSubjects, "/subjects", kbWeak, "/weak", kbCustom, "/custom", kbProgress, "/progress",
 		kbTop, "/top", kbSettings, "/settings", kbPlans, "/plans", "/subscription", "/tariffs":
 		return true
 	}
@@ -154,6 +163,13 @@ func (h *Handler) handleCallback(ctx context.Context, cb *bot.CallbackQuery) {
 	// handler below dereferences cb.Message.Chat.ID, so bail out safely.
 	if cb.Message == nil {
 		h.answerCallback(ctx, cb, "Сообщение устарело — открой меню заново")
+		return
+	}
+
+	// Test mode: inline buttons of older messages (subjects, other tests,
+	// weak topics, «Свой тест», plans, admin panel …) must not open
+	// anything while a test is active.
+	if h.guardCallback(ctx, cb, user, data) {
 		return
 	}
 
