@@ -351,7 +351,22 @@ func newPreCheckoutHandler(cfg *config.Config, pool *pgxpool.Pool, tg *bot.Clien
 		MaxGenAttempts:    cfg.Subscriptions.WeakOrderMaxGen,
 		ReconcileInterval: cfg.Subscriptions.ReconcileInterval,
 	}).WithAdmins(cfg.Subscriptions.IsAdmin)
-	return h.WithBilling(svc).WithAdmins(cfg.Subscriptions.IsAdmin)
+	// «✨ Свой тест» payments are validated here too (no AI client: the web
+	// process never generates anything).
+	custom := services.NewCustomTestService(repositories.NewCustomTestRepository(pool), repositories.NewGenerationRepository(pool),
+		repositories.NewSubjectRepository(pool), nil, customSettings(cfg)).WithBilling(svc).WithAdmins(cfg.Subscriptions.IsAdmin)
+	return h.WithBilling(svc).WithAdmins(cfg.Subscriptions.IsAdmin).WithCustomTests(custom)
+}
+
+// customSettings maps the CUSTOM_TEST_* configuration.
+func customSettings(cfg *config.Config) services.CustomSettings {
+	return services.CustomSettings{
+		Enabled:           cfg.Subscriptions.CustomTestEnabled,
+		Price:             cfg.Subscriptions.CustomTestPrice,
+		MaxPerSubject:     cfg.Subscriptions.CustomTestMaxPerSubject,
+		OrderTimeout:      cfg.Subscriptions.CustomOrderTimeout,
+		ReconcileInterval: cfg.Subscriptions.ReconcileInterval,
+	}
 }
 
 // workerSide is what a ROLE=worker / ROLE=all process runs besides HTTP.
@@ -500,6 +515,16 @@ func startWorkerSide(ctx, workerCtx context.Context, bgWG *sync.WaitGroup, cfg *
 		bgWG.Add(1)
 		go func() { defer bgWG.Done(); billingSvc.Run(workerCtx) }()
 	}
+	// «✨ Свой тест»: the student's own test (AI pre-check → Stars → urgent
+	// generation with a second-model answer-key check). Free when the
+	// subscriptions are off. The reconciler runs on every worker.
+	customSvc := services.NewCustomTestService(repositories.NewCustomTestRepository(pool), genRepo, subjectRepo, genSvc, customSettings(cfg)).
+		WithBilling(billingSvc).WithAdmins(cfg.Subscriptions.IsAdmin).WithNotifier(h)
+	h.WithCustomTests(customSvc)
+	bgWG.Add(1)
+	go func() { defer bgWG.Done(); customSvc.Run(workerCtx) }()
+	log.Printf("custom tests: enabled=%t (AI %t) price %d⭐ (0 = free), max %d per subject, order timeout %s",
+		cfg.Subscriptions.CustomTestEnabled, genSvc.Enabled(), customSvc.Price(), cfg.Subscriptions.CustomTestMaxPerSubject, cfg.Subscriptions.CustomOrderTimeout)
 	// Admin panel (docs/ADMIN.md): ADMIN_IDS see «🛠 Админка» / /admin —
 	// statistics, user search and plan changes, broadcasts. The broadcast
 	// sender runs on every worker; one broadcast is sent by one worker at a
@@ -541,7 +566,15 @@ func startWorkerSide(ctx, workerCtx context.Context, bgWG *sync.WaitGroup, cfg *
 	// at once (shared watcher per key) instead of waiting for their poll.
 	genSvc.WithJobFinishedHook(func(job *models.GenerationJob) {
 		h.NotifyJobFinished(job)
-		if billingSvc != nil && job != nil {
+		if job != nil && job.Kind == models.TestKindCustom {
+			// A custom order waits for this job (also routed through the
+			// billing hook below when the subscriptions are on).
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				customSvc.OnGenerationFinished(ctx, job)
+			}()
+		} else if billingSvc != nil && job != nil {
 			// A paid weak-topics order may be waiting for this job.
 			go func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

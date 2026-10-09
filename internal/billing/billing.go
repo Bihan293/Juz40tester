@@ -221,11 +221,14 @@ func Left(limit, used int) int {
 const (
 	KindSubscription = "subscription"
 	KindWeakTest     = "weak_test"
+	// KindCustomTest: one «✨ Свой тест» order (custom_test_orders).
+	KindCustomTest = "custom_test"
 )
 
 const (
 	subPrefix  = "sub:"
 	weakPrefix = "weak:"
+	custPrefix = "cust:"
 )
 
 // SubscriptionPayload is the invoice payload of a plan subscription.
@@ -234,11 +237,14 @@ func SubscriptionPayload(plan string) string { return subPrefix + plan }
 // WeakTestPayload is the invoice payload of a weak-topics test order.
 func WeakTestPayload(orderID int64) string { return weakPrefix + strconv.FormatInt(orderID, 10) }
 
+// CustomTestPayload is the invoice payload of a custom-test order.
+func CustomTestPayload(orderID int64) string { return custPrefix + strconv.FormatInt(orderID, 10) }
+
 // Payload is a parsed invoice payload.
 type Payload struct {
-	Kind    string // KindSubscription | KindWeakTest
+	Kind    string // KindSubscription | KindWeakTest | KindCustomTest
 	Plan    string // subscription plan code
-	OrderID int64  // weak-test order id
+	OrderID int64  // weak-test / custom-test order id
 }
 
 // ParsePayload parses an invoice payload; ok is false for anything the bot
@@ -257,6 +263,12 @@ func ParsePayload(s string) (Payload, bool) {
 			return Payload{}, false
 		}
 		return Payload{Kind: KindWeakTest, OrderID: id}, true
+	case strings.HasPrefix(s, custPrefix):
+		id, err := strconv.ParseInt(strings.TrimPrefix(s, custPrefix), 10, 64)
+		if err != nil || id <= 0 {
+			return Payload{}, false
+		}
+		return Payload{Kind: KindCustomTest, OrderID: id}, true
 	}
 	return Payload{}, false
 }

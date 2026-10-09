@@ -497,11 +497,12 @@ func (r *AttemptRepository) SubmitAnswer(ctx context.Context, userID, attemptID 
 	q := &models.Question{}
 	var minUnanswered, unanswered int
 	var topicKey string // B2: catalog topic of the question ("" = not mapped)
+	var testKind string // a custom test never feeds the topic statistics
 	err = tx.QueryRow(ctx, `
 		SELECT aq.id, aq.attempt_id, aq.question_id, aq.position, aq.answered, aq.selected_answer, aq.is_correct, aq.option_order,
 		       q.id, q.subject_id, q.question_text, q.option_a, q.option_b, q.option_c,
 		       q.option_d, q.correct_answer, q.topic, q.difficulty, COALESCE(q.topic_key, ''),
-		       u.min_pos, u.cnt
+		       u.min_pos, u.cnt, COALESCE((SELECT kind FROM tests WHERE id = $3), '')
 		FROM attempt_questions aq
 		JOIN questions q ON q.id = aq.question_id
 		CROSS JOIN (
@@ -509,12 +510,12 @@ func (r *AttemptRepository) SubmitAnswer(ctx context.Context, userID, attemptID 
 			FROM attempt_questions WHERE attempt_id = $1 AND NOT answered
 		) u
 		WHERE aq.attempt_id = $1 AND aq.position = $2
-		FOR UPDATE OF aq`, attemptID, position).
+		FOR UPDATE OF aq`, attemptID, position, a.TestID).
 		Scan(&aq.ID, &aq.AttemptID, &aq.QuestionID, &aq.Position, &aq.Answered,
 			&sel, &aq.IsCorrect, &orderJSON,
 			&q.ID, &q.SubjectID, &q.Text, &q.OptionA, &q.OptionB, &q.OptionC,
 			&q.OptionD, &q.CorrectAnswer, &q.Topic, &q.Difficulty, &topicKey,
-			&minUnanswered, &unanswered)
+			&minUnanswered, &unanswered, &testKind)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -601,7 +602,10 @@ func (r *AttemptRepository) SubmitAnswer(ctx context.Context, userID, attemptID 
 
 	// 5b. Per-TOPIC statistics (the source of weak topics) — in the same
 	// transaction, so the answer and the topic statistics never diverge.
-	if countsForTopic(prevStatus) {
+	// A «✨ Свой тест» test is excluded: its topics come from the student's
+	// own request, not from the subject programme — they must not create or
+	// move weak topics.
+	if countsForTopic(prevStatus) && testKind != models.TestKindCustom {
 		if err := recordTopicAnswer(ctx, tx, userID, q.SubjectID, q.Topic, topicKey, correct); err != nil {
 			return nil, err
 		}

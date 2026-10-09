@@ -30,7 +30,7 @@ func (h *Handler) openTest(ctx context.Context, cb *bot.CallbackQuery, user *mod
 	}
 
 	// A personal weak-topics test opens only for its owner.
-	if test.Kind == models.TestKindPersonal && test.OwnerUserID != user.ID {
+	if models.IsOwnedKind(test.Kind) && test.OwnerUserID != user.ID {
 		h.answerCallback(ctx, cb, "Этот тест собран под другого ученика")
 		return
 	}
@@ -514,8 +514,11 @@ func (h *Handler) exitTest(ctx context.Context, cb *bot.CallbackQuery, user *mod
 	}
 	h.answerCallback(ctx, cb, "Прогресс сохранён")
 	note := exitNoteChain
-	if test.Kind == models.TestKindPersonal {
+	switch test.Kind {
+	case models.TestKindPersonal:
 		note = exitNotePersonal
+	case models.TestKindCustom:
+		note = customExitNote
 	}
 	text, kb := h.afterTestScreen(ctx, user, test, note, nil)
 	h.editMessage(ctx, cb, withHeader("", text), kb)

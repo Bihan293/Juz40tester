@@ -233,19 +233,25 @@ func (r *GenerationRepository) PersonalTestQuestions(ctx context.Context, testID
 // subjectID pins the operation to the subject the caller resolved the test
 // in, so a stale callback can never touch a test of another subject.
 func (r *GenerationRepository) DeletePersonalTest(ctx context.Context, userID, testID, subjectID int64) error {
-	tx, err := r.pool.Begin(ctx)
+	return deleteOwnedTest(ctx, r.pool, userID, testID, subjectID, models.TestKindPersonal)
+}
+
+// deleteOwnedTest deletes a per-user test of the given kind (personal /
+// custom) — see DeletePersonalTest.
+func deleteOwnedTest(ctx context.Context, pool *pgxpool.Pool, userID, testID, subjectID int64, kind string) error {
+	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	// Ownership + kind + subject guard: only the owner can finish their own
-	// personal test of THIS subject.
+	// test of THIS subject.
 	var fromBank bool
 	err = tx.QueryRow(ctx, `
 		SELECT from_bank FROM tests
-		WHERE id = $1 AND owner_user_id = $2 AND kind = 'personal' AND subject_id = $3
-		FOR UPDATE`, testID, userID, subjectID).Scan(&fromBank)
+		WHERE id = $1 AND owner_user_id = $2 AND kind = $4 AND subject_id = $3
+		FOR UPDATE`, testID, userID, subjectID, kind).Scan(&fromBank)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -454,6 +460,54 @@ func (r *GenerationRepository) EnqueuePersonalJob(ctx context.Context, subjectID
 		notifyQueue(ctx, r.pool, ChannelGenJobs)
 	}
 	return err
+}
+
+// EnqueueCustomJob registers the URGENT generation job of a paid custom
+// order and returns its id. Idempotent: one job per order
+// (idx_genjobs_custom_order) — a repeated call returns the existing job.
+func (r *GenerationRepository) EnqueueCustomJob(ctx context.Context, subjectID, userID, orderID int64) (int64, error) {
+	var id int64
+	err := r.pool.QueryRow(ctx, `
+		INSERT INTO generation_jobs (kind, subject_id, owner_user_id, custom_order_id, not_before, urgent)
+		VALUES ('custom', $1, $2, $3, now(), TRUE)
+		ON CONFLICT (custom_order_id) WHERE custom_order_id IS NOT NULL DO NOTHING
+		RETURNING id`, subjectID, userID, orderID).Scan(&id)
+	if err == nil {
+		notifyQueue(ctx, r.pool, ChannelGenJobs)
+		return id, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return 0, err
+	}
+	err = r.pool.QueryRow(ctx, `SELECT id FROM generation_jobs WHERE custom_order_id = $1`, orderID).Scan(&id)
+	return id, err
+}
+
+// CustomJobRequest is what a custom generation job needs from its order.
+type CustomJobRequest struct {
+	Description string
+	Title       string
+	Paid        bool // the order is still 'paid' (not refunded meanwhile)
+}
+
+// CustomJobRequest loads the order of a custom job (ErrNotFound if gone).
+func (r *GenerationRepository) CustomJobRequest(ctx context.Context, orderID int64) (*CustomJobRequest, error) {
+	var c CustomJobRequest
+	err := r.pool.QueryRow(ctx, `SELECT description, title, status = 'paid' FROM custom_test_orders WHERE id = $1`, orderID).
+		Scan(&c.Description, &c.Title, &c.Paid)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+// CustomTestByOrder returns the test already stored for a custom order
+// (nil = none).
+func (r *GenerationRepository) CustomTestByOrder(ctx context.Context, orderID int64) (*models.Test, error) {
+	return scanTest(r.pool.QueryRow(ctx, `SELECT `+testColumns+` FROM tests WHERE custom_order_id = $1`, orderID))
 }
 
 // PersonalJobsSince counts the user's personal generation jobs created at
@@ -722,13 +776,14 @@ func (r *GenerationRepository) ClaimNextJob(ctx context.Context) (*models.Genera
 	var owner sql.NullInt64
 	var topicKey sql.NullString
 	err = tx.QueryRow(ctx, `
-		SELECT id, kind, subject_id, test_number, topics_fingerprint, owner_user_id, status, attempts, urgent, topic_key
+		SELECT id, kind, subject_id, test_number, topics_fingerprint, owner_user_id, status, attempts, urgent, topic_key,
+		       COALESCE(custom_order_id, 0)
 		FROM generation_jobs
 		WHERE status = 'pending' AND not_before <= now()
 		ORDER BY urgent DESC, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED`).
-		Scan(&j.ID, &j.Kind, &j.SubjectID, &testNumber, &fingerprint, &owner, &j.Status, &j.Attempts, &j.Urgent, &topicKey)
+		Scan(&j.ID, &j.Kind, &j.SubjectID, &testNumber, &fingerprint, &owner, &j.Status, &j.Attempts, &j.Urgent, &topicKey, &j.CustomOrderID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -858,7 +913,18 @@ func (r *GenerationRepository) createTest(ctx context.Context, test *models.Test
 			}
 		}
 	}
-	if test.Kind == models.TestKindPersonal && test.TestNumber == 0 {
+	if test.Kind == models.TestKindCustom && test.CustomOrderID > 0 {
+		// A retried custom job whose earlier run already stored the test
+		// (crash before CompleteJob): never a second test for one order.
+		existing, err := scanTest(tx.QueryRow(ctx, `SELECT `+testColumns+` FROM tests WHERE custom_order_id = $1`, test.CustomOrderID))
+		if err != nil {
+			return nil, err
+		}
+		if existing != nil {
+			return existing, nil
+		}
+	}
+	if models.IsOwnedKind(test.Kind) && test.TestNumber == 0 {
 		// B3: numbers come from personal_test_number_seq (shared with bank
 		// tests), not MAX(test_number)+1.
 		if err := tx.QueryRow(ctx, `SELECT nextval('personal_test_number_seq')`).
@@ -879,13 +945,17 @@ func (r *GenerationRepository) createTest(ctx context.Context, test *models.Test
 	if test.OriginTestID > 0 {
 		origin = test.OriginTestID
 	}
+	var customOrder any
+	if test.CustomOrderID > 0 {
+		customOrder = test.CustomOrderID
+	}
 	var testID int64
 	err = tx.QueryRow(ctx, `
-		INSERT INTO tests (subject_id, test_number, title, is_active, kind, topics, owner_user_id, topics_fingerprint, origin_test_id)
-		VALUES ($1, $2, $3, TRUE, $4, $5, $6, $7, $8)
+		INSERT INTO tests (subject_id, test_number, title, is_active, kind, topics, owner_user_id, topics_fingerprint, origin_test_id, custom_order_id)
+		VALUES ($1, $2, $3, TRUE, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (subject_id, test_number) DO NOTHING
 		RETURNING id`,
-		test.SubjectID, test.TestNumber, test.Title, test.Kind, topicsJSON, owner, fingerprint, origin).
+		test.SubjectID, test.TestNumber, test.Title, test.Kind, topicsJSON, owner, fingerprint, origin, customOrder).
 		Scan(&testID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// Conflict — the test already exists (concurrent generation). Re-read
@@ -927,9 +997,15 @@ func (r *GenerationRepository) createTest(ctx context.Context, test *models.Test
 	for i, sq := range questions {
 		rawTopics[i] = sq.Topic
 	}
-	topicKeys, err := ensureTopicKeys(ctx, tx, test.SubjectID, rawTopics)
-	if err != nil {
-		return nil, err
+	// A custom test stays OUT of the topic catalog and the question bank:
+	// its topics come from the student's own request (topic_key NULL — the
+	// bank selects by topic_key, so these questions are never handed out).
+	topicKeys := map[string]string{}
+	if test.Kind != models.TestKindCustom {
+		topicKeys, err = ensureTopicKeys(ctx, tx, test.SubjectID, rawTopics)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// One round trip for all questions (pgx.Batch) instead of 2×20

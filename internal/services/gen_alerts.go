@@ -240,6 +240,8 @@ func jobDesc(job *models.GenerationJob) string {
 		return fmt.Sprintf("цепочка: предмет %d, Тест %d", job.SubjectID, job.TestNumber)
 	case models.TestKindPersonal:
 		return fmt.Sprintf("слабые темы: предмет %d, пользователь %d", job.SubjectID, job.OwnerUserID)
+	case models.TestKindCustom:
+		return fmt.Sprintf("свой тест: предмет %d, пользователь %d, заказ %d", job.SubjectID, job.OwnerUserID, job.CustomOrderID)
 	case models.JobKindTopicBatch:
 		return fmt.Sprintf("банк вопросов: предмет %d, тема %q", job.SubjectID, job.TopicKey)
 	}
@@ -254,6 +256,8 @@ func jobSlotKey(job *models.GenerationJob) string {
 		return fmt.Sprintf("chain:%d:%d", job.SubjectID, job.TestNumber)
 	case models.TestKindPersonal:
 		return fmt.Sprintf("personal:%d:%d", job.SubjectID, job.OwnerUserID)
+	case models.TestKindCustom:
+		return fmt.Sprintf("custom:%d", job.CustomOrderID)
 	case models.JobKindTopicBatch:
 		return fmt.Sprintf("topic:%d:%s", job.SubjectID, job.TopicKey)
 	}

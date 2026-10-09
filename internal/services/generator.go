@@ -1621,6 +1621,30 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 		fingerprint = models.WeakTopicsFingerprint(job.SubjectID, topicKeys)
 		spec.basePrompt = personalGenContext(subject.Name, spec.personalTopics)
 
+	case models.TestKindCustom:
+		ownerUserID = job.OwnerUserID
+		if ownerUserID <= 0 || job.CustomOrderID <= 0 {
+			return 0, fmt.Errorf("custom job %d without owner/order", job.ID)
+		}
+		// A retried job whose earlier run already stored the test.
+		if existing, err := g.gen.CustomTestByOrder(ctx, job.CustomOrderID); err != nil {
+			return 0, err
+		} else if existing != nil {
+			log.Printf("generator: custom order %d already has test %d — job %d resolved with no AI call", job.CustomOrderID, existing.ID, job.ID)
+			return existing.ID, nil
+		}
+		req, err := g.gen.CustomJobRequest(ctx, job.CustomOrderID)
+		if err != nil {
+			return 0, fmt.Errorf("custom order %d: %w", job.CustomOrderID, err)
+		}
+		if !req.Paid {
+			// Refunded / cancelled meanwhile: never pay for its generation.
+			return 0, fmt.Errorf("custom order %d is no longer paid — not generated", job.CustomOrderID)
+		}
+		spec.customDesc = req.Description
+		title = customTestTitle(req.Title)
+		spec.basePrompt = customGenContext(subject.Name, req.Description)
+
 	default:
 		return 0, fmt.Errorf("unknown job kind %q", job.Kind)
 	}
@@ -1632,6 +1656,11 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 	}
 
 	strategy := g.chooseStrategy(job)
+	if job.Kind == models.TestKindCustom {
+		// The batch strategy plans per-topic slots of the subject
+		// programme; a custom test follows the student's request instead.
+		strategy = strategyFull
+	}
 	run := &genRun{strategy: strategy, kind: job.Kind}
 	if r := genRunFrom(ctx); r != nil {
 		run = r
@@ -1673,6 +1702,13 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 	if err := g.repairFlagged(ctx, task, subject.Name, final); err != nil {
 		return 0, fmt.Errorf("quality: %w", err)
 	}
+	if job.Kind == models.TestKindCustom {
+		// Second-model answer-key check: an independent model solves every
+		// question; disputed keys are rewritten and re-checked.
+		if err := g.verifyAnswerKeys(ctx, task, subject.Name, spec, final); err != nil {
+			return 0, fmt.Errorf("answer keys: %w", err)
+		}
+	}
 	// The rewrites keep topics, but re-check the whole contract anyway
 	// (duplicates across questions, key balance, weak-topic coverage,
 	// difficulty, repeats of the previous test).
@@ -1705,13 +1741,26 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 		OwnerUserID:       ownerUserID,
 		TopicsFingerprint: fingerprint,
 	}
-	if job.Kind == models.TestKindPersonal {
+	if models.IsOwnedKind(job.Kind) {
 		test.TestNumber = 0 // assigned by the DB: next personal number
+	}
+	if job.Kind == models.TestKindCustom {
+		test.CustomOrderID = job.CustomOrderID
+		// Last look before the test is stored: the order may have been
+		// refunded (timeout, /refund) while the models were writing.
+		if req, err := g.gen.CustomJobRequest(ctx, job.CustomOrderID); err != nil {
+			return 0, err
+		} else if !req.Paid {
+			return 0, fmt.Errorf("custom order %d was refunded during generation — test not stored", job.CustomOrderID)
+		}
 	}
 	seed := final.toSeed()
 	stored, err := g.gen.CreateGeneratedTest(ctx, test, seed)
 	if err != nil {
 		return 0, err
+	}
+	if job.Kind == models.TestKindCustom {
+		return stored.ID, nil // never a template: the content is one student's request
 	}
 	g.saveTemplate(ctx, job, fingerprint, spec.testNumber, testTopics, seed, stored.ID, ownerUserID, strategy)
 	return stored.ID, nil
@@ -1722,9 +1771,12 @@ func (g *GeneratorService) runJob(ctx context.Context, job *models.GenerationJob
 // A rejected reply's reason is fed back to the next provider step.
 func (g *GeneratorService) generateFull(ctx context.Context, job *models.GenerationJob, spec *genSpec, task string) (*generatedTest, error) {
 	var prompt string
-	if job.Kind == models.TestKindChain {
+	switch job.Kind {
+	case models.TestKindChain:
 		prompt = spec.basePrompt + chainOutputLine
-	} else {
+	case models.TestKindCustom:
+		prompt = spec.basePrompt + customOutputLine
+	default:
 		prompt = spec.basePrompt + personalOutputLine
 	}
 	var feedback string
@@ -1758,10 +1810,12 @@ func (g *GeneratorService) generateFull(ctx context.Context, job *models.Generat
 		final = gt
 		return nil
 	}
-	if _, _, err := runStepsFeedback(ctx, task, g.generationStepsDyn(messages, job.Kind, job.Attempts), validate,
-		func(e error) { feedback = e.Error() }); err != nil {
+	_, by, err := runStepsFeedback(ctx, task, g.generationStepsDyn(messages, job.Kind, job.Attempts), validate,
+		func(e error) { feedback = e.Error() })
+	if err != nil {
 		return nil, fmt.Errorf("generate: %w", err)
 	}
+	spec.servedBy = by
 	return final, nil
 }
 
@@ -1777,6 +1831,14 @@ func (g *GeneratorService) validateReply(gt *generatedTest, spec *genSpec) error
 		}
 		// Near-duplicate questions (the same question reworded) were only
 		// caught for chain tests; a weak-topics test could show one twice.
+		if err := validateNoRepeats(gt, nil); err != nil {
+			return err
+		}
+	case models.TestKindCustom:
+		// The topic contract of a custom test is the student's request,
+		// not the subject's topic list: no catalog/coverage checks (a
+		// question outside the standard programme topics is fine as long
+		// as it matches the request). Repeats are still rejected.
 		if err := validateNoRepeats(gt, nil); err != nil {
 			return err
 		}
@@ -1867,7 +1929,7 @@ func (g *GeneratorService) generationStepsDyn(messages func() []deepseek.Message
 	}
 	if g.ds != nil {
 		effort := deepseek.ThinkingEffortHigh
-		if kind == models.TestKindPersonal || kind == models.JobKindTopicBatch || retry {
+		if kind == models.TestKindPersonal || kind == models.TestKindCustom || kind == models.JobKindTopicBatch || retry {
 			effort = deepseek.ThinkingEffortLow
 		}
 		ds := g.ds

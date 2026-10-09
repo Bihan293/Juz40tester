@@ -88,7 +88,7 @@ const usageSQL = `
 	       COALESCE((SELECT used FROM daily_usage WHERE user_id = $1 AND day = $2::date), 0),
 	       (SELECT COUNT(*)::int FROM test_attempts a JOIN tests t ON t.id = a.test_id
 	         WHERE a.user_id = $1 AND a.status = 'in_progress' AND a.started_at >= $3
-	           AND t.kind <> 'personal' AND a.test_id <> $4)
+	           AND t.kind NOT IN ('personal','custom') AND a.test_id <> $4)
 	FROM (SELECT 1) one
 	LEFT JOIN user_subscriptions s ON s.user_id = $1 AND s.status = 'active'`
 
@@ -142,7 +142,8 @@ func (r *BillingRepository) CheckStartTx(ctx context.Context, tx pgx.Tx, userID,
 		}
 		return err
 	}
-	if kind == models.TestKindPersonal {
+	if models.IsOwnedKind(kind) {
+		// Weak-topics and custom tests are paid separately: never limited.
 		return nil
 	}
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, $2)`, quotaLockNS, int32(userID%2147483647)); err != nil {
@@ -198,7 +199,7 @@ func (r *BillingRepository) ChargeCompletionTx(ctx context.Context, tx pgx.Tx, u
 	err = tx.QueryRow(ctx, `
 		WITH ins AS (
 			INSERT INTO test_completions (attempt_id, user_id, test_id, day, charged, plan)
-			SELECT $1, $2, $3, $4::date, t.kind <> 'personal', $5
+			SELECT $1, $2, $3, $4::date, t.kind NOT IN ('personal','custom'), $5
 			FROM tests t WHERE t.id = $3
 			ON CONFLICT (attempt_id) DO NOTHING
 			RETURNING charged
@@ -550,6 +551,8 @@ func (r *BillingRepository) MarkRefunded(ctx context.Context, chargeID string) (
 			RETURNING 1
 		), o AS (
 			`+stopPaidOrderSQL+`
+		), oc AS (
+			`+stopPaidCustomOrderSQL+`
 		)
 		SELECT EXISTS (SELECT 1 FROM p)`, chargeID).Scan(&changed)
 	return changed, err
@@ -579,6 +582,8 @@ func (r *BillingRepository) RequestRefund(ctx context.Context, chargeID, reason 
 			RETURNING 1
 		), o AS (
 			`+stopPaidOrderSQL+`
+		), oc AS (
+			`+stopPaidCustomOrderSQL+`
 		)
 		SELECT EXISTS (SELECT 1 FROM p)`, chargeID, reason).Scan(&changed)
 	return changed, err
@@ -617,6 +622,12 @@ func (r *BillingRepository) OnExternalRefund(ctx context.Context, chargeID strin
 		// Refunded outside the reconciler while the test is still being
 		// built: stop building it.
 		if _, err := tx.Exec(ctx, `WITH o AS (`+stopPaidOrderSQL+`) SELECT 1`, chargeID); err != nil {
+			return nil, err
+		}
+	}
+	if isCustomPayment(p.Kind) {
+		// A custom test still being generated with this payment: stop it.
+		if _, err := tx.Exec(ctx, `WITH o AS (`+stopPaidCustomOrderSQL+`) SELECT 1`, chargeID); err != nil {
 			return nil, err
 		}
 	}
@@ -898,6 +909,10 @@ func (r *BillingRepository) DeleteOldUsage(ctx context.Context, keep time.Durati
 		`DELETE FROM test_completions WHERE ctid IN (SELECT ctid FROM test_completions WHERE day < $1::date LIMIT $2)`,
 		`DELETE FROM weak_test_orders WHERE ctid IN (SELECT ctid FROM weak_test_orders
 		     WHERE status IN ('created','canceled') AND created_at < $1::date LIMIT $2)`,
+		`DELETE FROM custom_test_orders WHERE ctid IN (SELECT ctid FROM custom_test_orders
+		     WHERE status IN ('created','canceled') AND created_at < $1::date LIMIT $2)`,
+		`DELETE FROM custom_test_drafts WHERE ctid IN (SELECT ctid FROM custom_test_drafts
+		     WHERE created_at < $1::date LIMIT $2)`,
 	} {
 		tag, err := r.pool.Exec(ctx, q, cutoff, limit)
 		if err != nil {
