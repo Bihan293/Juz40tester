@@ -675,6 +675,12 @@ func (s *QuizService) existingPersonalTest(ctx context.Context, userID, subjectI
 	return test, false, test.Topics, nil
 }
 
+// ActiveAttempts reports which of the tests have an unfinished attempt of
+// the user (⏸ marks of the custom-test list).
+func (s *QuizService) ActiveAttempts(ctx context.Context, userID int64, testIDs []int64) (map[int64]bool, error) {
+	return s.attempts.ActiveAttemptTests(ctx, userID, testIDs)
+}
+
 // FinishPersonalTest deletes the user's personal weak-topics test (and its
 // questions) so the next weak-topics run generates a fresh one. Only the
 // owner can finish their own personal test.

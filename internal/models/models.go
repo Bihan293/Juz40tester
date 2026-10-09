@@ -101,6 +101,10 @@ func (q *Question) Options() []string {
 const (
 	TestKindChain    = "chain"    // main linear chain: Тест 1, Тест 2, ...
 	TestKindPersonal = "personal" // per-user weak-topics test (owner_user_id), deletable on finish
+	// TestKindCustom: «✨ Свой тест» — a per-user test generated from the
+	// student's own description (owner_user_id), deletable on finish. Never
+	// part of the bank, templates, topic statistics, chain or daily quota.
+	TestKindCustom = "custom"
 	// JobKindTopicBatch (B4) is a generation job (not a test kind): ~10 bank
 	// questions on one catalog topic, stored without a test row.
 	JobKindTopicBatch = "topic_batch"
@@ -126,6 +130,9 @@ type Test struct {
 	// FromBank (B3): personal test assembled from the question bank — it
 	// links existing questions and owns none of them.
 	FromBank bool
+	// CustomOrderID: the custom_test_orders row a custom test was generated
+	// for (set only when the test is stored; not read back by scanTest).
+	CustomOrderID int64
 }
 
 // UserSubjectState is per-user UI/progress state that survives restarts.
@@ -150,7 +157,12 @@ type GenerationJob struct {
 	Urgent            bool   // run immediately, ignore the off-peak deferral
 	OwnerUserID       int64  // personal jobs only: the user the test is generated for
 	TopicKey          string // topic_batch jobs only: the catalog topic (B4)
+	CustomOrderID     int64  // custom jobs only: the custom_test_orders row
 }
+
+// IsOwnedKind reports a per-user test kind (weak-topics / custom): such a
+// test opens only for its owner and is deleted when finished.
+func IsOwnedKind(kind string) bool { return kind == TestKindPersonal || kind == TestKindCustom }
 
 // Unlock rule for the next chain test: the previous test must have at least
 // this many 🟢 (mastered) and 🟡 (in progress) questions.

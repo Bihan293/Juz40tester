@@ -101,6 +101,12 @@ type genSpec struct {
 	catalog     *models.TopicCatalog
 	// personalTopics: the requested weak topics of a personal test.
 	personalTopics []string
+	// customDesc: the student's request of a «✨ Свой тест» test
+	// (untrusted data, always delimited in prompts).
+	customDesc string
+	// servedBy: the provider step that wrote the test (full strategy) —
+	// the answer-key check of a custom test prefers ANOTHER model.
+	servedBy string
 
 	mu sync.Mutex
 	// newTopics: chain topics outside the catalog held by questions of

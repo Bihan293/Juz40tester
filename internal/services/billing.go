@@ -72,6 +72,9 @@ type BillingService struct {
 	// isAdmin (optional) recognises administrators (ADMIN_IDS): their
 	// purchases may be applied without an invoice (AdminBypassPurchase).
 	isAdmin func(tgUserID int64) bool
+	// custom (optional): «✨ Свой тест» orders (payload kind custom_test);
+	// set by CustomTestService.WithBilling.
+	custom *CustomTestService
 }
 
 // NewBillingService wires the service. build may be nil (AI generation
@@ -222,6 +225,11 @@ func (s *BillingService) PreCheckout(ctx context.Context, userID int64, currency
 			return false, errPayNoTopics
 		}
 		return true, ""
+	case billing.KindCustomTest:
+		if s.custom == nil {
+			return false, errPayStale
+		}
+		return s.custom.PreCheckout(ctx, userID, amount, pl.OrderID)
 	}
 	return false, errPayStale
 }
@@ -286,6 +294,19 @@ func (s *BillingService) OnSuccessfulPayment(ctx context.Context, userID, tgUser
 	switch pl.Kind {
 	case billing.KindSubscription:
 		return s.applySubscription(ctx, tgUserID, rec)
+	case billing.KindCustomTest:
+		if s.custom == nil {
+			// Custom tests are not wired in this process: record nothing,
+			// give the Stars back.
+			log.Printf("billing: custom-test payment %q of tg %d without the custom-test service — refunding", pi.ChargeID, tgUserID)
+			if s.stars != nil && !pi.AdminBypass {
+				if err := s.stars.RefundStarPayment(ctx, tgUserID, pi.ChargeID); err != nil {
+					log.Printf("billing: refund custom payment %q: %v", pi.ChargeID, err)
+				}
+			}
+			return &PaymentOutcome{Kind: OutcomeUnknown}, nil
+		}
+		return s.custom.ApplyPayment(ctx, tgUserID, rec)
 	default:
 		return s.applyWeakPayment(ctx, tgUserID, rec)
 	}
@@ -556,6 +577,12 @@ func (s *BillingService) OnGenerationFinished(ctx context.Context, job *models.G
 	if job == nil || job.Kind == models.TestKindChain {
 		return
 	}
+	if job.Kind == models.TestKindCustom {
+		if s.custom != nil {
+			s.custom.OnGenerationFinished(ctx, job)
+		}
+		return
+	}
 	userID := int64(0)
 	if job.Kind == models.TestKindPersonal {
 		userID = job.OwnerUserID
@@ -803,6 +830,15 @@ func (s *BillingService) AdminBypassPurchase(ctx context.Context, userID, tgUser
 			return nil, err
 		}
 		amount = o.Amount
+	case billing.KindCustomTest:
+		if s.custom == nil {
+			return nil, &BypassRefusedError{Reason: errPayStale}
+		}
+		a, err := s.custom.OrderAmount(ctx, pl.OrderID)
+		if err != nil {
+			return nil, err
+		}
+		amount = a
 	}
 	if ok, msg := s.PreCheckout(ctx, userID, billing.CurrencyStars, amount, payload); !ok {
 		return nil, &BypassRefusedError{Reason: msg}

@@ -251,7 +251,7 @@ func (h *Handler) buyPlan(ctx context.Context, cb *bot.CallbackQuery, user *mode
 // quotaToast is the «Осталось сегодня» notice shown when a chain test is
 // opened ("" when subscriptions are off or the lookup failed).
 func (h *Handler) quotaToast(ctx context.Context, user *models.User, test *models.Test) string {
-	if h.billing == nil || test.Kind == models.TestKindPersonal {
+	if h.billing == nil || models.IsOwnedKind(test.Kind) {
 		return ""
 	}
 	u, err := h.billing.Usage(ctx, user.ID)
@@ -479,6 +479,9 @@ func (h *Handler) handleSuccessfulPayment(ctx context.Context, m *bot.Message) e
 // sendPaymentOutcome tells the user what a (real or admin-bypass) payment
 // gave them.
 func (h *Handler) sendPaymentOutcome(ctx context.Context, chatID int64, user *models.User, out *services.PaymentOutcome) {
+	if h.customOutcome(ctx, chatID, out) {
+		return
+	}
 	switch out.Kind {
 	case services.OutcomeSubscription:
 		until := ""
@@ -548,6 +551,9 @@ func (h *Handler) PaymentRefunded(ctx context.Context, tgUserID int64, p reposit
 	text := fmt.Sprintf("↩️ Возвращено %d⭐ на твой баланс Telegram Stars.", p.Amount)
 	if p.Kind == billing.KindWeakTest {
 		text = fmt.Sprintf("↩️ Тест по слабым темам собрать не удалось — %d⭐ возвращены на твой баланс. Попробуй позже ещё раз 🙏", p.Amount)
+	}
+	if p.Kind == billing.KindCustomTest {
+		text = fmt.Sprintf("↩️ Свой тест сгенерировать не удалось — %d⭐ возвращены на твой баланс. Попробуй заказать его ещё раз чуть позже 🙏", p.Amount)
 	}
 	h.sendText(ctx, tgUserID, text)
 }

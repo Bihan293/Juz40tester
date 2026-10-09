@@ -81,13 +81,22 @@ func (h *Handler) handleMessage(ctx context.Context, m *bot.Message) {
 	if strings.HasPrefix(text, "/") && h.handleAdmin(ctx, m, text) {
 		return
 	}
-	switch commandKey(text) {
+	cmd := commandKey(text)
+	if h.custom != nil && isMenuCommand(cmd) {
+		// Any menu button / command leaves the «send the description» step.
+		if err := h.custom.ClearDraft(ctx, user.ID); err != nil {
+			logf("custom clear draft %d: %v", user.ID, err)
+		}
+	}
+	switch cmd {
 	case "/start":
 		h.sendMainMenu(ctx, m.Chat.ID, user, true)
 	case kbSubjects, "/subjects":
 		h.showSubjects(ctx, m.Chat.ID)
 	case kbWeak, "/weak":
 		h.showWeakMenu(ctx, m.Chat.ID, user)
+	case kbCustom, "/custom":
+		h.showCustomMenu(ctx, m.Chat.ID, user)
 	case kbProgress, "/progress":
 		h.showProgress(ctx, m.Chat.ID, user)
 	case kbTop, "/top":
@@ -97,9 +106,23 @@ func (h *Handler) handleMessage(ctx context.Context, m *bot.Message) {
 	case kbPlans, "/plans", "/subscription", "/tariffs":
 		h.showPlans(ctx, m.Chat.ID, user)
 	default:
+		// The description of a «✨ Свой тест» test (the user is in that step).
+		if !strings.HasPrefix(text, "/") && h.handleCustomDescription(ctx, m, user, text) {
+			return
+		}
 		// Unknown text/command -> main menu.
 		h.sendMainMenu(ctx, m.Chat.ID, user, false)
 	}
+}
+
+// isMenuCommand reports a reply-keyboard button or a known command.
+func isMenuCommand(cmd string) bool {
+	switch cmd {
+	case "/start", kbSubjects, "/subjects", kbWeak, "/weak", kbCustom, "/custom", kbProgress, "/progress",
+		kbTop, "/top", kbSettings, "/settings", kbPlans, "/plans", "/subscription", "/tariffs":
+		return true
+	}
+	return false
 }
 
 // --- Callbacks router -----------------------------------------------------------
@@ -166,6 +189,8 @@ func (h *Handler) handleCallback(ctx context.Context, cb *bot.CallbackQuery) {
 	case data == cbWeakMenu:
 		h.answerCallback(ctx, cb, "")
 		h.editWeakMenu(ctx, cb, user)
+	case data == cbCustomMenu:
+		h.editCustomMenu(ctx, cb, user) // answers itself
 	case strings.HasPrefix(data, cbAnswer):
 		h.handleAnswer(ctx, cb, user, data)
 	case data == cbProgress:
@@ -205,16 +230,21 @@ type idRoute struct {
 // idRoutes: a new numeric-id section is one line here. Order matters where
 // prefixes overlap: cbExitYes / cbExitNo must precede cbExit.
 var idRoutes = []idRoute{
-	{cbWeakSubject, false, (*Handler).openWeakSubject},    // answers itself (toast / error / silent)
-	{cbWeakBuy, false, (*Handler).buyWeakTest},            // answers itself
-	{cbFinish, false, (*Handler).finishPersonalTest},      // answers itself
-	{cbSubject, true, (*Handler).openSubject},             //
-	{cbOpenTest, false, (*Handler).openTest},              // answers itself (unlock requirements toast)
-	{cbExitYes, false, (*Handler).exitTest},               // answers itself («Прогресс сохранён»)
-	{cbExitNo, false, (*Handler).cancelExit},              // answers itself («Продолжаем 💪»)
-	{cbExit, true, (*Handler).confirmExit},                //
-	{cbRetry, true, (*Handler).retryTest},                 //
-	{cbProgSubject, true, (*Handler).showSubjectProgress}, //
+	{cbWeakSubject, false, (*Handler).openWeakSubject},     // answers itself (toast / error / silent)
+	{cbWeakBuy, false, (*Handler).buyWeakTest},             // answers itself
+	{cbFinish, false, (*Handler).finishPersonalTest},       // answers itself
+	{cbCustomSubject, false, (*Handler).openCustomSubject}, // answers itself
+	{cbCustomNew, false, (*Handler).newCustomTest},         // answers itself (alerts)
+	{cbCustomFinish, false, (*Handler).finishCustomTest},   // answers itself
+	{cbCustomCancel, false, (*Handler).cancelCustomDraft},  // answers itself
+	{cbCustomFree, false, (*Handler).confirmFreeCustom},    // answers itself
+	{cbSubject, true, (*Handler).openSubject},              //
+	{cbOpenTest, false, (*Handler).openTest},               // answers itself (unlock requirements toast)
+	{cbExitYes, false, (*Handler).exitTest},                // answers itself («Прогресс сохранён»)
+	{cbExitNo, false, (*Handler).cancelExit},               // answers itself («Продолжаем 💪»)
+	{cbExit, true, (*Handler).confirmExit},                 //
+	{cbRetry, true, (*Handler).retryTest},                  //
+	{cbProgSubject, true, (*Handler).showSubjectProgress},  //
 	{cbLbSubject, true, (*Handler).showSubjectLeaderboardFor},
 }
 

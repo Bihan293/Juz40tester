@@ -277,6 +277,22 @@ type Subscriptions struct {
 	// worker re-checks paid orders and pending refunds (payments and
 	// finished generations also wake it at once).
 	ReconcileInterval time.Duration
+
+	// «✨ Свой тест» (a test generated from the student's own description).
+	// CustomTestEnabled (CUSTOM_TEST_ENABLED, default 1): 0 hides the
+	// feature (the menu button explains it is off).
+	CustomTestEnabled bool
+	// CustomTestPrice (CUSTOM_TEST_PRICE_STARS, default 15; 0 = free): price
+	// of ONE custom test. Free for ADMIN_IDS; free for everybody when the
+	// subscriptions are off (SUBSCRIPTIONS_ENABLED=0).
+	CustomTestPrice int
+	// CustomTestMaxPerSubject (CUSTOM_TEST_MAX_PER_SUBJECT, default 3):
+	// unfinished custom tests (incl. one being generated) per subject.
+	CustomTestMaxPerSubject int
+	// CustomOrderTimeout (CUSTOM_ORDER_TIMEOUT_MIN, default 70): a paid
+	// custom test not generated after this long is refunded automatically
+	// (covers the 3 attempts of the generation job).
+	CustomOrderTimeout time.Duration
 }
 
 // Catalog builds the validated plan catalog.
@@ -302,6 +318,23 @@ func loadSubscriptions() (Subscriptions, error) {
 		WeakOrderTimeout:  45 * time.Minute,
 		WeakOrderMaxGen:   3,
 		ReconcileInterval: time.Minute,
+
+		CustomTestEnabled:       true,
+		CustomTestPrice:         15,
+		CustomTestMaxPerSubject: 3,
+		CustomOrderTimeout:      70 * time.Minute,
+	}
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("CUSTOM_TEST_ENABLED"))); v != "" {
+		s.CustomTestEnabled = !(v == "0" || v == "false" || v == "no" || v == "off")
+	}
+	if n, ok := envIntOpt("CUSTOM_TEST_PRICE_STARS"); ok && n >= 0 && n <= 10000 {
+		s.CustomTestPrice = n
+	}
+	if n, ok := envIntOpt("CUSTOM_TEST_MAX_PER_SUBJECT"); ok && n >= 1 && n <= 20 {
+		s.CustomTestMaxPerSubject = n
+	}
+	if n, ok := envIntOpt("CUSTOM_ORDER_TIMEOUT_MIN"); ok && n >= 10 {
+		s.CustomOrderTimeout = time.Duration(n) * time.Minute
 	}
 	if v := strings.ToLower(strings.TrimSpace(os.Getenv("SUBSCRIPTIONS_ENABLED"))); v != "" {
 		s.Enabled = !(v == "0" || v == "false" || v == "no" || v == "off")

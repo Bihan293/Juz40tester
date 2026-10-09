@@ -39,6 +39,8 @@ type Handler struct {
 	// billing (optional): Telegram Stars subscriptions, daily quota, paid
 	// weak-topics tests. nil = off (the old behaviour).
 	billing *services.BillingService
+	// custom (optional): «✨ Свой тест». nil = off.
+	custom *services.CustomTestService
 	// isAdmin (optional) recognises administrators (ADMIN_IDS).
 	isAdmin func(tgUserID int64) bool
 	// admin (optional): the admin panel (statistics, users, broadcasts).

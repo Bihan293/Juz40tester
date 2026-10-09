@@ -95,7 +95,14 @@ func (h *Handler) resultScreen(ctx context.Context, sum *services.AttemptSummary
 	// Personal weak-topics test: once it is mastered (15🟢 + 5🟡) it can be
 	// finished — the test is deleted and the next weak-topics run generates
 	// a fresh one.
-	if sum.Test.Kind == models.TestKindPersonal {
+	if sum.Test.Kind == models.TestKindCustom {
+		if models.MeetsUnlockBar(green, yellow) {
+			b.WriteString("\n\n🏁 Отличный результат! Можешь закончить тест — он удалится, и освободится место для нового.")
+			top = append(top, bot.Row(bot.Btn("🏁 Закончить тест", cbCustomFinish+strconv.FormatInt(sum.Test.ID, 10))))
+		} else {
+			fmt.Fprintf(&b, "\n\nДоведи тест до %d🟢 + %d🟡 — тогда его можно будет закончить.", models.UnlockGreen, models.UnlockYellow)
+		}
+	} else if sum.Test.Kind == models.TestKindPersonal {
 		if models.MeetsUnlockBar(green, yellow) {
 			b.WriteString("\n\n🏁 Ты закрыл эти слабые темы! Можешь закончить тест — в следующий раз соберу новый.")
 			top = append(top, bot.Row(bot.Btn("🏁 Закончить тест", cbFinish+strconv.FormatInt(sum.Test.ID, 10))))
@@ -138,6 +145,8 @@ func (h *Handler) afterTestScreen(ctx context.Context, user *models.User, test *
 		}
 		if test != nil && test.Kind == models.TestKindPersonal {
 			rows = append(rows, bot.Row(bot.Btn("🎯 Слабые темы", cbWeakMenu)))
+		} else if test != nil && test.Kind == models.TestKindCustom {
+			rows = append(rows, bot.Row(bot.Btn("✨ Свой тест", cbCustomMenu)))
 		} else {
 			rows = append(rows, bot.Row(bot.Btn("📚 К предметам", cbSubjects)))
 		}
@@ -161,6 +170,9 @@ func (h *Handler) testListScreen(ctx context.Context, user *models.User, test *m
 	}
 	if test.Kind == models.TestKindPersonal {
 		return h.renderWeakMenu(ctx, user)
+	}
+	if test.Kind == models.TestKindCustom {
+		return h.renderCustomSubject(ctx, user, test.SubjectID)
 	}
 	page, err := h.quiz.SavedTestsPage(ctx, user.ID, test.SubjectID)
 	if err != nil {

@@ -20,7 +20,8 @@ const (
 // --- Main menu ---------------------------------------------------------------
 
 // mainMenuKeyboard is the persistent Reply Keyboard at the bottom of the chat:
-// Предметы · Слабые темы / Статистика · Топ / Настройки.
+// Предметы · Слабые темы / Свой тест · Статистика / Топ · Настройки
+// (/ Подписка).
 //
 // It is sent ONLY with the main menu and is never removed or re-sent around
 // a test: a ReplyKeyboardRemove (formerly sent when a test started) makes
@@ -40,8 +41,9 @@ func mainMenuKeyboardFor(plans bool) *bot.ReplyKeyboardMarkup {
 			ResizeKeyboard: true,
 			Keyboard: [][]bot.KeyboardButton{
 				bot.ReplyRow(kbSubjects, kbWeak),
-				bot.ReplyRow(kbProgress, kbTop),
-				bot.ReplyRow(kbSettings, kbPlans),
+				bot.ReplyRow(kbCustom, kbProgress),
+				bot.ReplyRow(kbTop, kbSettings),
+				bot.ReplyRow(kbPlans),
 			},
 		}
 	}
@@ -49,8 +51,8 @@ func mainMenuKeyboardFor(plans bool) *bot.ReplyKeyboardMarkup {
 		ResizeKeyboard: true,
 		Keyboard: [][]bot.KeyboardButton{
 			bot.ReplyRow(kbSubjects, kbWeak),
-			bot.ReplyRow(kbProgress, kbTop),
-			bot.ReplyRow(kbSettings),
+			bot.ReplyRow(kbCustom, kbProgress),
+			bot.ReplyRow(kbTop, kbSettings),
 		},
 	}
 }
