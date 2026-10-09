@@ -159,7 +159,7 @@ func (f *floodControl) drain(c *Client, chatID int64) {
 			}
 		}
 		ctx, cancel := context.WithTimeout(f.base, deferredSendTimeout)
-		retryAfter, err := c.callOnce(ctx, req.method, req.body, nil)
+		retryAfter, _, err := c.callOnce(ctx, req.method, chatID, req.body, nil)
 		cancel()
 
 		f.mu.Lock()

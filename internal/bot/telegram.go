@@ -25,6 +25,9 @@ type Client struct {
 
 	// flood keeps 429 back-off state and the deferred-retry queue (R-3).
 	flood *floodControl
+	// floods tells a per-chat 429 from a bot-wide one (only the latter
+	// pauses the global limiter).
+	floods *floodDetector
 	// limiter is the global token bucket of message-changing calls (A8,
 	// TG_MAX_RPS). answerCallbackQuery and service calls bypass it.
 	limiter *rateLimiter
@@ -52,6 +55,7 @@ func NewClient(token string) *Client {
 		httpClient: httpx.NewClient(15 * time.Second),
 		baseURL:    "https://api.telegram.org",
 		flood:      newFloodControl(defaultMaxDeferred),
+		floods:     newFloodDetector(),
 		limiter:    newRateLimiter(DefaultMaxRPS, defaultBurst),
 	}
 }
@@ -381,7 +385,7 @@ func (c *Client) call(ctx context.Context, method string, payload any, out any) 
 		}
 	}
 	for attempt := 0; ; attempt++ {
-		retryAfter, err := c.callOnce(ctx, method, body, out)
+		retryAfter, paused, err := c.callOnce(ctx, method, chatID, body, out)
 		if retryAfter <= 0 {
 			return err
 		}
@@ -397,11 +401,12 @@ func (c *Client) call(ctx context.Context, method string, payload any, out any) 
 			}
 			return &RateLimitError{Method: method, RetryAfter: retryAfter}
 		}
-		if c.limiter != nil && limitedMethods[method] {
+		if paused && c.limiter != nil && limitedMethods[method] {
 			// The 429 paused the global limiter (callOnce): the retry waits
 			// for it there instead of sleeping here as well.
 			continue
 		}
+		// A per-chat 429 (only this chat waits): sleep it out here.
 		t := time.NewTimer(retryAfter)
 		select {
 		case <-ctx.Done():
@@ -451,9 +456,13 @@ func (c *Client) safeErr(method string, err error) error {
 //
 // Message-changing methods first wait for the global limiter (A8); a 429
 // pauses the whole limiter for retry_after (capped at maxGlobalPause).
-func (c *Client) callOnce(ctx context.Context, method string, body []byte, out any) (retryAfter time.Duration, err error) {
+//
+// chatID is the chat of the request (0 = none). paused reports that the 429
+// was taken as bot-wide and paused the global limiter; a lone per-chat 429
+// only blocks its own chat (see floodDetector).
+func (c *Client) callOnce(ctx context.Context, method string, chatID int64, body []byte, out any) (retryAfter time.Duration, paused bool, err error) {
 	if err := c.waitLimit(ctx, method); err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	url := fmt.Sprintf("%s/bot%s/%s", c.baseURL, c.token, method)
 	if c.testEnv {
@@ -461,22 +470,22 @@ func (c *Client) callOnce(ctx context.Context, method string, body []byte, out a
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return 0, c.safeErr(method, err)
+		return 0, false, c.safeErr(method, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return 0, c.safeErr(method, err)
+		return 0, false, c.safeErr(method, err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return 0, c.safeErr(method, err)
+		return 0, false, c.safeErr(method, err)
 	}
 	var ar apiResponse
 	if err := json.Unmarshal(raw, &ar); err != nil {
-		return 0, fmt.Errorf("telegram %s: decode: %w", method, err)
+		return 0, false, fmt.Errorf("telegram %s: decode: %w", method, err)
 	}
 	if !ar.OK {
 		if resp.StatusCode == http.StatusTooManyRequests || ar.ErrorCode == http.StatusTooManyRequests {
@@ -484,22 +493,25 @@ func (c *Client) callOnce(ctx context.Context, method string, body []byte, out a
 			if ar.Parameters != nil && ar.Parameters.RetryAfter > 0 {
 				wait = time.Duration(ar.Parameters.RetryAfter) * time.Second
 			}
-			if c.limiter != nil {
-				c.limiter.pause(min(wait, maxGlobalPause))
+			if c.floods.global(chatID) {
+				paused = true
+				if c.limiter != nil {
+					c.limiter.pause(min(wait, maxGlobalPause))
+				}
+				if c.shared != nil {
+					c.shared.Pause(min(wait, maxGlobalPause))
+				}
 			}
-			if c.shared != nil {
-				c.shared.Pause(min(wait, maxGlobalPause))
-			}
-			return wait, fmt.Errorf("telegram %s: %s", method, ar.Description)
+			return wait, paused, fmt.Errorf("telegram %s: %s", method, ar.Description)
 		}
-		return 0, &APIError{Method: method, Code: ar.ErrorCode, Description: ar.Description}
+		return 0, false, &APIError{Method: method, Code: ar.ErrorCode, Description: ar.Description}
 	}
 	if out != nil && len(ar.Result) > 0 {
 		if err := json.Unmarshal(ar.Result, out); err != nil {
-			return 0, fmt.Errorf("telegram %s: result: %w", method, err)
+			return 0, false, fmt.Errorf("telegram %s: result: %w", method, err)
 		}
 	}
-	return 0, nil
+	return 0, false, nil
 }
 
 // maxMessageRunes is the Telegram limit for one message text (4096
@@ -761,7 +773,7 @@ func (c *Client) SendBroadcast(ctx context.Context, chatID int64, m BroadcastMes
 		return 0, err
 	}
 	var msg Message
-	retryAfter, err := c.callOnce(ctx, method, body, &msg)
+	retryAfter, _, err := c.callOnce(ctx, method, chatID, body, &msg)
 	if retryAfter > 0 {
 		return 0, &RateLimitError{Method: method, RetryAfter: retryAfter}
 	}

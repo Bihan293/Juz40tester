@@ -193,6 +193,12 @@ func main() {
 		if queue == nil {
 			updates = newUpdateDispatcher(cfg.WebhookSecret, w.updateWorkers, defaultUpdateQueueSize, cfg.UpdateTimeout, w.h.HandleUpdate)
 			updates.preCheckout = preCheckout
+			// Graceful shutdown: what cannot be processed in time is saved
+			// to tg_update_queue instead of being dropped, and replayed by
+			// the next instance (spill.go).
+			updates.spill = updq.NewPostgres(pool, 0)
+			bgWG.Add(1)
+			go func() { defer bgWG.Done(); replaySpilled(workerCtx, pool, updates, w.replayWake) }()
 			mux.Handle("POST /telegram/webhook", updates)
 		} else {
 			ingress = updq.NewIngress(cfg.WebhookSecret, queue)
@@ -209,11 +215,7 @@ func main() {
 		go selfPing(workerCtx, cfg.WebhookURL+"/ping")
 	}
 
-	srv := &http.Server{
-		Addr:              ":" + cfg.Port,
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-	}
+	srv := newHTTPServer(":"+cfg.Port, mux)
 
 	go func() {
 		log.Printf("listening on :%s", cfg.Port)
@@ -285,6 +287,31 @@ func main() {
 	log.Println("shutdown complete")
 }
 
+// HTTP server timeouts. Before, only ReadHeaderTimeout was set: a client
+// that sent its headers and then trickled (or never finished) the body, or
+// kept an idle keep-alive connection open, held a goroutine and a file
+// descriptor forever. Every legitimate request is tiny (a Telegram update
+// is at most a few KB and is answered at once; pre_checkout is answered
+// within Telegram's 10 s), so the bounds are generous.
+const (
+	httpReadHeaderTimeout = 5 * time.Second
+	httpReadTimeout       = 30 * time.Second
+	httpWriteTimeout      = 30 * time.Second
+	httpIdleTimeout       = 2 * time.Minute
+)
+
+// newHTTPServer builds the public HTTP server with bounded timeouts.
+func newHTTPServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		ReadTimeout:       httpReadTimeout,
+		WriteTimeout:      httpWriteTimeout,
+		IdleTimeout:       httpIdleTimeout,
+	}
+}
+
 // usesRedis reports whether any backend is switched to Redis.
 func usesRedis(cfg *config.Config) bool {
 	return cfg.QueueBackend == config.BackendRedis || cfg.RateLimitBackend == config.BackendRedis ||
@@ -332,6 +359,25 @@ type workerSide struct {
 	h             *handlers.Handler
 	consumer      *updq.Consumer // nil with QUEUE_BACKEND=memory
 	updateWorkers int
+	broadcasts    *services.BroadcastService
+	// replayWake (QUEUE_BACKEND=memory) signals updates spilled to
+	// tg_update_queue by a stopping instance.
+	replayWake chan struct{}
+}
+
+// wakeReplay asks replaySpilled to look for spilled updates (non-blocking).
+func (w *workerSide) wakeReplay() {
+	select {
+	case w.replayWake <- struct{}{}:
+	default:
+	}
+}
+
+// wakeBroadcasts makes the broadcast sender look for work at once.
+func (w *workerSide) wakeBroadcasts() {
+	if w != nil && w.broadcasts != nil {
+		w.broadcasts.Wake()
+	}
 }
 
 // startWorkerSide wires the services and starts every background loop of
@@ -509,7 +555,7 @@ func startWorkerSide(ctx, workerCtx context.Context, bgWG *sync.WaitGroup, cfg *
 		}
 	})
 
-	ws := &workerSide{h: h, updateWorkers: cfg.UpdateWorkers}
+	ws := &workerSide{h: h, updateWorkers: cfg.UpdateWorkers, broadcasts: bcSvc, replayWake: make(chan struct{}, 1)}
 	if ws.updateWorkers <= 0 {
 		ws.updateWorkers = updateWorkersFor(cfg.DBMaxConns, cfg.BackgroundConns())
 	}
@@ -544,7 +590,9 @@ func startWorkerSide(ctx, workerCtx context.Context, bgWG *sync.WaitGroup, cfg *
 	// the same connection carries the update-queue wake-ups and the
 	// cluster events (PostgreSQL bus).
 	channels := []string{repositories.ChannelGenJobs, repositories.ChannelTrJobs}
-	if cfg.QueueBackend == config.BackendPostgres {
+	if cfg.QueueBackend == config.BackendPostgres || queue == nil {
+		// queue == nil (QUEUE_BACKEND=memory): updates spilled to
+		// tg_update_queue by a stopping instance are announced here.
 		channels = append(channels, updq.ChannelUpdates)
 	}
 	pgEvents := events != nil && cfg.QueueBackend != config.BackendRedis
@@ -562,6 +610,8 @@ func startWorkerSide(ctx, workerCtx context.Context, bgWG *sync.WaitGroup, cfg *
 			case updq.ChannelUpdates:
 				if ws.consumer != nil {
 					ws.consumer.Wake()
+				} else {
+					ws.wakeReplay()
 				}
 			case cluster.ChannelEvents:
 				if payload != "" {
