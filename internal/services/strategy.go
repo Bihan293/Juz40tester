@@ -86,7 +86,7 @@ func abBucket(id int64) int {
 }
 
 // genRun accumulates the per-job outcome while the job runs (attached to
-// the job context, updated by runSteps and the DeepSeek usage hook).
+// the job context, updated by runSteps / the Groq steps).
 type genRun struct {
 	strategy      string
 	kind          string
@@ -103,8 +103,9 @@ type genRunKey struct{}
 
 func withGenRun(ctx context.Context, r *genRun) context.Context {
 	ctx = context.WithValue(ctx, genRunKey{}, r)
-	// DeepSeek calls report their real token usage to the job outcome
-	// (the per-job «tokens_in/out»).
+	// Paid DeepSeek calls report their tokens too (the Groq steps call
+	// noteTokens themselves): the per-job «tokens_in/out» used to show
+	// only the free tokens.
 	return deepseek.WithUsageHook(ctx, func(prompt, completion int) {
 		r.promptTok.Add(int64(prompt))
 		r.complTok.Add(int64(completion))

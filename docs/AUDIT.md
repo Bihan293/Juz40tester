@@ -66,7 +66,7 @@
 | 28 | `config.Load`: в production (`APP_ENV` не dev/local/test) без `WEBHOOK_SECRET` бот не запускается | `TestWebhookSecretRequiredInProduction`, ручной запуск бинаря |
 | 29 | Сломанный JSON апдейта логируется, Telegram получает 200 | `TestWebhookMalformedJSONReturns200`, ручной запуск бинаря |
 | 30 | `bot.Client.call`: на 429 читается `parameters.retry_after`, не больше 2 повторов, ожидание не дольше 30 с, иначе `RateLimitError` | `TestCall429RetriedAfterRetryAfter`, `TestCall429BoundedRetries`, `TestCall429TooLongWaitFailsFast`, `TestCallNon429ErrorNotRetried` |
-| 31 | Оставлен вариант в памяти; поведение после рестарта и при 429 проверено и описано в `docs/AI_PROVIDERS.md` | `TestLimiterAfterRestart`, `TestClient429PerDayBlocksForAnHour` |
+| 31 | Оставлен вариант в памяти; поведение после рестарта и при 429 проверено и описано в `docs/GROQ_LIMITS.md` | `TestLimiterAfterRestart`, `TestClient429PerDayBlocksForAnHour` |
 
 Повторная проверка: #13 — `TestReviveChainTestLockedIsRefusedAtServiceLevel` (у `GeneratorService.reviveChainTest` убран экспорт, единственный вход — `QuizService.ReviveChainTest` с проверкой `unlockedMax`); #16 — `TestReplaceQuestionContentAtomic` (ошибка подставлена триггером, после отката нет ни нового текста, ни потерянного прогресса); #18 — `TestEnsurePersonalTestKeepsActiveAttemptAndNormalizes`.
 

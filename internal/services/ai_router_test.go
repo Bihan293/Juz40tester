@@ -2,17 +2,12 @@ package services
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/Bihan293/Juz40tester/internal/config"
 	"github.com/Bihan293/Juz40tester/internal/deepseek"
 	"github.com/Bihan293/Juz40tester/internal/groq"
 	"github.com/Bihan293/Juz40tester/internal/models"
@@ -31,7 +26,7 @@ func TestRunStepsFallsThrough(t *testing.T) {
 		mk("groq-b", "garbage", nil),
 		mk("deepseek", "good", nil),
 		mk("never", "good", nil),
-	} // quota skip, invalid reply, success, never reached
+	}
 	raw, by, err := runSteps(context.Background(), "t", steps, func(s string) error {
 		if s != "good" {
 			return errors.New("bad")
@@ -58,104 +53,52 @@ func TestRunStepsAllFail(t *testing.T) {
 	}
 }
 
-// TestGenerationRoute: every generation (chain, personal, retry, topic
-// batch, repair) is ONE step — DeepSeek flash, thinking, effort high.
-// No Groq, no lower effort, no other model.
+// TestGenerationRoute pins the cost order: free Groq models first, paid
+// DeepSeek strictly last; Qwen runs in instruct mode.
 func TestGenerationRoute(t *testing.T) {
-	g := &GeneratorService{ds: deepseek.New("k", "")}
-	msgs := func() []deepseek.Message { return []deepseek.Message{{Role: "user", Content: "x"}} }
-	want := "deepseek/deepseek-flash(thinking-high)"
-	for _, r := range []string{
-		stepNames(g.genSteps(msgs, genMaxTokens, 0, true)),
-		stepNames(g.genSteps(msgs, genBatchMaxTokens, deepseekBatchTimeout, true)),
-		stepNames(g.repairSteps(msgs())),
-	} {
-		if r != want {
-			t.Fatalf("generation route: got %s, want %s", r, want)
-		}
-	}
-	// Without DEEPSEEK_API_KEY there is no generation at all.
-	if r := (&GeneratorService{}).genSteps(msgs, genMaxTokens, 0, true); len(r) != 0 {
-		t.Fatalf("no DeepSeek client must mean no generation steps: %d", len(r))
-	}
-}
-
-// TestGenerationRequestsAreThinkingHigh checks the wire format of every
-// kind of generation call (chain, personal, retry, batch, repair).
-func TestGenerationRequestsAreThinkingHigh(t *testing.T) {
-	var mu sync.Mutex
-	var reqs []map[string]any
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req map[string]any
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		mu.Lock()
-		reqs = append(reqs, req)
-		mu.Unlock()
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{}"},"finish_reason":"stop"}]}`))
-	}))
-	defer srv.Close()
-	g := NewGeneratorService(deepseek.New("k", srv.URL), &config.Config{}, nil, nil, nil)
-	msgs := func() []deepseek.Message { return []deepseek.Message{{Role: "user", Content: "x"}} }
-	routes := [][]aiStep{
-		g.genSteps(msgs, genMaxTokens, 0, true),
-		g.genSteps(msgs, genBatchMaxTokens, deepseekBatchTimeout, true),
-		g.repairSteps(msgs()),
-	}
-	for _, steps := range routes {
-		if _, _, err := runSteps(context.Background(), "t", steps, func(string) error { return nil }); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if len(reqs) != len(routes) {
-		t.Fatalf("want %d calls, got %d", len(routes), len(reqs))
-	}
-	for _, r := range reqs {
-		th, _ := r["thinking"].(map[string]any)
-		if r["model"] != "deepseek-flash" || th["type"] != "enabled" || r["reasoning_effort"] != "high" {
-			t.Fatalf("generation call must be flash thinking(high): %v", r)
-		}
-	}
-}
-
-// TestTranslationRoute: Qwen (instruct) first, then DeepSeek flash
-// non-thinking — nothing else.
-func TestTranslationRoute(t *testing.T) {
-	tr := &TranslatorService{gq: groq.New("k", ""), ds: deepseek.New("k", "")}
+	g := &GeneratorService{gq: groq.New("k", ""), ds: deepseek.New("k", "", "", "")}
 	msgs := []deepseek.Message{{Role: "user", Content: "x"}}
-	if r := stepNames(tr.translationSteps(msgs, 1000)); r != "groq/qwen/qwen3.8-27b(none),deepseek/deepseek-flash(non-thinking)" {
-		t.Fatalf("translation route: %s", r)
+
+	chain := stepNames(g.generationSteps(msgs, models.TestKindChain, 1))
+	want := "groq/openai/gpt-oss-120b(medium),groq/qwen/qwen3.8-27b(none),deepseek/deepseek-flash(high)" // at most 2 Groq attempts
+	if chain != want {
+		t.Fatalf("chain route:\n got %s\nwant %s", chain, want)
 	}
-	tr.gq = nil
-	if r := stepNames(tr.translationSteps(msgs, 1000)); r != "deepseek/deepseek-flash(non-thinking)" {
-		t.Fatalf("translation route without Groq: %s", r)
+	personal := stepNames(g.generationSteps(msgs, models.TestKindPersonal, 1))
+	if personal != "groq/openai/gpt-oss-120b(low),groq/qwen/qwen3.8-27b(none),deepseek/deepseek-flash(low)" {
+		t.Fatalf("personal route: %s", personal)
+	}
+	// Without Groq the old behaviour (DeepSeek only) is preserved.
+	g.gq = nil
+	if r := stepNames(g.generationSteps(msgs, models.TestKindChain, 2)); r != "deepseek/deepseek-flash(low)" {
+		t.Fatalf("deepseek-only route: %s", r)
 	}
 }
 
-// TestTranslationFallbackIsNonThinking: when Qwen is out of quota the
-// chunk goes to DeepSeek flash with thinking DISABLED and a tight
-// max_tokens (estimate + 33%, far below the generation caps).
-func TestTranslationFallbackIsNonThinking(t *testing.T) {
-	var got map[string]any
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewDecoder(r.Body).Decode(&got)
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{}"},"finish_reason":"stop"}]}`))
-	}))
-	defer srv.Close()
-	tr := &TranslatorService{ds: deepseek.New("k", srv.URL)}
-	quotaGone := aiStep{name: "groq/qwen", run: func(context.Context) (string, error) {
-		return "", &groq.RateLimitError{Model: groq.ModelQwen27B, Reason: "requests per day"}
-	}}
-	steps := append([]aiStep{quotaGone}, tr.translationSteps([]deepseek.Message{{Role: "user", Content: "x"}}, 900)...)
-	_, by, err := runSteps(context.Background(), "t", steps, func(string) error { return nil })
-	if err != nil || by != "deepseek/deepseek-flash(non-thinking)" {
-		t.Fatalf("fallback: %q %v", by, err)
+func TestGenerationPromptFitsGroq(t *testing.T) {
+	// A worst-case chain prompt (20 long previous stems) must leave enough
+	// output budget for a full 20-question test on the free tier.
+	prev := make([]models.Question, 20)
+	marks := make([]float64, 20)
+	for i := range prev {
+		prev[i] = models.Question{Topic: "Молекулярная генетика", Text: strings.Repeat("Какой процесс происходит ", 10)}
 	}
-	th, _ := got["thinking"].(map[string]any)
-	if th["type"] != "disabled" || got["reasoning_effort"] != nil {
-		t.Fatalf("translation fallback must be non-thinking: %v", got)
+	msgs := toGroqMessages([]deepseek.Message{
+		{Role: "system", Content: genSystemPrompt},
+		{Role: "user", Content: chainGenPrompt("Биология", 5, prev, marks)},
+	})
+	for _, m := range []string{groq.ModelGPTOSS120B, groq.ModelQwen27B} {
+		if b := groq.Budget(m, msgs); b < groqGenMinTokens {
+			t.Fatalf("%s: only %d output tokens left, need %d", m, b, groqGenMinTokens)
+		}
 	}
-	if mt := got["max_tokens"].(float64); mt != 1200 {
-		t.Fatalf("translation fallback max_tokens = %v, want 1200", mt)
+}
+
+func TestTranslationRoute(t *testing.T) {
+	tr := &TranslatorService{gq: groq.New("k", ""), ds: deepseek.New("k", "", "", "")}
+	r := stepNames(tr.translationSteps([]deepseek.Message{{Role: "user", Content: "x"}}, 1000))
+	if r != "groq/qwen/qwen3.8-27b(none),groq/openai/gpt-oss-120b(low),deepseek/deepseek-flash(translate)" {
+		t.Fatalf("translation route: %s", r)
 	}
 }
 
@@ -225,16 +168,27 @@ func stepNames(steps []aiStep) string {
 	return strings.Join(names, ",")
 }
 
-// TestStepTimeout: a step's own timeout bounds only that step.
-func TestStepTimeout(t *testing.T) {
-	sctx, cancel := stepContext(context.Background(), aiStep{timeout: time.Minute})
-	defer cancel()
-	if dl, ok := sctx.Deadline(); !ok || time.Until(dl) > time.Minute {
-		t.Fatal("step timeout not applied")
+// TestStepContextReservesTimeForPaidStep: earlier (free) steps are cut so
+// the reserve of a later paid step stays available.
+func TestStepContextReservesTimeForPaidStep(t *testing.T) {
+	steps := []aiStep{
+		{name: "free", timeout: time.Hour},
+		{name: "paid", reserve: 4 * time.Minute},
 	}
-	c, cc := stepContext(context.Background(), aiStep{})
-	defer cc()
-	if _, has := c.Deadline(); has {
-		t.Fatal("no timeout must mean no deadline")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	sctx, scancel, ok := stepContext(ctx, steps, 0)
+	defer scancel()
+	if !ok {
+		t.Fatal("free step must run when time is left")
+	}
+	dl, _ := sctx.Deadline()
+	if left := time.Until(dl); left > time.Minute+time.Second {
+		t.Fatalf("free step must leave the reserve: got %v", left)
+	}
+	short, c2 := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer c2()
+	if _, _, ok := stepContext(short, steps, 0); ok {
+		t.Fatal("free step must be skipped when only the reserve is left")
 	}
 }

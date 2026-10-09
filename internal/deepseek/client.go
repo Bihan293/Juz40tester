@@ -1,35 +1,34 @@
 // Package deepseek implements a minimal DeepSeek API client
-// (OpenAI-compatible chat completions).
+// (OpenAI-compatible chat completions) used for AI test generation.
 //
-// The bot uses exactly ONE DeepSeek model — deepseek-flash
-// (DeepSeek-V4.1-Flash) — in two modes:
-//
-//   - GenerateJSON: THINKING mode with reasoning_effort="high"
-//     ({"thinking":{"type":"enabled"},"reasoning_effort":"high"}). Every
-//     test generation goes through it: chain tests, personal weak-topics
-//     tests, retries, batches, topic-bank batches and the repair of flagged
-//     questions. There is no lower effort and no other model: if the API
-//     rejects the request, the call simply fails and the job is retried
-//     later (no silent switch to a pricier or weaker model);
-//   - TranslateJSON: NON-thinking mode ({"thinking":{"type":"disabled"}}) —
-//     the cheapest call possible. Used only as the fallback of the Kazakh
-//     translation when the primary translator (Groq Qwen) is out of quota
-//     or failed.
-//
-// Cost notes:
+// Cost model (the whole point of this client):
+//   - the primary generator is deepseek-flash (DeepSeek-V4.1-Flash) IN
+//     THINKING MODE — {"thinking":{"type":"enabled"}} plus the official
+//     reasoning_effort knob. Chain tests (one per subject, shared by every
+//     user) are generated with effort "high"; personal weak-topics tests and
+//     all retries use "low". V4.1-Flash-thinking beats the retired
+//     deepseek-reasoner on quality while costing ~6x less: a 20-question
+//     test lands at roughly $0.002–0.006 depending on effort and the
+//     off-peak pricing window;
 //   - the legacy model names deepseek-chat / deepseek-reasoner were REMOVED
-//     from the DeepSeek API on 2026-07-24 — never reintroduce them;
+//     from the DeepSeek API on 2026-07-24 (every request fails with
+//     "model not found") — never reintroduce them as defaults;
 //   - NEVER invent extra thinking fields: a "budget_tokens" sub-field is not
-//     part of the DeepSeek API and makes every call fail with HTTP 400;
-//   - max_tokens is the hard cost limiter (in thinking mode it also covers
-//     the hidden reasoning tokens);
+//     part of the DeepSeek API and makes every call fail with HTTP 400 —
+//     that bug once silently killed ALL test generation;
+//   - the fallback model (deepseek-v4-pro, non-thinking) is used ONLY when
+//     the flash model rejects the thinking parameters — it is several times
+//     pricier, so it must stay a fallback, never the default;
+//   - prompts are deliberately compact and `why` fields are disabled —
+//     output tokens dominate the price, so nothing but the required JSON is
+//     requested;
 //   - every successful call logs its REAL token usage and the estimated
-//     cost (off-peak and peak) plus the running session total, and feeds the
-//     daily spending cap (Budget). Thinking and non-thinking calls of the
-//     same model are billed at the same per-token price — non-thinking is
-//     cheaper only because it produces far fewer output tokens.
+//     cost (off-peak and peak) plus the running session total, so the spend
+//     per test is always visible in the server logs — no more surprise
+//     $0.10 bills.
 //
-// Configuration: DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL (optional).
+// The API key and models are configured through environment variables:
+// DEEPSEEK_API_KEY, DEEPSEEK_MODEL, DEEPSEEK_REASONER_MODEL, DEEPSEEK_BASE_URL.
 package deepseek
 
 import (
@@ -48,14 +47,32 @@ import (
 	"github.com/Bihan293/Juz40tester/internal/httpx"
 )
 
-// Model is the only DeepSeek model the bot calls (DeepSeek-V4.1-Flash).
-const Model = "deepseek-flash"
+// DefaultModel is used when DEEPSEEK_MODEL is not set: the strong
+// non-thinking fallback (deepseek-v4-pro). Pricier than flash — fallback
+// only, never the primary generator.
+const DefaultModel = "deepseek-v4-pro"
+
+// DefaultReasonerModel is used when DEEPSEEK_REASONER_MODEL is not set:
+// the primary generator, DeepSeek-V4.1-Flash in thinking mode.
+const DefaultReasonerModel = "deepseek-flash"
 
 // DefaultBaseURL is the official DeepSeek API endpoint.
 const DefaultBaseURL = "https://api.deepseek.com"
 
-// GenerationEffort is the reasoning_effort of every generation call.
-const GenerationEffort = "high"
+// Thinking effort levels (the official reasoning_effort knob). The API maps
+// every requested value onto actual low/high/max — there is no real
+// "medium", so:
+//   - ThinkingEffortHigh is the "medium" level: used for chain tests (one
+//     per subject, shared by all users — quality matters most here and the
+//     cost is amortised across everyone);
+//   - ThinkingEffortLow is the cheapest real thinking: used for personal
+//     weak-topics tests (a simpler, topics-only task) and for every RETRY
+//     (if a harder pass blew the token budget, a shorter thinking pass is
+//     what actually fits).
+const (
+	ThinkingEffortHigh = "high"
+	ThinkingEffortLow  = "low"
+)
 
 // pricePerToken is the OFF-PEAK price per token (USD) by model; the peak
 // price is exactly 2x (DeepSeek pricing, 2026). Cache-hit input is priced
@@ -66,31 +83,38 @@ type pricePerToken struct {
 	out    float64
 }
 
-// The price is per model, not per mode: thinking and non-thinking calls of
-// deepseek-flash cost the same per token (reasoning tokens are billed as
-// output).
 var prices = map[string]pricePerToken{
-	Model: {inHit: 0.003e-6, inMiss: 0.15e-6, out: 0.60e-6},
+	"deepseek-flash":  {inHit: 0.003e-6, inMiss: 0.15e-6, out: 0.60e-6},
+	"deepseek-v4-pro": {inHit: 0.022e-6, inMiss: 0.66e-6, out: 1.98e-6},
+	// Legacy names kept for cost estimates in case someone overrides the env
+	// vars back to V3.x on a private proxy.
+	"deepseek-chat":     {inHit: 0.07e-6, inMiss: 0.27e-6, out: 1.10e-6},
+	"deepseek-reasoner": {inHit: 0.14e-6, inMiss: 0.55e-6, out: 2.19e-6},
 }
 
 type usageHookKey struct{}
 
 // WithUsageHook returns a context whose DeepSeek calls report the token
 // usage of every successful reply to fn (the generator adds it to the
-// per-job statistics).
+// per-job statistics, which otherwise counted only the free Groq tokens).
 func WithUsageHook(ctx context.Context, fn func(prompt, completion int)) context.Context {
 	return context.WithValue(ctx, usageHookKey{}, fn)
 }
 
 // Client calls the DeepSeek chat completions API.
 type Client struct {
-	apiKey     string
-	baseURL    string
-	httpClient *http.Client
+	apiKey        string
+	model         string
+	reasonerModel string
+	baseURL       string
+	httpClient    *http.Client
 
-	// mu guards the session totals: the workers call the client from
-	// several goroutines.
-	mu sync.Mutex
+	// thinkingUnsupported is flipped to true at runtime if the model rejects
+	// the thinking parameters — further calls then omit them instead of
+	// failing. Guarded by the mutex: the generation worker may call the
+	// client from several goroutines.
+	mu                  sync.Mutex
+	thinkingUnsupported bool
 
 	// Session cost totals (off-peak estimate) — logged on every call so the
 	// spend is observable without an external dashboard.
@@ -132,7 +156,7 @@ func (c *Client) WithBudget(b Budget, offPeak func(time.Time) bool) *Client {
 // worstCaseCost bounds the price of one call before it is sent: every
 // input token priced as a cache miss (input tokens bounded by the request
 // size in BYTES — a BPE token is never shorter than one byte), the
-// whole max_tokens budget as output, at the PEAK rate. An unknown model is
+// whole max_tokens budget as output, at the PEAK rate. Unknown models are
 // priced like the most expensive known one.
 func worstCaseCost(model string, body []byte, maxTokens int) float64 {
 	p, ok := prices[model]
@@ -150,6 +174,20 @@ func worstCaseCost(model string, body []byte, maxTokens int) float64 {
 	return 2 * (in*p.inMiss + float64(maxTokens)*p.out)
 }
 
+// thinkingDisabled reports (under lock) whether thinking params must be
+// omitted, and setThinkingUnsupported flips the switch (under lock).
+func (c *Client) thinkingDisabled() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.thinkingUnsupported
+}
+
+func (c *Client) setThinkingUnsupported() {
+	c.mu.Lock()
+	c.thinkingUnsupported = true
+	c.mu.Unlock()
+}
+
 // addUsage accumulates session totals (under lock) and returns the running
 // cost estimate for logging.
 func (c *Client) addUsage(u *usage, cost float64) (total float64, in, out int64) {
@@ -161,17 +199,32 @@ func (c *Client) addUsage(u *usage, cost float64) (total float64, in, out int64)
 	return c.totalCost, c.totalIn, c.totalOut
 }
 
-// New creates a client. baseURL may be empty (official endpoint).
-func New(apiKey, baseURL string) *Client {
+// New creates a client. model / reasonerModel / baseURL may be empty —
+// defaults are used.
+func New(apiKey, model, reasonerModel, baseURL string) *Client {
+	if model == "" {
+		model = DefaultModel
+	}
+	if reasonerModel == "" {
+		reasonerModel = DefaultReasonerModel
+	}
 	if baseURL == "" {
 		baseURL = DefaultBaseURL
 	}
 	return &Client{
-		apiKey:     apiKey,
-		baseURL:    strings.TrimRight(baseURL, "/"),
-		httpClient: httpx.NewClient(300 * time.Second),
+		apiKey:        apiKey,
+		model:         model,
+		reasonerModel: reasonerModel,
+		baseURL:       strings.TrimRight(baseURL, "/"),
+		httpClient:    httpx.NewClient(300 * time.Second),
 	}
 }
+
+// Model returns the configured fallback (non-thinking) model name.
+func (c *Client) Model() string { return c.model }
+
+// ReasonerModel returns the configured primary (thinking) model name.
+func (c *Client) ReasonerModel() string { return c.reasonerModel }
 
 // Message is a single chat message.
 type Message struct {
@@ -182,18 +235,18 @@ type Message struct {
 type chatRequest struct {
 	Model    string    `json:"model"`
 	Messages []Message `json:"messages"`
-	// Temperature is sent only in non-thinking mode (translation) —
-	// thinking mode ignores it, so it is omitted there.
+	// Temperature is sent only to the non-thinking fallback — thinking mode
+	// ignores it (DeepSeek silently no-ops it, so we just omit it).
 	Temperature *float64 `json:"temperature,omitempty"`
 	// MaxTokens caps output tokens. In thinking mode it also covers the
 	// hidden reasoning tokens, so it is a hard cost limiter.
 	MaxTokens int `json:"max_tokens,omitempty"`
-	// Thinking toggles the reasoning mode: {"type":"enabled"} (generation)
-	// or {"type":"disabled"} (translation fallback). It is ALWAYS sent
-	// explicitly, so the mode never depends on the API default.
+	// Thinking toggles the reasoning mode: {"type":"enabled"} — the only
+	// thinking field the DeepSeek API documents. Never sent to the
+	// non-thinking fallback.
 	Thinking *thinking `json:"thinking,omitempty"`
-	// ReasoningEffort bounds the thinking length. Sent only in thinking
-	// mode (always GenerationEffort).
+	// ReasoningEffort ("low"/"high"/"max") bounds the thinking length.
+	// Sent only together with Thinking.
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 	// ResponseFormat enables DeepSeek JSON Output mode: the model is
 	// constrained to emit valid JSON.
@@ -201,7 +254,7 @@ type chatRequest struct {
 }
 
 type thinking struct {
-	Type string `json:"type"` // "enabled" | "disabled"
+	Type string `json:"type"` // "enabled"
 }
 
 type responseFormat struct {
@@ -249,52 +302,112 @@ func estimateCost(model string, u *usage) (offPeak, peak float64) {
 	return offPeak, offPeak * 2
 }
 
-// GenerateJSON asks deepseek-flash in THINKING mode (reasoning_effort
-// "high", JSON mode) for a generation reply. It is the only generation
-// entry point: chain tests, personal tests, retries, batches and repairs
-// all use it. Errors are returned as is — the caller retries later.
-func (c *Client) GenerateJSON(ctx context.Context, messages []Message, maxTokens int) (string, error) {
-	return c.call(ctx, messages, maxTokens, true)
-}
-
-// TranslateJSON asks deepseek-flash in NON-thinking mode (JSON mode,
-// temperature 0.3) — the cheapest possible call. It is the fallback of the
-// Kazakh translation only (the primary translator is Groq Qwen).
-func (c *Client) TranslateJSON(ctx context.Context, messages []Message, maxTokens int) (string, error) {
-	return c.call(ctx, messages, maxTokens, false)
-}
-
-// mode returns the log label of a call mode.
-func mode(think bool) string {
-	if think {
-		return "thinking(" + GenerationEffort + ")"
+// GenerateJSON is the single entry point used by the test generator: it asks
+// the THINKING model (JSON mode) for the whole test. effort is the
+// reasoning_effort knob (ThinkingEffortHigh for chain tests,
+// ThinkingEffortLow for personal tests and retries). If the model rejects
+// the thinking parameters (older proxy, unsupported knobs) the client
+// transparently retries without them, and as a last resort falls back to
+// the non-thinking model — generation never breaks.
+func (c *Client) GenerateJSON(ctx context.Context, messages []Message, maxTokens int, effort string) (string, error) {
+	if effort == "" {
+		effort = ThinkingEffortLow
 	}
-	return "non-thinking"
+	return c.jsonWithFallback(ctx, "generate", messages, maxTokens, effort, 0.7)
 }
 
-func (c *Client) call(ctx context.Context, messages []Message, maxTokens int, think bool) (string, error) {
+// TranslateJSON asks the model for a pure translation (JSON mode, low
+// thinking effort — translation is a mechanical task, not a reasoning one).
+// It is used to translate an already-generated Russian test into Kazakh ONCE
+// per question; the result is cached in the database and reused by every
+// user, so this entry point is expected to be called rarely.
+func (c *Client) TranslateJSON(ctx context.Context, messages []Message, maxTokens int) (string, error) {
+	return c.jsonWithFallback(ctx, "translate", messages, maxTokens, ThinkingEffortLow, 0.3)
+}
+
+// jsonWithFallback runs the provider route shared by GenerateJSON and
+// TranslateJSON:
+//
+//  1. thinking mode on the reasoner model — skipped entirely once the model
+//     has explicitly rejected the thinking parameters (no wasted 400 call);
+//  2. the same reasoner model WITHOUT thinking parameters — only after an
+//     explicit thinking-parameter rejection (the flag is set only then);
+//  3. the pricier non-thinking fallback (c.model) — ONLY when the reasoner
+//     rejected the request parameters. Timeouts, 5xx, truncated replies and
+//     context-length errors are returned as is: the job retries later
+//     instead of silently paying ~3x for v4-pro.
+func (c *Client) jsonWithFallback(ctx context.Context, op string, messages []Message, maxTokens int, effort string, fallbackTemp float64) (string, error) {
+	if !c.thinkingDisabled() {
+		raw, err := c.call(ctx, c.reasonerModel, messages, 0, maxTokens, true, effort)
+		if err == nil || !isThinkingParamError(err) {
+			return raw, err
+		}
+		log.Printf("deepseek: thinking params rejected on %s (%v) — retrying without them", op, err)
+		c.setThinkingUnsupported()
+	}
+	raw, err := c.call(ctx, c.reasonerModel, messages, 0, maxTokens, true, "")
+	if err != nil && isParamError(err) {
+		// The reasoner rejects the request itself — last resort: the
+		// non-thinking fallback model (deepseek-v4-pro — strong, but
+		// pricier; it must never become the default).
+		log.Printf("deepseek: %s rejected %s request (%v) — falling back to %s (non-thinking)", c.reasonerModel, op, err, c.model)
+		raw, err = c.call(ctx, c.model, messages, fallbackTemp, maxTokens, true, "")
+	}
+	return raw, err
+}
+
+// isThinkingParamError reports an explicit rejection of the thinking-mode
+// knobs (the error text names "thinking" or "reasoning_effort"). Any other
+// 400 (too long context, bad JSON, …) must NOT disable thinking forever.
+func isThinkingParamError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "thinking") || strings.Contains(s, "reasoning_effort")
+}
+
+// isParamError reports whether the API rejected request parameters (HTTP 400
+// class) rather than failing for a transient reason. Context-length errors
+// are excluded — a different model would not help with them.
+func isParamError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	ls := strings.ToLower(s)
+	if strings.Contains(ls, "context length") || strings.Contains(ls, "context_length") ||
+		strings.Contains(ls, "maximum context") || strings.Contains(ls, "too long") {
+		return false
+	}
+	return strings.Contains(s, "HTTP 400") ||
+		strings.Contains(s, "invalid_request") ||
+		strings.Contains(s, "unknown field") ||
+		strings.Contains(s, "unsupported")
+}
+
+func (c *Client) call(ctx context.Context, model string, messages []Message, temperature float64, maxTokens int, jsonMode bool, effort string) (string, error) {
 	if c.apiKey == "" {
 		return "", fmt.Errorf("deepseek: API key is not configured (set DEEPSEEK_API_KEY)")
 	}
-	model := Model
-	reqBody := chatRequest{
-		Model:          model,
-		Messages:       messages,
-		ResponseFormat: &responseFormat{Type: "json_object"},
+	reqBody := chatRequest{Model: model, Messages: messages}
+	if temperature > 0 {
+		reqBody.Temperature = &temperature
 	}
 	if maxTokens > 0 {
 		reqBody.MaxTokens = maxTokens
 	}
-	if think {
+	if jsonMode {
+		reqBody.ResponseFormat = &responseFormat{Type: "json_object"}
+	}
+	if effort != "" {
 		// Official thinking-mode knobs only (api-docs.deepseek.com/guides/
-		// thinking_mode). No "budget_tokens": DeepSeek rejects unknown
-		// fields with HTTP 400.
+		// thinking_mode): enable thinking and bound it with
+		// reasoning_effort — that is what keeps the hidden reasoning tokens
+		// (billed as output) cheap. No "budget_tokens": DeepSeek rejects
+		// unknown fields with HTTP 400.
 		reqBody.Thinking = &thinking{Type: "enabled"}
-		reqBody.ReasoningEffort = GenerationEffort
-	} else {
-		reqBody.Thinking = &thinking{Type: "disabled"}
-		temp := 0.3
-		reqBody.Temperature = &temp
+		reqBody.ReasoningEffort = effort
 	}
 
 	body, err := json.Marshal(reqBody)
@@ -381,20 +494,20 @@ func (c *Client) call(ctx context.Context, messages []Message, maxTokens int, th
 		}
 		total, totIn, totOut := c.addUsage(cr.Usage, off)
 		if off > 0 {
-			log.Printf("deepseek: %s %s in=%d (cache hit %d) out=%d => ~$%.4f off-peak / $%.4f peak | session ~$%.4f (%d in / %d out)",
-				model, mode(think), cr.Usage.PromptTokens, cr.Usage.PromptCacheHit, cr.Usage.CompletionTokens,
+			log.Printf("deepseek: %s effort=%q in=%d (cache hit %d) out=%d => ~$%.4f off-peak / $%.4f peak | session ~$%.4f (%d in / %d out)",
+				model, effort, cr.Usage.PromptTokens, cr.Usage.PromptCacheHit, cr.Usage.CompletionTokens,
 				off, peak, total, totIn, totOut)
 		} else {
-			log.Printf("deepseek: %s %s in=%d out=%d (price unknown for this model)",
-				model, mode(think), cr.Usage.PromptTokens, cr.Usage.CompletionTokens)
+			log.Printf("deepseek: %s effort=%q in=%d out=%d (price unknown for this model)",
+				model, effort, cr.Usage.PromptTokens, cr.Usage.CompletionTokens)
 		}
 	}
 
 	content := cr.Choices[0].Message.Content
 	// "length" means the model spent the whole max_tokens budget (mostly on
 	// hidden thinking) and the visible JSON got truncated — such a reply can
-	// never parse, so fail fast and let the job retry instead of storing
-	// garbage or looping on a JSON syntax error.
+	// never parse, so fail fast and let the job retry (at a lower thinking
+	// effort) instead of storing garbage or looping on a JSON syntax error.
 	if cr.Choices[0].FinishReason == "length" {
 		return "", fmt.Errorf("deepseek: reply truncated at max_tokens=%d (finish_reason=length, %d visible chars)", maxTokens, len(content))
 	}

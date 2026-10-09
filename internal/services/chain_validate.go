@@ -12,7 +12,7 @@ package services
 //
 // Every rejection is a typed *genRejectError, so runSteps can count it per
 // class (metrics: difficulty violations, repeat rejects, weak coverage …)
-// and the next batch round gets the reason as feedback.
+// and the next provider step gets the reason as feedback.
 
 import (
 	"errors"

@@ -1,12 +1,14 @@
 // Package groq implements a rate-limit-aware client for the Groq API
-// (OpenAI-compatible chat completions). The bot uses it for ONE task only:
-// the RU→KK translation of tests with qwen/qwen3.8-27b in instruct mode
-// (reasoning_effort=none). Test generation never touches Groq.
+// (OpenAI-compatible chat completions) used to offload the cheap/mechanical
+// AI work from the paid DeepSeek API:
 //
-// When the free quota is exhausted or a call fails, the translator falls
-// back to DeepSeek flash in non-thinking mode (internal/deepseek).
+//   - Kazakh translation of tests      → qwen/qwen3.8-27b  (instruct mode, no thinking)
+//   - chain + weak-topics generation   → openai/gpt-oss-120b (reasoning low/medium)
 //
-// The free-tier limits are HARD and per model (see docs/AI_PROVIDERS.md):
+// DeepSeek stays as the last-resort fallback, so a Groq outage or an
+// exhausted free-tier quota never breaks the bot — it only costs money again.
+//
+// The free-tier limits are HARD and per model (see docs/GROQ_LIMITS.md):
 // the client never sends a request that is known to exceed them — it waits
 // (bounded by the caller's MaxWait) or returns a *RateLimitError so the
 // caller can move on to the next provider immediately.
@@ -18,8 +20,11 @@ import (
 	"strings"
 )
 
-// ModelQwen27B is the translation model (official Groq id, 2026-09).
-const ModelQwen27B = "qwen/qwen3.8-27b"
+// Model ids (official Groq ids, 2026-09).
+const (
+	ModelGPTOSS120B = "openai/gpt-oss-120b"
+	ModelQwen27B    = "qwen/qwen3.8-27b"
+)
 
 // DefaultBaseURL is the official Groq OpenAI-compatible endpoint.
 const DefaultBaseURL = "https://api.groq.com/openai/v1"
@@ -38,9 +43,11 @@ type Limits struct {
 }
 
 // freeTierLimits are the Groq FREE plan limits as published on
-// console.groq.com/docs/rate-limits (verified 2026-09-30).
+// console.groq.com/docs/rate-limits (verified 2026-09-30). Both models have
+// their OWN independent buckets — traffic on one never consumes the other.
 var freeTierLimits = map[string]Limits{
-	ModelQwen27B: {RPM: 30, RPD: 1000, TPM: 8000, TPD: 200000, ContextWindow: 131072, MaxCompletion: 16384},
+	ModelGPTOSS120B: {RPM: 30, RPD: 1000, TPM: 8000, TPD: 200000, ContextWindow: 131072, MaxCompletion: 65536},
+	ModelQwen27B:    {RPM: 30, RPD: 1000, TPM: 8000, TPD: 200000, ContextWindow: 131072, MaxCompletion: 16384},
 }
 
 // conservativeDefault is used for an unknown model id (e.g. a model swapped
@@ -48,7 +55,7 @@ var freeTierLimits = map[string]Limits{
 var conservativeDefault = Limits{RPM: 30, RPD: 1000, TPM: 6000, TPD: 100000, ContextWindow: 32768, MaxCompletion: 8192}
 
 // Safety margins. The bot must NEVER hit the real ceiling (a 429 wastes a
-// request and forces the paid DeepSeek translation fallback), so the soft limits used by
+// request and forces a fallback to paid DeepSeek), so the soft limits used by
 // the local limiter are a bit lower than the published ones.
 const (
 	// safetyFactor is applied to RPM / RPD / TPD (window counters).
@@ -123,7 +130,7 @@ func envInt(key string) (int, bool) {
 
 // EstimateTokens is a deliberately PESSIMISTIC token estimate for a chat
 // request (no tokenizer dependency). Cyrillic (Russian / Kazakh) text costs
-// ~1 token per 2.5–4 characters on the Qwen tokenizer;
+// ~1 token per 2.5–4 characters on the gpt-oss (o200k) and Qwen tokenizers;
 // we assume 2.5, plus a fixed per-message overhead. Over-estimating only
 // shrinks max_tokens a little — under-estimating could trigger HTTP 413.
 func EstimateTokens(messages []Message) int {

@@ -1,7 +1,6 @@
 package config
 
 import (
-	"os"
 	"testing"
 	"time"
 )
@@ -265,23 +264,6 @@ func TestDefaultBroadcastRPS(t *testing.T) {
 	for in, want := range map[int]int{25: 16, 30: 20, 1: 1, 2: 1, 3: 2} {
 		if got := DefaultBroadcastRPS(in); got != want {
 			t.Errorf("DefaultBroadcastRPS(%d) = %d, want %d", in, got, want)
-		}
-	}
-}
-
-// TestRemovedEnvVars: the env vars of the old AI routing are reported at
-// startup while they are still set (so they get removed on Render).
-func TestRemovedEnvVars(t *testing.T) {
-	t.Setenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
-	got := RemovedEnvVars()
-	if len(got) == 0 || got[0] != "DEEPSEEK_MODEL" {
-		t.Fatalf("DEEPSEEK_MODEL must be reported as removed: %v", got)
-	}
-	for _, k := range got {
-		if k == "DEEPSEEK_REASONER_MODEL" {
-			if _, ok := os.LookupEnv(k); !ok {
-				t.Fatalf("%s reported but not set", k)
-			}
 		}
 	}
 }

@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/Bihan293/Juz40tester/internal/config"
-	"github.com/Bihan293/Juz40tester/internal/deepseek"
+	"github.com/Bihan293/Juz40tester/internal/groq"
 	"github.com/Bihan293/Juz40tester/internal/models"
 	"github.com/Bihan293/Juz40tester/internal/repositories"
 )
@@ -71,7 +71,7 @@ func TestShutdownReleasesRunningJob(t *testing.T) {
 	defer hang.Close()
 	defer close(stopHang)
 	state := repositories.NewStateRepository(e.pool)
-	svc := NewGeneratorService(deepseek.New("k", hang.URL), &config.Config{}, e.gen, e.subjects, state)
+	svc := NewGeneratorService(nil, &config.Config{}, e.gen, e.subjects, state).WithGroq(groq.New("k", hang.URL))
 
 	if _, err := e.gen.EnqueueChainJobNow(ctx, e.sid, 1); err != nil {
 		t.Fatal(err)
