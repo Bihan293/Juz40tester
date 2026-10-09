@@ -419,7 +419,7 @@ func startWorkerSide(ctx, workerCtx context.Context, bgWG *sync.WaitGroup, cfg *
 	// Telegram alerts to ADMIN_IDS: generation failing for good / in a row,
 	// stuck jobs, the DeepSeek daily cap. Rate-limited per alert key,
 	// cluster-wide (nil when ADMIN_IDS is empty).
-	alerts := services.NewAdminAlerter(cfg.Subscriptions.AdminIDs, func(ctx context.Context, chatID int64, text string) error {
+	alerts := services.NewAdminAlerter(cfg.Subscriptions.AlertRecipients(), func(ctx context.Context, chatID int64, text string) error {
 		_, err := tg.SendMessage(ctx, chatID, text, nil)
 		return err
 	}).WithClaim(spendRepo.ClaimAlert)

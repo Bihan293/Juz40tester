@@ -989,7 +989,7 @@ func (h *Handler) bypassPurchase(ctx context.Context, chatID int64, user *models
 		return
 	case err != nil:
 		logf("admin bypass purchase %s tg %d: %v", payload, tgUserID, err)
-		h.sendText(ctx, chatID, "🛠 Тестовая покупка не удалась: "+err.Error())
+		h.sendText(ctx, chatID, "🛠 Тестовая покупка не удалась — подробности в логах сервера.")
 		return
 	}
 	if h.admin != nil {

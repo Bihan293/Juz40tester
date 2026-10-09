@@ -51,7 +51,7 @@ type fakeCustomAI struct {
 	mu           sync.Mutex
 	refuse       string // pre-check: refuse with this reason ("" = accept)
 	failGen      bool   // generation replies are garbage
-	disputeOnce  int    // verify: dispute this question (1-based) on the FIRST check
+	disputeOnce  int    // verify: dispute this question (1-based) on the first check and the second opinion
 	checks       int
 	gens         int
 	verifies     int
@@ -94,7 +94,7 @@ func (f *fakeCustomAI) server(t *testing.T) *httptest.Server {
 				if !ok {
 					k = 2 // a rewritten question: its key is C
 				}
-				if f.disputeOnce == n && f.verifies == 1 {
+				if f.disputeOnce == n && f.verifies <= 2 { // first check AND the second opinion
 					k = (k + 1) % 4
 				}
 				ans = append(ans, map[string]any{"n": n, "letter": string(rune('A' + k))})
@@ -326,7 +326,7 @@ func TestCustomPrecheckRefusalNoCharge(t *testing.T) {
 
 func TestCustomPayGenerateAppearsAndResume(t *testing.T) {
 	e := newCustomEnv(t, true)
-	e.ai.disputeOnce = 7 // the checker disputes q7 once → rewrite → re-check
+	e.ai.disputeOnce = 7 // the checker AND the second opinion dispute q7 → rewrite → re-check
 	o := e.order(e.user.ID, e.tgID, e.sid)
 	if o.Amount != 15 || o.Title != "Клетка и организм" {
 		t.Fatalf("order: %+v", o)
@@ -363,8 +363,8 @@ func TestCustomPayGenerateAppearsAndResume(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	if e.ai.verifies != 2 || e.ai.repairs != 1 {
-		t.Fatalf("answer-key check: verifies=%d repairs=%d (want 2/1)", e.ai.verifies, e.ai.repairs)
+	if e.ai.verifies != 3 || e.ai.repairs != 1 {
+		t.Fatalf("answer-key check: verifies=%d repairs=%d (want 3/1: check, second opinion, re-check)", e.ai.verifies, e.ai.repairs)
 	}
 	if st := e.orderStatus(o.ID); st != repositories.OrderFulfilled {
 		t.Fatalf("order status %s", st)

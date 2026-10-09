@@ -267,6 +267,12 @@ type Subscriptions struct {
 	// AdminIDs (ADMIN_IDS, comma-separated Telegram user ids): may use
 	// /grant, /revoke, /subinfo, /refund.
 	AdminIDs []int64
+	// AlertIDs (ALERT_IDS, comma-separated Telegram user ids; default =
+	// ADMIN_IDS): who receives the TECHNICAL operational alerts (failed
+	// generations with provider errors, quota / budget warnings). It can
+	// only narrow ADMIN_IDS — an id that is not an administrator is dropped,
+	// so a technical log can never reach an ordinary student.
+	AlertIDs []int64
 	// WeakOrderTimeout (WEAK_ORDER_TIMEOUT_MIN, default 45): a paid order
 	// without a test after this long is refunded automatically.
 	WeakOrderTimeout time.Duration
@@ -297,6 +303,22 @@ type Subscriptions struct {
 
 // Catalog builds the validated plan catalog.
 func (s Subscriptions) Catalog() (*billing.Catalog, error) { return billing.NewCatalog(s.Plans) }
+
+// AlertRecipients returns the Telegram ids that get technical alerts:
+// ALERT_IDS when set (restricted to administrators), else every
+// administrator.
+func (s Subscriptions) AlertRecipients() []int64 {
+	if len(s.AlertIDs) == 0 {
+		return append([]int64(nil), s.AdminIDs...)
+	}
+	var out []int64
+	for _, id := range s.AlertIDs {
+		if s.IsAdmin(id) {
+			out = append(out, id)
+		}
+	}
+	return out
+}
 
 // IsAdmin reports whether the Telegram user is an administrator.
 func (s Subscriptions) IsAdmin(tgUserID int64) bool {
@@ -366,6 +388,13 @@ func loadSubscriptions() (Subscriptions, error) {
 			return s, fmt.Errorf("ADMIN_IDS: bad Telegram id %q", f)
 		}
 		s.AdminIDs = append(s.AdminIDs, id)
+	}
+	for _, f := range strings.FieldsFunc(os.Getenv("ALERT_IDS"), func(r rune) bool { return r == ',' || r == ' ' || r == ';' }) {
+		id, err := strconv.ParseInt(strings.TrimSpace(f), 10, 64)
+		if err != nil || id <= 0 {
+			return s, fmt.Errorf("ALERT_IDS: bad Telegram id %q", f)
+		}
+		s.AlertIDs = append(s.AlertIDs, id)
 	}
 	for _, p := range billing.DefaultPlans() {
 		up := strings.ToUpper(p.Code)
