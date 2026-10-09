@@ -288,14 +288,14 @@ func (r *GenerationRepository) DeletePersonalTest(ctx context.Context, userID, t
 		return err
 	}
 	if len(qids) > 0 {
-		// R-8b: questions may be shared with other clones and survive the
-		// delete below — drop THIS user's progress on them explicitly (it
-		// used to vanish via the cascade of the question row).
-		if _, err := tx.Exec(ctx, `
-			DELETE FROM user_question_progress
-			WHERE user_id = $1 AND question_id = ANY($2::bigint[])`, userID, qids); err != nil {
-			return err
-		}
+		// The user's progress on questions that SURVIVE the delete (shared
+		// with a clone or linked into another student's bank test) is kept,
+		// exactly like for a bank test above: it is what keeps the solved
+		// questions out of the user's next weak-topics test. Dropping it
+		// (the old R-8b behaviour) made the bank hand the same, already
+		// mastered questions out again as «new». The progress of questions
+		// deleted below goes away with them (ON DELETE CASCADE).
+		//
 		// Questions of the deleted test that no other test references go
 		// away; their progress / attempt rows cascade. Questions still linked
 		// to another test are left untouched.

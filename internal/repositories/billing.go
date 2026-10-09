@@ -169,15 +169,33 @@ func (r *BillingRepository) LockUserTx(ctx context.Context, tx pgx.Tx, userID in
 // test of today's quota — in the transaction of the final answer. The
 // attempt_id primary key makes it idempotent (a second call for the same
 // attempt changes nothing); personal tests are recorded but not charged.
+//
+// The completion is charged to the quota day the attempt was STARTED on
+// (Asia/Almaty), not the day it is finished: the start gate already
+// counted the attempt against its start day while it was open. Charging
+// it to the finishing day let a student start the whole limit late in the
+// evening, finish it after midnight and still start the full new limit —
+// twice the plan's daily tests.
 func (r *BillingRepository) ChargeCompletionTx(ctx context.Context, tx pgx.Tx, userID, attemptID, testID int64) (bool, error) {
 	now := r.now()
-	day, _, _ := r.cal.Day(now)
+	chargeAt := now
+	var startedAt time.Time
+	err := tx.QueryRow(ctx, `SELECT started_at FROM test_attempts WHERE id = $1`, attemptID).Scan(&startedAt)
+	switch {
+	case err == nil:
+		if startedAt.Before(chargeAt) {
+			chargeAt = startedAt
+		}
+	case !errors.Is(err, pgx.ErrNoRows):
+		return false, err
+	}
+	day, _, _ := r.cal.Day(chargeAt)
 	plan := ""
 	if u, err := r.usage(ctx, tx, userID, 0); err == nil {
 		plan = u.Plan.Code
 	}
 	var charged bool
-	err := tx.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		WITH ins AS (
 			INSERT INTO test_completions (attempt_id, user_id, test_id, day, charged, plan)
 			SELECT $1, $2, $3, $4::date, t.kind <> 'personal', $5
@@ -530,6 +548,8 @@ func (r *BillingRepository) MarkRefunded(ctx context.Context, chargeID string) (
 			FROM p
 			WHERE p.kind = 'subscription' AND us.user_id = p.user_id AND us.charge_id = $1 AND us.status = 'active'
 			RETURNING 1
+		), o AS (
+			`+stopPaidOrderSQL+`
 		)
 		SELECT EXISTS (SELECT 1 FROM p)`, chargeID).Scan(&changed)
 	return changed, err
@@ -545,16 +565,32 @@ func (r *BillingRepository) NoteRefundFailure(ctx context.Context, chargeID stri
 }
 
 // RequestRefund marks a paid payment for refund (admin / failed order).
+//
+// A weak-topics order still being built with this payment is stopped in
+// the same statement (stopPaidOrderSQL): the student gets the Stars back,
+// so the test must not be generated (and paid for in AI calls) after all.
 func (r *BillingRepository) RequestRefund(ctx context.Context, chargeID, reason string) (bool, error) {
-	tag, err := r.pool.Exec(ctx, `
-		UPDATE payments SET status = `+refundStatusSQL+`, refund_reason = $2, next_check_at = now(),
-		       refunded_at = CASE WHEN admin_bypass THEN now() END
-		WHERE charge_id = $1 AND status = 'paid'`, chargeID, reason)
-	if err != nil {
-		return false, err
-	}
-	return tag.RowsAffected() == 1, nil
+	var changed bool
+	err := r.pool.QueryRow(ctx, `
+		WITH p AS (
+			UPDATE payments SET status = `+refundStatusSQL+`, refund_reason = $2, next_check_at = now(),
+			       refunded_at = CASE WHEN admin_bypass THEN now() END
+			WHERE charge_id = $1 AND status = 'paid'
+			RETURNING 1
+		), o AS (
+			`+stopPaidOrderSQL+`
+		)
+		SELECT EXISTS (SELECT 1 FROM p)`, chargeID, reason).Scan(&changed)
+	return changed, err
 }
+
+// stopPaidOrderSQL moves the weak-topics order paid with charge $1 from
+// 'paid' (still being built) to 'refunded'. A fulfilled order is left
+// alone (the test was delivered). Used inside a WITH of the refund paths.
+const stopPaidOrderSQL = `UPDATE weak_test_orders SET status = 'refunded', refunded_at = now(),
+			       last_error = 'payment refunded', updated_at = now()
+			WHERE charge_id = $1 AND status = 'paid'
+			RETURNING 1`
 
 // OnExternalRefund handles Telegram's refunded_payment (a refund made
 // outside the reconciler): the payment is marked refunded and, when it
@@ -577,6 +613,13 @@ func (r *BillingRepository) OnExternalRefund(ctx context.Context, chargeID strin
 		return nil, err
 	}
 	p := ps[0]
+	if p.Kind == billing.KindWeakTest {
+		// Refunded outside the reconciler while the test is still being
+		// built: stop building it.
+		if _, err := tx.Exec(ctx, `WITH o AS (`+stopPaidOrderSQL+`) SELECT 1`, chargeID); err != nil {
+			return nil, err
+		}
+	}
 	if p.Kind == billing.KindSubscription {
 		if _, err := tx.Exec(ctx, `
 			UPDATE user_subscriptions SET status = 'revoked', expires_at = LEAST(expires_at, now()), updated_at = now()

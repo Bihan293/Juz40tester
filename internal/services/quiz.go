@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	mrand "math/rand"
@@ -654,9 +655,12 @@ func (s *QuizService) EnsurePersonalTest(ctx context.Context, userID, subjectID 
 	// Stale: nothing left to train in this test. Delete it and build a fresh
 	// one from the current weak topics (clone of a matching fingerprint when
 	// one exists — otherwise one paid generation).
-	if err := s.gen.DeletePersonalTest(ctx, userID, test.ID, subjectID); err != nil {
+	if err := s.gen.DeletePersonalTest(ctx, userID, test.ID, subjectID); err != nil && !errors.Is(err, repositories.ErrNotFound) {
 		return test, false, topics, nil // deletion failed — keep the old test
 	}
+	// ErrNotFound: a concurrent tap (double click) already deleted the
+	// stale test — build the fresh one instead of handing out the id of a
+	// test that no longer exists («Тест не найден»).
 	return s.genSvc.EnsurePersonalTest(ctx, userID, subjectID)
 }
 
