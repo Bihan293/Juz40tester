@@ -66,19 +66,41 @@ const (
 	maxJobAttempts = 3
 	// retryDelay is the backoff applied between job retries.
 	retryDelay = 10 * time.Minute
+	// urgentRetryDelay: an URGENT job (a user is waiting for this test right
+	// now) is retried much sooner after a failure — the AI providers usually
+	// recover within a minute, a 10-minute pause looks like a dead bot.
+	urgentRetryDelay = 1 * time.Minute
 	// jobTimeout bounds a single generation run. It covers the whole
 	// provider route (up to 3 Groq steps of groqStepTimeout each, then the
 	// DeepSeek fallback, then the repair of flagged questions) and stays
 	// below stuckJobTimeout (the heartbeat keeps a live job fresh anyway).
 	// The Groq steps are cut so that deepseekGenReserve is always left for
-	// the paid fallback + repair (see aiStep.reserve).
-	jobTimeout = 14 * time.Minute
+	// the paid fallback + repair (see aiStep.reserve). Was 14 min — too
+	// short for a thinking DeepSeek reply plus its in-task retries.
+	jobTimeout = 22 * time.Minute
 	// stuckJobTimeout: a 'running' job idle longer than this is returned to
 	// 'pending' (the worker died mid-generation — deploy, restart, OOM).
-	stuckJobTimeout = 20 * time.Minute
+	// Kept above jobTimeout (was 20 min).
+	stuckJobTimeout = 30 * time.Minute
 	// deepseekGenReserve: time guaranteed to the DeepSeek generation step
 	// (and the repair round after it) — the free Groq steps never use it.
-	deepseekGenReserve = 4 * time.Minute
+	// Covers deepseekGenCallTimeout plus a short wait for a semaphore slot
+	// (was 4 min).
+	deepseekGenReserve = 9 * time.Minute
+	// deepseekGenCallTimeout bounds the paid DeepSeek generation of a full
+	// test — the thinking reply, the truncation retry and the backoff
+	// retries of transient errors. It starts AFTER the paid-call semaphore
+	// slot is acquired: time spent queueing behind other jobs never eats
+	// the model's time.
+	deepseekGenCallTimeout = 8 * time.Minute
+	// dsGenMaxTokens is the max_tokens of the paid DeepSeek full generation
+	// (thinking + visible JSON). It is higher than the Groq budget
+	// (genMaxTokens) because DeepSeek is the LAST provider: a reply cut off
+	// by the cap (finish_reason=length, the thinking ate the budget) fails
+	// the whole task. Only the tokens actually produced are billed, so the
+	// headroom costs nothing unless the model really needs it; worst case
+	// one call at peak flash pricing ≈ $0.019 (was 6000 ≈ $0.007).
+	dsGenMaxTokens = 16000
 	// genMaxTokens caps the model output INCLUDING the hidden thinking
 	// tokens — the hard cost limiter of one FULL (20-question) generation
 	// (strategy "full" and the 10-question topic batches). 20 questions
@@ -580,6 +602,15 @@ func validatePersonalCoverage(gt *generatedTest, topics []string, catalog *model
 	for i := range gt.Questions {
 		q := &gt.Questions[i]
 		n := normalizeTopic(q.Topic)
+		if _, ok := allowed[n]; !ok {
+			// «X (уточнение)» / «X: подтема» is a question on topic X.
+			if bn := normalizeTopic(topicBase(q.Topic)); bn != "" {
+				if t, ok := allowed[bn]; ok {
+					q.Topic = t
+					n = bn
+				}
+			}
+		}
 		if _, ok := allowed[n]; !ok {
 			k, found := catalog.Resolve(q.Topic)
 			req, mapped := byKey[k]
@@ -1370,7 +1401,7 @@ func (g *GeneratorService) executeJob(ctx context.Context, job *models.Generatio
 	g.recordOutcome(bctx, run, runErr == nil, g.now().Sub(started))
 	if runErr != nil {
 		log.Printf("generator: job %d failed: %v", job.ID, runErr)
-		if ferr := g.gen.FailJob(bctx, job.ID, runErr, retryDelay, maxJobAttempts); ferr != nil {
+		if ferr := g.gen.FailJob(bctx, job.ID, runErr, jobRetryDelay(job), maxJobAttempts); ferr != nil {
 			log.Printf("generator: fail job %d: %v", job.ID, ferr)
 		}
 		g.jobFinished(job)
@@ -1387,6 +1418,16 @@ func (g *GeneratorService) executeJob(ctx context.Context, job *models.Generatio
 		log.Printf("generator: job %d done -> test %d", job.ID, testID)
 	}
 	g.queueChainTranslation(bctx, job, testID)
+}
+
+// jobRetryDelay is the pause before a failed job is retried: an urgent job
+// (a user is waiting for it) is retried after urgentRetryDelay, background
+// jobs after retryDelay.
+func jobRetryDelay(job *models.GenerationJob) time.Duration {
+	if job != nil && job.Urgent {
+		return urgentRetryDelay
+	}
+	return retryDelay
 }
 
 // queueChainTranslation queues the Kazakh translation of a freshly generated
@@ -1819,7 +1860,10 @@ func (g *GeneratorService) generationStepsDyn(messages func() []deepseek.Message
 					return "", err
 				}
 				defer release()
-				return ds.GenerateJSON(ctx, messages(), genMaxTokens, effort)
+				// The call timeout starts only now, after the slot.
+				cctx, cancel := context.WithTimeout(ctx, deepseekGenCallTimeout)
+				defer cancel()
+				return ds.GenerateJSON(cctx, messages(), dsGenMaxTokens, effort)
 			},
 		})
 	}

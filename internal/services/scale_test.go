@@ -256,7 +256,7 @@ func TestMatchBatchPerQuestion(t *testing.T) {
 		mk("Вопрос про эволюцию", "Эволюция", 2),
 	)
 	ctx := withGenRun(context.Background(), &genRun{strategy: strategyBatch, kind: models.TestKindChain})
-	got, err := g.matchBatch(ctx, spec, group, raw, nil)
+	got, err := g.matchBatch(ctx, spec, group, raw, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,11 +267,11 @@ func TestMatchBatchPerQuestion(t *testing.T) {
 		t.Fatalf("metrics: %s", metrics.Summary())
 	}
 	// Fewer than half usable → the whole reply is rejected with a reason.
-	_, err = g.matchBatch(ctx, spec, group, batchReply(mk("Только один вопрос годный", "Генетика", 3)), nil)
+	_, err = g.matchBatch(ctx, spec, group, batchReply(mk("Только один вопрос годный", "Генетика", 3)), nil, false)
 	if err == nil || !strings.Contains(err.Error(), "usable") {
 		t.Fatalf("expected a rejection, got %v", err)
 	}
-	if _, err := g.matchBatch(ctx, spec, group, "not json", nil); rejectClass(err) != rejectFormat {
+	if _, err := g.matchBatch(ctx, spec, group, "not json", nil, false); rejectClass(err) != rejectFormat {
 		t.Fatalf("broken JSON: %v", err)
 	}
 }

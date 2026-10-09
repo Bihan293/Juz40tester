@@ -40,6 +40,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -325,33 +326,125 @@ func (c *Client) TranslateJSON(ctx context.Context, messages []Message, maxToken
 	return c.jsonWithFallback(ctx, "translate", messages, maxTokens, ThinkingEffortLow, 0.3)
 }
 
+// Reliability knobs of the paid fallback. DeepSeek is the LAST provider in
+// every route (Groq runs first), so a DeepSeek failure fails the whole
+// task — it must survive transient trouble on its own:
+//
+//   - transient errors (HTTP 429 / 408 / 5xx, transport errors, client
+//     timeouts, empty replies) are retried with backoff (retryBackoff);
+//   - a reply truncated at max_tokens (finish_reason=length — typically the
+//     hidden thinking ate the whole budget, 0 visible chars) is retried ONCE
+//     without thinking, with the non-thinking output ceiling.
+//
+// The daily cap is untouched: every retry is a separate call that reserves
+// and settles its own cost against the same Budget.
+var retryBackoff = []time.Duration{2 * time.Second, 6 * time.Second, 15 * time.Second}
+
+// maxRetryAfter caps a server-requested Retry-After wait.
+const maxRetryAfter = 30 * time.Second
+
+// minAttemptTime: a retry is not started when less than this is left until
+// the context deadline (it could not finish anyway).
+const minAttemptTime = 20 * time.Second
+
+// NonThinkingMaxTokens is the output ceiling of a call WITHOUT thinking
+// (the non-thinking DeepSeek endpoints reject larger max_tokens). Every
+// non-thinking call is clamped to it; it is also the budget of the
+// truncation retry (no hidden reasoning — the whole budget is visible JSON,
+// enough for a full 20-question test).
+const NonThinkingMaxTokens = 8192
+
+// ErrTruncated: the reply hit max_tokens (finish_reason=length).
+var ErrTruncated = errors.New("deepseek: reply truncated")
+
+// transientError marks a failure that a plain resend may fix.
+type transientError struct {
+	err        error
+	retryAfter time.Duration
+}
+
+func (e *transientError) Error() string { return e.err.Error() }
+func (e *transientError) Unwrap() error { return e.err }
+
+func transient(err error) error { return &transientError{err: err} }
+
+// IsTransient reports whether err is a transient DeepSeek failure (rate
+// limit, server error, network trouble, timeout, empty reply).
+func IsTransient(err error) bool {
+	var t *transientError
+	return errors.As(err, &t)
+}
+
+// callRetry is call with in-task retries of transient failures (backoff,
+// honouring Retry-After). A cancelled/expired ctx, the daily cap and
+// non-transient errors (400, truncation) are returned at once.
+func (c *Client) callRetry(ctx context.Context, model string, messages []Message, temperature float64, maxTokens int, jsonMode bool, effort string) (string, error) {
+	for attempt := 0; ; attempt++ {
+		raw, err := c.call(ctx, model, messages, temperature, maxTokens, jsonMode, effort)
+		if err == nil || !IsTransient(err) || ctx.Err() != nil || attempt >= len(retryBackoff) {
+			return raw, err
+		}
+		wait := retryBackoff[attempt]
+		var t *transientError
+		if errors.As(err, &t) && t.retryAfter > wait {
+			wait = min(t.retryAfter, maxRetryAfter)
+		}
+		if dl, ok := ctx.Deadline(); ok && time.Until(dl) < wait+minAttemptTime {
+			return raw, err
+		}
+		log.Printf("deepseek: %s transient error (attempt %d/%d): %v — retrying in %s",
+			model, attempt+1, len(retryBackoff)+1, err, wait)
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return raw, err
+		case <-timer.C:
+		}
+	}
+}
+
 // jsonWithFallback runs the provider route shared by GenerateJSON and
-// TranslateJSON:
+// TranslateJSON (every call below is callRetry — transient errors are
+// retried with backoff inside):
 //
 //  1. thinking mode on the reasoner model — skipped entirely once the model
 //     has explicitly rejected the thinking parameters (no wasted 400 call);
 //  2. the same reasoner model WITHOUT thinking parameters — only after an
 //     explicit thinking-parameter rejection (the flag is set only then);
 //  3. the pricier non-thinking fallback (c.model) — ONLY when the reasoner
-//     rejected the request parameters. Timeouts, 5xx, truncated replies and
-//     context-length errors are returned as is: the job retries later
-//     instead of silently paying ~3x for v4-pro.
+//     rejected the request parameters. Timeouts, 5xx and context-length
+//     errors never route to it (no silent ~3x spend);
+//  4. a reply truncated at max_tokens is retried ONCE on the same model
+//     WITHOUT thinking with NonThinkingMaxTokens — all of that budget goes
+//     to the visible JSON, so the retry practically never truncates.
 func (c *Client) jsonWithFallback(ctx context.Context, op string, messages []Message, maxTokens int, effort string, fallbackTemp float64) (string, error) {
-	if !c.thinkingDisabled() {
-		raw, err := c.call(ctx, c.reasonerModel, messages, 0, maxTokens, true, effort)
-		if err == nil || !isThinkingParamError(err) {
-			return raw, err
-		}
+	model, temp := c.reasonerModel, 0.0
+	eff := effort
+	if c.thinkingDisabled() {
+		eff = ""
+	}
+	raw, err := c.callRetry(ctx, model, messages, temp, maxTokens, true, eff)
+	if eff != "" && err != nil && !IsTransient(err) && isThinkingParamError(err) {
 		log.Printf("deepseek: thinking params rejected on %s (%v) — retrying without them", op, err)
 		c.setThinkingUnsupported()
+		eff = ""
+		raw, err = c.callRetry(ctx, model, messages, temp, maxTokens, true, "")
 	}
-	raw, err := c.call(ctx, c.reasonerModel, messages, 0, maxTokens, true, "")
-	if err != nil && isParamError(err) {
+	if eff == "" && err != nil && !IsTransient(err) && isParamError(err) {
 		// The reasoner rejects the request itself — last resort: the
 		// non-thinking fallback model (deepseek-v4-pro — strong, but
 		// pricier; it must never become the default).
 		log.Printf("deepseek: %s rejected %s request (%v) — falling back to %s (non-thinking)", c.reasonerModel, op, err, c.model)
-		raw, err = c.call(ctx, c.model, messages, fallbackTemp, maxTokens, true, "")
+		model, temp = c.model, fallbackTemp
+		raw, err = c.callRetry(ctx, model, messages, temp, maxTokens, true, "")
+	}
+	if err != nil && errors.Is(err, ErrTruncated) && ctx.Err() == nil {
+		log.Printf("deepseek: %s %s reply truncated (%v) — retrying once without thinking, max_tokens=%d", model, op, err, NonThinkingMaxTokens)
+		raw, err = c.callRetry(ctx, model, messages, temp, NonThinkingMaxTokens, true, "")
+		if err != nil {
+			err = fmt.Errorf("after truncation retry: %w", err)
+		}
 	}
 	return raw, err
 }
@@ -393,6 +486,11 @@ func (c *Client) call(ctx context.Context, model string, messages []Message, tem
 	reqBody := chatRequest{Model: model, Messages: messages}
 	if temperature > 0 {
 		reqBody.Temperature = &temperature
+	}
+	if effort == "" && maxTokens > NonThinkingMaxTokens {
+		// Without thinking the endpoint caps the output lower — a larger
+		// max_tokens would be rejected with HTTP 400.
+		maxTokens = NonThinkingMaxTokens
 	}
 	if maxTokens > 0 {
 		reqBody.MaxTokens = maxTokens
@@ -445,32 +543,48 @@ func (c *Client) call(ctx context.Context, model string, messages []Message, tem
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", err
+		if ctx.Err() != nil {
+			return "", err // the caller's deadline/cancel — not retryable
+		}
+		// Transport failure / client timeout: a resend may well succeed.
+		return "", transient(fmt.Errorf("deepseek: request: %w", err))
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		return "", err
+		if ctx.Err() != nil {
+			return "", err
+		}
+		return "", transient(fmt.Errorf("deepseek: read response (HTTP %d): %w", resp.StatusCode, err))
 	}
 
 	var cr chatResponse
-	if err := json.Unmarshal(raw, &cr); err != nil {
-		return "", fmt.Errorf("deepseek: decode response (HTTP %d): %w", resp.StatusCode, err)
+	decodeErr := json.Unmarshal(raw, &cr)
+	if resp.StatusCode != http.StatusOK {
+		// Bounded, valid UTF-8 excerpt: the body may be large, and the
+		// error ends up in logs and in generation_jobs.last_error.
+		msg := strings.ToValidUTF8(string(raw), "\uFFFD")
+		if decodeErr == nil && cr.Error != nil {
+			msg = fmt.Sprintf("%s (%s)", cr.Error.Message, cr.Error.Type)
+		}
+		if r := []rune(msg); len(r) > 500 {
+			msg = string(r[:500]) + "…"
+		}
+		err := fmt.Errorf("deepseek: HTTP %d: %s", resp.StatusCode, msg)
+		if isTransientStatus(resp.StatusCode) {
+			return "", &transientError{err: err, retryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
+		}
+		return "", err
+	}
+	if decodeErr != nil {
+		// A 200 with a broken body (proxy hiccup, cut stream) — resend.
+		return "", transient(fmt.Errorf("deepseek: decode response (HTTP %d): %w", resp.StatusCode, decodeErr))
 	}
 	if cr.Error != nil {
 		return "", fmt.Errorf("deepseek: %s (%s)", cr.Error.Message, cr.Error.Type)
 	}
-	if resp.StatusCode != http.StatusOK {
-		// Bounded, valid UTF-8 excerpt: the body may be large, and the
-		// error ends up in logs and in generation_jobs.last_error.
-		body := strings.ToValidUTF8(string(raw), "\uFFFD")
-		if r := []rune(body); len(r) > 500 {
-			body = string(r[:500]) + "…"
-		}
-		return "", fmt.Errorf("deepseek: HTTP %d: %s", resp.StatusCode, body)
-	}
 	if len(cr.Choices) == 0 {
-		return "", fmt.Errorf("deepseek: empty choices")
+		return "", transient(fmt.Errorf("deepseek: empty choices"))
 	}
 
 	// Cost observability: log the real token usage of every successful call
@@ -509,10 +623,25 @@ func (c *Client) call(ctx context.Context, model string, messages []Message, tem
 	// never parse, so fail fast and let the job retry (at a lower thinking
 	// effort) instead of storing garbage or looping on a JSON syntax error.
 	if cr.Choices[0].FinishReason == "length" {
-		return "", fmt.Errorf("deepseek: reply truncated at max_tokens=%d (finish_reason=length, %d visible chars)", maxTokens, len(content))
+		return "", fmt.Errorf("%w at max_tokens=%d (finish_reason=length, %d visible chars)", ErrTruncated, maxTokens, len(content))
 	}
 	if strings.TrimSpace(content) == "" {
-		return "", fmt.Errorf("deepseek: empty content (finish_reason=%q)", cr.Choices[0].FinishReason)
+		return "", transient(fmt.Errorf("deepseek: empty content (finish_reason=%q)", cr.Choices[0].FinishReason))
 	}
 	return content, nil
+}
+
+// isTransientStatus: rate limit, request timeout and every server error.
+func isTransientStatus(code int) bool {
+	return code == http.StatusTooManyRequests || code == http.StatusRequestTimeout || code >= 500
+}
+
+// parseRetryAfter reads a Retry-After header given in seconds (0 if absent
+// or in the HTTP-date form, which DeepSeek does not use).
+func parseRetryAfter(v string) time.Duration {
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return time.Duration(n) * time.Second
 }
