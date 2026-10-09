@@ -268,12 +268,37 @@ func topicMatchesExact(got, want string, catalog *models.TopicCatalog) bool {
 	if models.NormalizeTopic(got) == models.NormalizeTopic(want) {
 		return true
 	}
+	// Cosmetic differences a model makes when «copying» a topic: quotes,
+	// a trailing dot, ё/е. They used to reject a correct question as
+	// «тема не по спецификации».
+	lg, lw := looseTopic(got), looseTopic(want)
+	if lg != "" && lg == lw {
+		return true
+	}
 	if catalog == nil {
 		return false
 	}
-	kg, ok1 := catalog.Resolve(got)
-	kw, ok2 := catalog.Resolve(want)
+	kg, ok1 := resolveLoose(catalog, got)
+	kw, ok2 := resolveLoose(catalog, want)
 	return ok1 && ok2 && kg == kw
+}
+
+// looseTopic is NormalizeTopic without the cosmetic noise of a model's
+// copy: surrounding quotes/brackets/punctuation and ё → е. Used only to
+// MATCH topics (the stored spelling is the requested one).
+func looseTopic(t string) string {
+	t = strings.ReplaceAll(strings.ReplaceAll(t, "ё", "е"), "Ё", "Е")
+	t = strings.Trim(strings.TrimSpace(t), " «»\"'“”„`.,;:!?")
+	return models.NormalizeTopic(t)
+}
+
+// resolveLoose resolves a topic through the catalog, retrying with the
+// loose spelling.
+func resolveLoose(catalog *models.TopicCatalog, t string) (string, bool) {
+	if k, ok := catalog.Resolve(t); ok {
+		return k, true
+	}
+	return catalog.Resolve(strings.Trim(strings.TrimSpace(t), " «»\"'“”„`.,;:!?"))
 }
 
 // validateWeakCoverage rejects a chain reply that ignores the weak topics:

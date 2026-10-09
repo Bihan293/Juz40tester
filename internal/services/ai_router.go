@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync/atomic"
 	"time"
 
 	"github.com/Bihan293/Juz40tester/internal/deepseek"
@@ -36,6 +37,68 @@ type aiStep struct {
 	// it — the free Groq steps can never eat the time of the paid DeepSeek
 	// fallback (or of the repair that follows the generation).
 	reserve time.Duration
+	// paid marks a step that costs money (DeepSeek). Before such a step
+	// runs, free steps that failed only on a SHORT-LIVED Groq quota (the
+	// per-minute window) are retried once after the quota is back — see
+	// runStepsOpts.
+	paid bool
+}
+
+// freeRetryMaxWait is the longest runStepsFeedback waits for a free Groq
+// model's per-minute quota before it pays for DeepSeek instead. The Groq
+// free tier allows ~one generation request per model per minute (TPM
+// 8000), so with several workers and parallel batches a free step was
+// often skipped after a short limiter wait — and the paid fallback ran
+// although Groq would have served the request a few seconds later.
+const freeRetryMaxWait = 70 * time.Second
+
+// errStepNotNeeded is returned by a conditional step that does not apply
+// to this run (e.g. the cheap retry of a free model whose first reply was
+// not rejected). No call was made: it is neither logged nor counted.
+var errStepNotNeeded = errors.New("step not needed")
+
+// maxPaidCallsPerJob caps the paid DeepSeek steps of ONE generation job
+// run (all its batches, rescue rounds and repairs together). A test the
+// models keep getting wrong (every batch rejected, rounds and rescues
+// re-asking) could otherwise make dozens of paid calls in one run — and
+// again on each of its retries. Past the cap the job fails this attempt
+// (retried later with the batches it already paid for) instead.
+const maxPaidCallsPerJob = 12
+
+// errPaidCallLimit: the job used up its paid calls for this run.
+var errPaidCallLimit = errors.New("paid DeepSeek calls of this job run exhausted")
+
+type paidCallsKey struct{}
+
+type paidCalls struct {
+	n   atomic.Int32
+	max int32
+}
+
+// withPaidCallLimit attaches a per-job paid-call counter to ctx.
+func withPaidCallLimit(ctx context.Context, max int) context.Context {
+	return context.WithValue(ctx, paidCallsKey{}, &paidCalls{max: int32(max)})
+}
+
+// takePaidCall books one paid call of the job (no limit when ctx carries
+// no counter, e.g. the quality sweep — bounded by the daily cap).
+func takePaidCall(ctx context.Context) error {
+	pc, _ := ctx.Value(paidCallsKey{}).(*paidCalls)
+	if pc == nil {
+		return nil
+	}
+	if pc.n.Add(1) > pc.max {
+		return fmt.Errorf("%w (%d)", errPaidCallLimit, pc.max)
+	}
+	return nil
+}
+
+// stepOpts tunes runStepsOpts.
+type stepOpts struct {
+	onReject func(error)
+	// freeRetryWait caps the wait for a rate-limited free step before the
+	// paid one (0 = do not wait, pay at once).
+	freeRetryWait time.Duration
 }
 
 // groqStepTimeout bounds one Groq step: the local rate-limiter wait
@@ -86,22 +149,36 @@ func runSteps(ctx context.Context, task string, steps []aiStep, validate func(ra
 //
 //	difficulty_violation task=… step=… err=…
 func runStepsFeedback(ctx context.Context, task string, steps []aiStep, validate func(raw string) error, onReject func(error)) (string, string, error) {
+	return runStepsOpts(ctx, task, steps, validate, stepOpts{onReject: onReject, freeRetryWait: freeRetryMaxWait})
+}
+
+// runStepsOpts is runStepsFeedback with options. Before the first PAID step
+// runs, every free step that failed only because its per-minute Groq quota
+// was busy (groq.RetryableSoon) is retried ONCE, after waiting until the
+// quota is back (at most opts.freeRetryWait, and never into the time
+// reserved for the paid step). The provider order is unchanged — DeepSeek
+// still runs when the free retry fails too — it only stops paying for work
+// the free tier would have done a few seconds later.
+func runStepsOpts(ctx context.Context, task string, steps []aiStep, validate func(raw string) error, opts stepOpts) (string, string, error) {
 	var errs []error
-	for i, st := range steps {
-		if ctx.Err() != nil {
-			errs = append(errs, ctx.Err())
-			break
-		}
+	var busyFree []int // free steps that failed on a short-lived quota
+	var busyWait time.Duration
+	freeRetried := false
+	runOne := func(i int) (string, bool) {
+		st := steps[i]
 		sctx, cancel, ok := stepContext(ctx, steps, i)
 		if !ok {
 			log.Printf("ai[%s]: %s skipped — time is reserved for the next provider", task, st.name)
 			errs = append(errs, fmt.Errorf("%s: skipped (time reserved for fallback)", st.name))
-			continue
+			return "", false
 		}
 		started := time.Now()
 		raw, err := st.run(sctx)
 		cancel()
-		if err == nil || (!groq.IsRateLimited(err) && !errors.Is(err, groq.ErrTooLarge)) {
+		if errors.Is(err, errStepNotNeeded) {
+			return "", false // conditional step that did not apply (no call made)
+		}
+		if err == nil || (!groq.IsRateLimited(err) && !errors.Is(err, groq.ErrTooLarge) && !errors.Is(err, errPaidCallLimit)) {
 			noteAICall(ctx, st.name)
 		}
 		if err == nil {
@@ -110,27 +187,92 @@ func runStepsFeedback(ctx context.Context, task string, steps []aiStep, validate
 				if rejectClass(verr) == rejectDifficulty {
 					log.Printf("difficulty_violation task=%q step=%s err=%q", task, st.name, verr.Error())
 				}
-				if onReject != nil {
-					onReject(verr)
+				if opts.onReject != nil {
+					opts.onReject(verr)
 				}
 				err = fmt.Errorf("invalid reply: %w", verr)
 			}
 		}
 		if err == nil {
 			log.Printf("ai[%s]: served by %s in %.1fs", task, st.name, time.Since(started).Seconds())
-			return raw, st.name, nil
+			return raw, true
 		}
 		if groq.IsRateLimited(err) {
 			log.Printf("ai[%s]: %s skipped — free-tier quota: %v", task, st.name, err)
+			if wait, soon := groq.RetryableSoon(err); soon && !st.paid {
+				busyFree = append(busyFree, i)
+				if busyWait == 0 || wait < busyWait {
+					busyWait = wait
+				}
+			}
 		} else {
 			log.Printf("ai[%s]: %s failed: %v", task, st.name, err)
 		}
 		errs = append(errs, fmt.Errorf("%s: %w", st.name, err))
+		return "", false
+	}
+	for i, st := range steps {
+		if ctx.Err() != nil {
+			errs = append(errs, ctx.Err())
+			break
+		}
+		if st.paid && !freeRetried && len(busyFree) > 0 {
+			freeRetried = true
+			retry := busyFree
+			busyFree = nil
+			if waitForFreeQuota(ctx, task, st, busyWait, opts.freeRetryWait) {
+				for _, fi := range retry {
+					if ctx.Err() != nil {
+						break
+					}
+					if raw, ok := runOne(fi); ok {
+						return raw, steps[fi].name, nil
+					}
+				}
+			}
+			if ctx.Err() != nil {
+				errs = append(errs, ctx.Err())
+				break
+			}
+		}
+		if raw, ok := runOne(i); ok {
+			return raw, st.name, nil
+		}
 	}
 	if len(errs) == 0 {
 		return "", "", fmt.Errorf("ai[%s]: no AI provider configured", task)
 	}
 	return "", "", errors.Join(errs...)
+}
+
+// waitForFreeQuota sleeps until a rate-limited free model should accept a
+// request again. false = not worth it (the wait is longer than maxWait or
+// would eat the time reserved for the paid step, or ctx ended).
+func waitForFreeQuota(ctx context.Context, task string, paid aiStep, wait, maxWait time.Duration) bool {
+	if maxWait <= 0 || wait > maxWait {
+		return false
+	}
+	if wait < 0 {
+		wait = 0
+	}
+	if dl, ok := ctx.Deadline(); ok {
+		// Leave the paid step its reserve plus a minimal free call.
+		if time.Until(dl)-wait < paid.reserve+30*time.Second {
+			return false
+		}
+	}
+	log.Printf("ai[%s]: free Groq quota is back in %s — waiting instead of paying for %s", task, wait.Round(time.Second), paid.name)
+	if wait == 0 {
+		return true
+	}
+	t := time.NewTimer(wait)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }
 
 // toGroqMessages converts DeepSeek-style messages (shared prompt builders).

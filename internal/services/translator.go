@@ -48,6 +48,10 @@ const (
 	// sit on the per-minute window for long; the next free bucket (or the
 	// paid fallback) is tried instead.
 	groqTranslateMaxWait = 8 * time.Second
+	// translateFreeRetryWait: before the PAID DeepSeek translation, a free
+	// model that was only busy on its per-minute quota is retried once
+	// after waiting at most this long (runStepsOpts).
+	translateFreeRetryWait = 30 * time.Second
 )
 
 // translationSystemPrompt keeps the model strictly in translator mode: the
@@ -261,7 +265,12 @@ func fitsOneGroqRequest(questions []models.Question) bool {
 	if err != nil {
 		return false
 	}
-	return groq.Budget(groq.ModelQwen27B, toGroqMessages(msgs)) >= translationOutputBudget(payload)
+	// The chunk must also fit the SECOND free translator (GPT-OSS needs a
+	// little reasoning headroom on top of the visible JSON). Chunks packed
+	// to the Qwen budget alone made the GPT-OSS step fail locally with
+	// ErrTooLarge for almost every full chunk, so any rejected Qwen reply
+	// went straight to the paid DeepSeek fallback.
+	return groq.Budget(groq.ModelQwen27B, toGroqMessages(msgs)) >= translationOutputBudget(payload)+gptOSSTranslateMinHeadroom
 }
 
 // chunkForTranslation greedily packs questions into the fewest chunks that
@@ -286,22 +295,56 @@ func chunkForTranslation(questions []models.Question) [][]models.Question {
 	return chunks
 }
 
-// translationSteps returns the provider route of one chunk.
-func (t *TranslatorService) translationSteps(msgs []deepseek.Message, outBudget int) []aiStep {
+// translationSteps returns the provider route of one chunk:
+//
+//	Qwen → Qwen again (only after a REJECTED Qwen reply, with the reason) →
+//	GPT-OSS → paid DeepSeek.
+//
+// The cheap Qwen retry exists because Qwen sometimes numbers one question
+// twice («duplicate translation id») — a slip a second free call with the
+// reason fixes almost always; before, that reply went to paid DeepSeek.
+// rejected returns the validation error of the first Qwen reply ("" =
+// not rejected — then the retry step is not needed and makes no call).
+func (t *TranslatorService) translationSteps(msgs []deepseek.Message, outBudget int, rejected ...func() string) []aiStep {
 	var steps []aiStep
 	if t.gq != nil {
 		gm := toGroqMessages(msgs)
+		qwen := groq.Request{
+			Model: groq.ModelQwen27B, Messages: gm,
+			// +33% headroom over the estimate (clamped to the per-request
+			// ceiling by the client); the limiter re-credits unused tokens.
+			MaxTokens: outBudget + outBudget/3, MinTokens: outBudget,
+			Effort:      groq.EffortNone, // instruct mode — translation needs no reasoning
+			Temperature: 0.3, TopP: 0.8,
+			Schema: translationJSONSchema, SchemaName: "kk_translation",
+			MaxWait: groqTranslateMaxWait,
+		}
+		steps = append(steps, groqStep(t.gq, qwen))
+		if len(rejected) > 0 && rejected[0] != nil {
+			why := rejected[0]
+			gq := t.gq
+			retry := groqStep(gq, qwen)
+			retry.name += "(retry)"
+			retry.run = func(ctx context.Context) (string, error) {
+				reason := why()
+				if reason == "" {
+					return "", errStepNotNeeded
+				}
+				req := qwen
+				req.Messages = append([]groq.Message(nil), gm...)
+				last := len(req.Messages) - 1
+				req.Messages[last].Content += "\n\nВНИМАНИЕ: предыдущий ответ ОТКЛОНЁН проверкой: " + reason +
+					". Каждый id из входного массива — ровно один раз, без пропусков и повторов, в том же порядке."
+				res, err := gq.ChatJSON(ctx, req)
+				if err != nil {
+					return "", err
+				}
+				noteTokens(ctx, res.PromptTokens, res.CompletionTokens)
+				return res.Content, nil
+			}
+			steps = append(steps, retry)
+		}
 		steps = append(steps,
-			groqStep(t.gq, groq.Request{
-				Model: groq.ModelQwen27B, Messages: gm,
-				// +33% headroom over the estimate (clamped to the per-request
-				// ceiling by the client); the limiter re-credits unused tokens.
-				MaxTokens: outBudget + outBudget/3, MinTokens: outBudget,
-				Effort:      groq.EffortNone, // instruct mode — translation needs no reasoning
-				Temperature: 0.3, TopP: 0.8,
-				Schema: translationJSONSchema, SchemaName: "kk_translation",
-				MaxWait: groqTranslateMaxWait,
-			}),
 			groqStep(t.gq, groq.Request{
 				Model: groq.ModelGPTOSS120B, Messages: gm,
 				MaxTokens: outBudget + gptOSSTranslateHeadroom,
@@ -316,6 +359,7 @@ func (t *TranslatorService) translationSteps(msgs []deepseek.Message, outBudget 
 		ds := t.ds
 		steps = append(steps, aiStep{
 			name: "deepseek/" + ds.ReasonerModel() + "(translate)",
+			paid: true,
 			run: func(ctx context.Context) (string, error) {
 				return ds.TranslateJSON(ctx, msgs, translateMaxTokens)
 			},
@@ -350,19 +394,32 @@ var translationJSONSchema = map[string]any{
 // translateChunk translates one chunk through the provider route and saves
 // it. Every reply is validated locally before anything is written.
 func (t *TranslatorService) translateChunk(ctx context.Context, questions []models.Question) error {
-	payload := translationPayload(questions)
-	msgs, err := translationMessages(payload)
+	out, err := t.translateChunkRows(ctx, questions)
 	if err != nil {
 		return err
 	}
 	correctByID := make(map[int64]string, len(questions))
-	masterByIdx := make(map[int]*models.Question, len(questions))
 	for i := range questions {
 		correctByID[questions[i].ID] = questions[i].CorrectAnswer
+	}
+	return t.repo.SaveTranslations(ctx, out, correctByID)
+}
+
+// translateChunkRows runs the provider route of one chunk and returns the
+// validated rows (nothing is stored).
+func (t *TranslatorService) translateChunkRows(ctx context.Context, questions []models.Question) ([]models.QuestionTranslation, error) {
+	payload := translationPayload(questions)
+	msgs, err := translationMessages(payload)
+	if err != nil {
+		return nil, err
+	}
+	masterByIdx := make(map[int]*models.Question, len(questions))
+	for i := range questions {
 		masterByIdx[i+1] = &questions[i]
 	}
 
 	var out []models.QuestionTranslation
+	firstReject := "" // why the FIRST (Qwen) reply was rejected
 	validate := func(raw string) error {
 		rows, err := buildTranslations(raw, len(payload), masterByIdx)
 		if err != nil {
@@ -371,11 +428,19 @@ func (t *TranslatorService) translateChunk(ctx context.Context, questions []mode
 		out = rows
 		return nil
 	}
-	task := fmt.Sprintf("translate %d q", len(questions))
-	if _, _, err := runSteps(ctx, task, t.translationSteps(msgs, translationOutputBudget(payload)), validate); err != nil {
-		return fmt.Errorf("translate: %w", err)
+	calls := 0
+	onReject := func(e error) {
+		calls++
+		if calls == 1 {
+			firstReject = e.Error()
+		}
 	}
-	return t.repo.SaveTranslations(ctx, out, correctByID)
+	task := fmt.Sprintf("translate %d q", len(questions))
+	steps := t.translationSteps(msgs, translationOutputBudget(payload), func() string { return firstReject })
+	if _, _, err := runStepsOpts(ctx, task, steps, validate, stepOpts{onReject: onReject, freeRetryWait: translateFreeRetryWait}); err != nil {
+		return nil, fmt.Errorf("translate: %w", err)
+	}
+	return out, nil
 }
 
 // buildTranslations parses and validates a model reply against the chunk.

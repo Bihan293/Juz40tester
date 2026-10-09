@@ -12,7 +12,7 @@
 
 | Задача | 1-й выбор | 2-й выбор | Последний резерв (платно) |
 |---|---|---|---|
-| Перевод теста RU → KK | **Groq `qwen/qwen3.8-27b`**, instruct-режим (`reasoning_effort=none`), temp 0.3 | Groq `openai/gpt-oss-120b`, `reasoning_effort=low` | DeepSeek flash (low) |
+| Перевод теста RU → KK | **Groq `qwen/qwen3.8-27b`**, instruct-режим (`reasoning_effort=none`), temp 0.3; если ответ отклонён (например, повтор id) — ещё один бесплатный вызов Qwen с причиной | Groq `openai/gpt-oss-120b`, `reasoning_effort=low` | DeepSeek flash (low) |
 | Chain-тест (общий для всех, 20 вопросов) | **Groq `openai/gpt-oss-120b`**, `reasoning_effort=medium` → повтор на `low` | Groq `qwen/qwen3.8-27b`, instruct | DeepSeek flash thinking (high) |
 | 🎯 Тест по слабым темам | **Groq `openai/gpt-oss-120b`**, `reasoning_effort=low` | Groq `qwen/qwen3.8-27b`, instruct | DeepSeek flash thinking (low) |
 | Ретрай упавшей джобы | GPT-OSS 120B `low` | Qwen | DeepSeek (low) |
@@ -60,6 +60,8 @@
 6. `max_completion_tokens` автоматически ужимается под лимит модели и под TPM.
 7. Structured Outputs (`json_schema`, `strict: true`) — поддерживаются обеими моделями, гарантируют валидный JSON. Если API отклонит схему или `reasoning_effort`, клиент один раз логирует это и дальше работает без параметра (`json_object`) — без падений.
 8. `finish_reason=length` (ответ обрезан) → ошибка → следующий шаг маршрута.
+9. **Сначала подождать бесплатную квоту, потом платить.** Если бесплатные шаги пропущены только из-за минутного окна (TPM/RPM или короткий 429 — не суточный лимит), перед платным DeepSeek маршрут один раз ждёт освобождения окна (генерация — до 70 с, перевод — до 30 с) и повторяет бесплатную модель. Порядок провайдеров не меняется.
+10. Токены промта из кэша Groq (`cached_tokens`) не засчитываются в минутное окно локального лимитера — Groq не считает их в rate limits; заголовки сервера остаются верхней границей.
 
 Каждый вызов логирует реальные токены и текущую загрузку квоты:
 

@@ -151,6 +151,9 @@ type GeneratorService struct {
 	onJobFinished func(job *models.GenerationJob)
 	// noBank disables B3 bank assembly (tests of the personal-generation path only).
 	noBank bool
+	// alerts (optional) tells the administrators about failing generations.
+	alerts     *AdminAlerter
+	failStreak genFailStreak
 }
 
 // WithJobFinishedHook installs the in-process «job finished» callback (R-7).
@@ -294,6 +297,10 @@ type generatedQuestion struct {
 	Correct    int      `json:"correct_index"` // 0..3
 	Topic      string   `json:"topic"`
 	Difficulty int      `json:"difficulty"` // 1..5
+
+	// newTopic: the batch generator's hold on a chain topic outside the
+	// catalog (genSpec.newTopics); never part of the model contract.
+	newTopic string
 }
 
 type generatedTest struct {
@@ -589,41 +596,44 @@ func normalizeTopic(t string) string { return models.NormalizeTopic(t) }
 // B1: with a topic catalog, a spelling that is an alias of a requested topic
 // (same topic_key) is accepted too and rewritten to the requested topic.
 func validatePersonalCoverage(gt *generatedTest, topics []string, catalog *models.TopicCatalog) error {
-	allowed := make(map[string]string, len(topics)) // norm -> requested spelling
-	byKey := map[string]string{}                    // topic_key -> requested norm
+	requested := make([]string, 0, len(topics)) // distinct requested topics
+	seen := map[string]bool{}
 	for _, t := range topics {
-		n := normalizeTopic(t)
-		allowed[n] = t
-		if k, ok := catalog.Resolve(t); ok {
-			byKey[k] = n
+		if n := normalizeTopic(t); n != "" && !seen[n] {
+			seen[n] = true
+			requested = append(requested, t)
 		}
 	}
-	covered := make(map[string]bool, len(topics))
+	covered := make(map[string]bool, len(requested))
 	for i := range gt.Questions {
 		q := &gt.Questions[i]
-		n := normalizeTopic(q.Topic)
-		if _, ok := allowed[n]; !ok {
-			// «X (уточнение)» / «X: подтема» is a question on topic X.
-			if bn := normalizeTopic(topicBase(q.Topic)); bn != "" {
-				if t, ok := allowed[bn]; ok {
-					q.Topic = t
-					n = bn
+		match := ""
+		// Exact spelling first: an alias/base match must never steal a
+		// question that names another requested topic verbatim.
+		for _, t := range requested {
+			if normalizeTopic(q.Topic) == normalizeTopic(t) {
+				match = t
+				break
+			}
+		}
+		if match == "" {
+			// topicMatches: «X (уточнение)», quotes/ё noise, catalog aliases
+			// of the same topic_key (B1).
+			for _, t := range requested {
+				if topicMatches(q.Topic, t, catalog) {
+					match = t
+					break
 				}
 			}
 		}
-		if _, ok := allowed[n]; !ok {
-			k, found := catalog.Resolve(q.Topic)
-			req, mapped := byKey[k]
-			if !found || !mapped {
-				return fmt.Errorf("question %d: topic %q is not in the weak-topics list", i+1, q.Topic)
-			}
-			n = req
-			q.Topic = allowed[req]
+		if match == "" {
+			return fmt.Errorf("question %d: topic %q is not in the weak-topics list", i+1, q.Topic)
 		}
-		covered[n] = true
+		q.Topic = match
+		covered[normalizeTopic(match)] = true
 	}
-	if len(covered) != len(allowed) {
-		return fmt.Errorf("only %d of %d weak topics covered", len(covered), len(allowed))
+	if len(covered) != len(requested) {
+		return fmt.Errorf("only %d of %d weak topics covered", len(covered), len(requested))
 	}
 	return nil
 }
@@ -732,10 +742,14 @@ func validateQuestions(gt *generatedTest, want int) error {
 		seen[key] = true
 		positions[q.Correct]++
 	}
-	// Reject degenerate key distributions (all answers on one position etc.).
+	// A skewed key distribution (most answers on one position) is fixed
+	// locally by swapping options — the content does not change. It used
+	// to REJECT the whole reply, so a good free test went to the next
+	// provider (often the paid one) only because of answer positions.
 	for _, n := range positions {
 		if n > want/2 {
-			return fmt.Errorf("unbalanced answer key distribution: %v", positions)
+			rebalanceAnswerKeys(gt)
+			break
 		}
 	}
 	return nil
@@ -1325,6 +1339,7 @@ func (g *GeneratorService) reapStuckJobs(ctx context.Context) {
 	}
 	if failed > 0 {
 		log.Printf("generator: parked %d stuck job(s) as failed (attempts exhausted)", failed)
+		g.noteStuckParked(ctx, failed)
 	}
 }
 
@@ -1353,7 +1368,7 @@ func (g *GeneratorService) executeJob(ctx context.Context, job *models.Generatio
 				err = fmt.Errorf("job %d panicked: %v", job.ID, r)
 			}
 		}()
-		jobCtx, cancel := context.WithTimeout(withGenRun(ctx, run), jobTimeout)
+		jobCtx, cancel := context.WithTimeout(withPaidCallLimit(withGenRun(ctx, run), maxPaidCallsPerJob), jobTimeout)
 		defer cancel()
 		return g.runJob(jobCtx, job)
 	}()
@@ -1404,9 +1419,11 @@ func (g *GeneratorService) executeJob(ctx context.Context, job *models.Generatio
 		if ferr := g.gen.FailJob(bctx, job.ID, runErr, jobRetryDelay(job), maxJobAttempts); ferr != nil {
 			log.Printf("generator: fail job %d: %v", job.ID, ferr)
 		}
+		g.noteJobFailure(bctx, job, runErr)
 		g.jobFinished(job)
 		return
 	}
+	g.noteJobSuccess()
 	if err := g.gen.CompleteJob(bctx, job.ID, testID); err != nil {
 		log.Printf("generator: complete job %d: %v", job.ID, err)
 	}
@@ -1758,6 +1775,11 @@ func (g *GeneratorService) validateReply(gt *generatedTest, spec *genSpec) error
 		if err := validatePersonalCoverage(gt, spec.personalTopics, spec.catalog); err != nil {
 			return rejectf(rejectTopics, "personal test: %v", err)
 		}
+		// Near-duplicate questions (the same question reworded) were only
+		// caught for chain tests; a weak-topics test could show one twice.
+		if err := validateNoRepeats(gt, nil); err != nil {
+			return err
+		}
 	case models.TestKindChain:
 		// Chain tests must match the difficulty of their chain position:
 		// a model that writes a beginner test for Тест 40 (or an olympiad
@@ -1852,9 +1874,13 @@ func (g *GeneratorService) generationStepsDyn(messages func() []deepseek.Message
 		steps = append(steps, aiStep{
 			name:    "deepseek/" + ds.ReasonerModel() + "(" + effort + ")",
 			reserve: deepseekGenReserve,
+			paid:    true,
 			run: func(ctx context.Context) (string, error) {
 				// Bound the paid calls in flight across the worker pool:
 				// more workers must not mean a proportional DeepSeek burst.
+				if err := takePaidCall(ctx); err != nil {
+					return "", err
+				}
 				release, err := g.acquireDeepSeek(ctx)
 				if err != nil {
 					return "", err

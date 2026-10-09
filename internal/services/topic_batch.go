@@ -93,10 +93,14 @@ func (g *GeneratorService) runTopicBatch(ctx context.Context, job *models.Genera
 	pinTopic(final, title)
 
 	seed := make([]models.SeedQuestion, 0, len(final.Questions))
+	var kept []string
 	for _, sq := range final.toSeed() {
-		if seen[strings.ToLower(strings.TrimSpace(sq.Text))] {
+		// Near-duplicates too (the same question reworded): of the banked
+		// questions shown to the model and of this batch itself.
+		if seen[strings.ToLower(strings.TrimSpace(sq.Text))] || repeatsAny(sq.Text, existing) >= 0 || repeatsAny(sq.Text, kept) >= 0 {
 			continue
 		}
+		kept = append(kept, sq.Text)
 		seed = append(seed, sq)
 	}
 	if len(seed) == 0 {

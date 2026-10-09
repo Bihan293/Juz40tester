@@ -39,6 +39,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -217,7 +218,13 @@ func New(apiKey, model, reasonerModel, baseURL string) *Client {
 		model:         model,
 		reasonerModel: reasonerModel,
 		baseURL:       strings.TrimRight(baseURL, "/"),
-		httpClient:    httpx.NewClient(300 * time.Second),
+		// The HTTP timeout is only a safety net ABOVE the callers' own
+		// deadlines (generation 8 min, batches/repairs 5 min, translation
+		// jobs 4 min). It used to be 300 s — shorter than the 8-minute
+		// generation call: a long thinking reply (max_tokens 16000) was cut
+		// by the client after the server had already produced (and billed)
+		// it, and the transient-error retry then paid for it again.
+		httpClient: httpx.NewClient(httpSafetyTimeout),
 	}
 }
 
@@ -353,6 +360,10 @@ const minAttemptTime = 20 * time.Second
 // truncation retry (no hidden reasoning — the whole budget is visible JSON,
 // enough for a full 20-question test).
 const NonThinkingMaxTokens = 8192
+
+// httpSafetyTimeout bounds one HTTP exchange when the caller's context has
+// no (shorter) deadline.
+const httpSafetyTimeout = 10 * time.Minute
 
 // ErrTruncated: the reply hit max_tokens (finish_reason=length).
 var ErrTruncated = errors.New("deepseek: reply truncated")
@@ -516,6 +527,7 @@ func (c *Client) call(ctx context.Context, model string, messages []Message, tem
 	// request — a capped call is never sent.
 	reserved := 0.0
 	settled := false
+	mayBeBilled := false
 	if c.budget != nil {
 		reserved = worstCaseCost(model, body, maxTokens)
 		if err := c.budget.Reserve(ctx, reserved); err != nil {
@@ -526,11 +538,20 @@ func (c *Client) call(ctx context.Context, model string, messages []Message, tem
 			return "", fmt.Errorf("%w (ledger error: %v)", ErrBudgetExceeded, err)
 		}
 		defer func() {
-			if !settled {
-				// No usage data (transport error, API error): DeepSeek does
-				// not bill a request that produced no completion — release.
-				c.budget.Settle(context.WithoutCancel(ctx), reserved, 0)
+			if settled {
+				return
 			}
+			if mayBeBilled {
+				// The request reached DeepSeek but the reply was lost (cut
+				// by a deadline, connection dropped mid-reply): the server
+				// may well have produced — and billed — the completion.
+				// Keep the worst case booked so the daily cap stays honest.
+				c.budget.Settle(context.WithoutCancel(ctx), reserved, reserved)
+				return
+			}
+			// No usage data (connection never made, API error): DeepSeek
+			// does not bill a request that produced no completion — release.
+			c.budget.Settle(context.WithoutCancel(ctx), reserved, 0)
 		}()
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
@@ -543,6 +564,7 @@ func (c *Client) call(ctx context.Context, model string, messages []Message, tem
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		mayBeBilled = !isDialError(err)
 		if ctx.Err() != nil {
 			return "", err // the caller's deadline/cancel — not retryable
 		}
@@ -552,12 +574,16 @@ func (c *Client) call(ctx context.Context, model string, messages []Message, tem
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
+		mayBeBilled = resp.StatusCode == http.StatusOK
 		if ctx.Err() != nil {
 			return "", err
 		}
 		return "", transient(fmt.Errorf("deepseek: read response (HTTP %d): %w", resp.StatusCode, err))
 	}
 
+	// A 200 is billed even when its body turns out to be unusable (broken
+	// JSON, no usage block): keep the reservation unless usage settles it.
+	mayBeBilled = resp.StatusCode == http.StatusOK
 	var cr chatResponse
 	decodeErr := json.Unmarshal(raw, &cr)
 	if resp.StatusCode != http.StatusOK {
@@ -629,6 +655,17 @@ func (c *Client) call(ctx context.Context, model string, messages []Message, tem
 		return "", transient(fmt.Errorf("deepseek: empty content (finish_reason=%q)", cr.Choices[0].FinishReason))
 	}
 	return content, nil
+}
+
+// isDialError reports a failure to even open the connection (DNS, refused,
+// TLS handshake): the request never reached the API, nothing was billed.
+func isDialError(err error) bool {
+	var op *net.OpError
+	if errors.As(err, &op) && op.Op == "dial" {
+		return true
+	}
+	var dns *net.DNSError
+	return errors.As(err, &dns)
 }
 
 // isTransientStatus: rate limit, request timeout and every server error.

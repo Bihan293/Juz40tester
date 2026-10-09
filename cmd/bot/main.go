@@ -353,12 +353,20 @@ func startWorkerSide(ctx, workerCtx context.Context, bgWG *sync.WaitGroup, cfg *
 	// still works with the seeded tests, AI generation is simply disabled.
 	// R-9: global daily DeepSeek spending cap, kept in PostgreSQL
 	// (ai_spend_daily) and fed by the client's per-call cost estimate.
-	budget := services.NewDailyBudget(repositories.NewSpendRepository(pool), cfg.DeepSeekDailyCapUSD)
+	spendRepo := repositories.NewSpendRepository(pool)
+	budget := services.NewDailyBudget(spendRepo, cfg.DeepSeekDailyCapUSD)
+	// Telegram alerts to ADMIN_IDS: generation failing for good / in a row,
+	// stuck jobs, the DeepSeek daily cap. Rate-limited per alert key,
+	// cluster-wide (nil when ADMIN_IDS is empty).
+	alerts := services.NewAdminAlerter(cfg.Subscriptions.AdminIDs, func(ctx context.Context, chatID int64, text string) error {
+		_, err := tg.SendMessage(ctx, chatID, text, nil)
+		return err
+	}).WithClaim(spendRepo.ClaimAlert)
 	var ds *deepseek.Client
 	if cfg.DeepSeekAPIKey != "" {
 		ds = deepseek.New(cfg.DeepSeekAPIKey, cfg.DeepSeekModel, cfg.DeepSeekReasonerModel, cfg.DeepSeekBaseURL)
 		if budget != nil {
-			ds.WithBudget(budget, cfg.IsOffPeak)
+			ds.WithBudget(services.WithCapAlert(budget, alerts, cfg.DeepSeekDailyCapUSD), cfg.IsOffPeak)
 			log.Printf("deepseek: daily spending cap $%.2f (UTC day)", cfg.DeepSeekDailyCapUSD)
 		} else {
 			log.Println("deepseek: DEEPSEEK_DAILY_CAP_USD=0 — NO daily spending cap")
@@ -388,7 +396,7 @@ func startWorkerSide(ctx, workerCtx context.Context, bgWG *sync.WaitGroup, cfg *
 	} else {
 		log.Println("groq: GROQ_API_KEY not set — all AI work goes to DeepSeek (paid)")
 	}
-	genSvc := services.NewGeneratorService(ds, cfg, genRepo, subjectRepo, stateRepo).WithGroq(gq).WithBudget(budget)
+	genSvc := services.NewGeneratorService(ds, cfg, genRepo, subjectRepo, stateRepo).WithGroq(gq).WithBudget(budget).WithAlerts(alerts)
 	// Kazakh test translations: reuse the same DeepSeek client (flash, low
 	// effort). A question is translated once, cached in the DB and shared by
 	// every user — no per-user API calls. The generator gets the translator

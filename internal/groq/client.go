@@ -437,7 +437,12 @@ func (c *Client) do(ctx context.Context, r Request, maxTokens int, useSchema boo
 		if cr.Usage.PromptTokensDetails != nil {
 			res.CachedTokens = cr.Usage.PromptTokensDetails.CachedTokens
 		}
-		resv.commit(cr.Usage.PromptTokens + cr.Usage.CompletionTokens)
+		// Prompt tokens served from Groq's prompt cache do not count toward
+		// the rate limits: crediting them back lets the next batch of the
+		// same job (byte-identical prefix) in sooner instead of spilling
+		// over to the paid fallback. The server-reported remaining tokens
+		// (observeHeaders) stay the authoritative upper bound.
+		resv.commit(max(cr.Usage.PromptTokens-res.CachedTokens, 0) + cr.Usage.CompletionTokens)
 	}
 	c.mu.Lock()
 	c.requests++
@@ -477,4 +482,19 @@ func truncateUTF8(s string, n int) string {
 func IsRateLimited(err error) bool {
 	var rl *RateLimitError
 	return errors.As(err, &rl)
+}
+
+// RetryableSoon reports whether err is a SHORT-LIVED quota error (a
+// per-minute window or a short 429 block — not the daily quota) and when
+// the quota should be back. The caller can wait that long and try the free
+// model again instead of paying for the next provider.
+func RetryableSoon(err error) (time.Duration, bool) {
+	var rl *RateLimitError
+	if !errors.As(err, &rl) {
+		return 0, false
+	}
+	if strings.Contains(strings.ToLower(rl.Reason), "day") {
+		return 0, false
+	}
+	return rl.RetryAfter, true
 }
