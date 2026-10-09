@@ -21,6 +21,13 @@ const (
 
 // mainMenuKeyboard is the persistent Reply Keyboard at the bottom of the chat:
 // Предметы · Слабые темы / Статистика · Топ / Настройки.
+//
+// It is sent ONLY with the main menu and is never removed or re-sent around
+// a test: a ReplyKeyboardRemove (formerly sent when a test started) makes
+// Telegram mobile clients replace the closed bot keyboard with the system
+// text keyboard — the «keyboard pops up by itself when I open a test» bug —
+// and re-sending the menu after every test popped the menu panel up over
+// the result. Tests are answered with inline buttons only.
 func mainMenuKeyboard() *bot.ReplyKeyboardMarkup {
 	return mainMenuKeyboardFor(false)
 }
@@ -48,73 +55,6 @@ func mainMenuKeyboardFor(plans bool) *bot.ReplyKeyboardMarkup {
 	}
 }
 
-// hideReplyKeyboard sends a tiny message with ReplyKeyboardRemove so the
-// bottom menu (Предметы / Слабые темы / Статистика / Настройки) disappears
-// while a test is in progress and cannot distract or break the flow.
-//
-// R-2: fewer Telegram calls.
-//   - When this process already hid the menu in this chat (and nothing has
-//     shown it again since), the call is a no-op — 0 requests instead of 3.
-//   - Otherwise the removal vehicle and the previous «menu is back» note
-//     are deleted with ONE deleteMessages call (was 2 deleteMessage calls).
-//
-// The hidden state is per process (in memory): after a restart the state is
-// unknown and the menu is hidden again the normal way, never skipped. In
-// cluster mode (WithSharedUpdates) it is never trusted: the menu may have
-// been restored by another worker, and skipping the hide left it visible
-// during the whole test.
-func (h *Handler) hideReplyKeyboard(ctx context.Context, chatID int64) {
-	if v, ok := h.kbHidden.Load(chatID); ok && v.(bool) && !h.sharedUpdates {
-		return
-	}
-	msgID, err := h.tg.SendMessage(ctx, chatID, "✍️ Идёт тест — меню скрыто до конца. Вопросы ниже 👇", bot.RemoveKeyboard)
-	if err != nil {
-		logf("hide reply keyboard: %v", err)
-		return
-	}
-	h.kbHidden.Store(chatID, true)
-	// The message is only the keyboard-removal vehicle — delete it so the
-	// chat stays clean (the keyboard stays hidden after the deletion),
-	// together with the note that carried the menu: it is useless now.
-	ids := []int64{msgID}
-	if prev, ok := h.kbNotes.LoadAndDelete(chatID); ok {
-		if old, ok := prev.(int64); ok && old != msgID {
-			ids = append(ids, old)
-		}
-	}
-	if err := h.tg.DeleteMessages(ctx, chatID, ids); err != nil {
-		logf("delete keyboard-removal note(s): %v", err)
-	}
-}
-
-// restoreReplyKeyboard brings the bottom main menu back once the test is
-// over (finished or exited) — it was hidden while the test ran.
-//
-// Telegram clients drop a reply keyboard together with the message that
-// carried it, so the note that restores the menu must stay in the chat
-// while the menu is visible. To keep that from turning into spam (one
-// «🏠 Главное меню…» line per finished test), only the LATEST note is
-// kept: the previous one is deleted right after the new one is sent
-// (deleting an OLDER message does not affect the keyboard of the newer
-// one), and the current one is deleted when the next test hides the menu.
-// In the normal test cycle the previous note was already removed by
-// hideReplyKeyboard, so this is ONE Telegram call.
-func (h *Handler) restoreReplyKeyboard(ctx context.Context, chatID int64) {
-	msgID, err := h.tg.SendMessage(ctx, chatID, "🏠 Меню снова доступно 👇", h.menuKeyboard(chatID))
-	if err != nil {
-		logf("restore reply keyboard: %v", err)
-		return
-	}
-	h.kbHidden.Delete(chatID)
-	if prev, loaded := h.kbNotes.Swap(chatID, msgID); loaded {
-		if old, ok := prev.(int64); ok && old != msgID {
-			if err := h.tg.DeleteMessage(ctx, chatID, old); err != nil {
-				logf("delete previous menu note: %v", err)
-			}
-		}
-	}
-}
-
 func (h *Handler) sendMainMenu(ctx context.Context, chatID int64, user *models.User, greet bool) {
 	text := fmt.Sprintf("Главное меню JUZ40 Tester. %s\nВыберите раздел кнопками ниже 👇", streakBadge(user))
 	if greet {
@@ -129,10 +69,7 @@ func (h *Handler) sendMainMenu(ctx context.Context, chatID int64, user *models.U
 	}
 	if _, err := h.tg.SendMessage(ctx, chatID, text, h.menuKeyboard(chatID)); err != nil {
 		logf("send main menu: %v", err)
-		return
 	}
-	h.kbHidden.Delete(chatID) // the menu keyboard is visible again
-
 }
 
 // streakBadge renders the daily-streak flame for the main menu: from the

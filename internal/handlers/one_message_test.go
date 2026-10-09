@@ -1,11 +1,9 @@
 package handlers
 
 import (
-	"context"
 	"strings"
 	"testing"
 
-	"github.com/Bihan293/Juz40tester/internal/bot"
 	"github.com/Bihan293/Juz40tester/internal/models"
 	"github.com/Bihan293/Juz40tester/internal/repositories"
 	"github.com/Bihan293/Juz40tester/internal/services"
@@ -66,26 +64,5 @@ func TestWithHeaderFitsTelegramLimit(t *testing.T) {
 	got = withHeader(hdr, huge)
 	if n := utf16Len(got); n > 4096 {
 		t.Fatalf("huge body not truncated: %d", n)
-	}
-}
-
-// The final answer edits the answered question into the result (one edit)
-// and only then sends the note that restores the bottom menu.
-func TestRenderSummaryIntoEditsAnsweredMessage(t *testing.T) {
-	f := &kbFake{}
-	h := New(bot.NewClient("T").WithBaseURL(f.server(t).URL), nil, nil)
-	sum := &services.AttemptSummary{
-		Attempt:      &models.TestAttempt{CorrectCount: 1},
-		Test:         &models.Test{ID: 5, SubjectID: 3, TestNumber: 1, Kind: models.TestKindChain},
-		Total:        2,
-		StatusCounts: map[int]int{models.StatusNone: 1, models.StatusMastered: 1},
-	}
-	cb := &bot.CallbackQuery{ID: "x", Message: &bot.Message{MessageID: 77, Chat: bot.Chat{ID: 42}}}
-	h.renderSummaryInto(context.Background(), cb, "🟢 Правильно", sum, &models.User{ID: 1}, 7, 42, "", services.CompletionOutcome{})
-	if f.calls != 2 {
-		t.Fatalf("final answer = %d Telegram calls, want 2 (edit + menu note)", f.calls)
-	}
-	if len(f.sent) != 1 || !strings.Contains(f.sent[0], "Меню снова доступно") {
-		t.Fatalf("only the menu note may be sent, got %q", f.sent)
 	}
 }

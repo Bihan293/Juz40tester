@@ -13,13 +13,17 @@ import (
 
 	"github.com/Bihan293/Juz40tester/internal/bot"
 	"github.com/Bihan293/Juz40tester/internal/models"
+	"github.com/Bihan293/Juz40tester/internal/services"
 )
 
-// kbFake is a fake Bot API that numbers sent messages and records deletes.
+// kbFake is a fake Bot API that numbers sent messages and records every
+// request body (to check which keyboards were sent).
 type kbFake struct {
 	mu      sync.Mutex
 	next    int64
 	sent    []string // texts of sendMessage, in order
+	edited  []string // texts of editMessageText, in order
+	bodies  []string // raw request bodies of every call
 	deleted []int64
 	calls   int // every Bot API request
 }
@@ -32,11 +36,15 @@ func (f *kbFake) server(t *testing.T) *httptest.Server {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.calls++
+		f.bodies = append(f.bodies, string(body))
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/sendMessage"):
 			f.next++
 			f.sent = append(f.sent, p["text"].(string))
 			_, _ = io.WriteString(w, `{"ok":true,"result":{"message_id":`+strconv.FormatInt(f.next, 10)+`,"chat":{"id":1,"type":"private"}}}`)
+		case strings.HasSuffix(r.URL.Path, "/editMessageText"):
+			f.edited = append(f.edited, p["text"].(string))
+			_, _ = io.WriteString(w, `{"ok":true,"result":true}`)
 		case strings.HasSuffix(r.URL.Path, "/deleteMessages"):
 			for _, id := range p["message_ids"].([]any) {
 				f.deleted = append(f.deleted, int64(id.(float64)))
@@ -53,94 +61,65 @@ func (f *kbFake) server(t *testing.T) *httptest.Server {
 	return srv
 }
 
-// #35: finishing many tests must leave at most ONE «menu is back» note in
-// the chat, and hiding the menu for the next test removes it.
-func TestReplyKeyboardNoteNoSpam(t *testing.T) {
-	f := &kbFake{}
-	h := New(bot.NewClient("T").WithBaseURL(f.server(t).URL), nil, nil)
-	ctx := context.Background()
-	const chat = 42
-
-	h.restoreReplyKeyboard(ctx, chat) // msg 1 — first test finished
-	if len(f.deleted) != 0 {
-		t.Fatalf("first note must stay (it carries the keyboard), deleted %v", f.deleted)
-	}
-	h.restoreReplyKeyboard(ctx, chat) // msg 2 — previous note 1 removed
-	h.restoreReplyKeyboard(ctx, chat) // msg 3 — previous note 2 removed
-	if want := []int64{1, 2}; !equal(f.deleted, want) {
-		t.Fatalf("deleted %v, want %v (only the latest note may remain)", f.deleted, want)
-	}
-
-	// Next test starts: msg 4 = removal vehicle; it and note 3 are deleted
-	// with ONE deleteMessages request (R-2: was two deleteMessage calls).
-	before := f.calls
-	h.hideReplyKeyboard(ctx, chat)
-	if want := []int64{1, 2, 4, 3}; !equal(f.deleted, want) {
-		t.Fatalf("deleted %v, want %v", f.deleted, want)
-	}
-	if got := f.calls - before; got != 2 {
-		t.Fatalf("hide = %d Telegram calls, want 2 (send + deleteMessages)", got)
-	}
-	// Hiding again while the menu is already hidden: ZERO Telegram calls.
-	before = f.calls
-	h.hideReplyKeyboard(ctx, chat)
-	if f.calls != before {
-		t.Fatalf("repeated hide made %d Telegram calls, want 0", f.calls-before)
-	}
-	// Restore after a hide: the old note is already gone — ONE call.
-	before = f.calls
-	h.restoreReplyKeyboard(ctx, chat) // 5
-	if f.calls-before != 1 {
-		t.Fatalf("restore after hide = %d calls, want 1", f.calls-before)
-	}
-	// Notes are tracked per chat.
-	h.restoreReplyKeyboard(ctx, chat+1) // 6 — other chat, nothing deleted
-	if want := []int64{1, 2, 4, 3}; !equal(f.deleted, want) {
-		t.Fatalf("other chat must not touch this one: %v", f.deleted)
-	}
-	// After the menu was shown again, the next test hides it again.
-	before = f.calls
-	h.hideReplyKeyboard(ctx, chat) // 7, deletes 7 and 5
-	if want := []int64{1, 2, 4, 3, 7, 5}; !equal(f.deleted, want) || f.calls-before != 2 {
-		t.Fatalf("hide after restore: deleted %v calls %d", f.deleted, f.calls-before)
-	}
-	// The main menu (with the reply keyboard) also makes the menu visible.
-	h.sendMainMenu(ctx, chat, &models.User{FirstName: "A"}, false) // 8
-	before = f.calls
-	h.hideReplyKeyboard(ctx, chat) // 9: send + deleteMessage of the vehicle
-	if f.calls-before != 2 {
-		t.Fatalf("hide after main menu must hide again: %d calls, want 2", f.calls-before)
-	}
-	for _, s := range f.sent {
-		if strings.Contains(s, "Главное меню снова доступно") {
-			t.Fatalf("old long note text still sent: %q", s)
+// noPopupKeyboard fails when a request could make the phone keyboard (or
+// the reply-menu panel) pop up during a test: ReplyKeyboardRemove,
+// ForceReply, an input placeholder or a reply keyboard.
+func noPopupKeyboard(t *testing.T, bodies []string) {
+	t.Helper()
+	for _, b := range bodies {
+		for _, bad := range []string{"remove_keyboard", "force_reply", "input_field_placeholder", `"keyboard":`} {
+			if strings.Contains(b, bad) {
+				t.Fatalf("request contains %q (keyboard pop-up): %s", bad, b)
+			}
 		}
 	}
 }
 
-func equal(a, b []int64) bool {
-	if len(a) != len(b) {
-		return false
+// The result screen is ONE edit of the answered question — no extra
+// message, no reply-keyboard change (it used to send «🏠 Меню снова
+// доступно» with the reply keyboard, which popped the menu panel up).
+func TestResultScreenNoKeyboardPopup(t *testing.T) {
+	for _, kind := range []string{models.TestKindChain, models.TestKindPersonal} {
+		t.Run(kind, func(t *testing.T) {
+			f := &kbFake{}
+			h := New(bot.NewClient("T").WithBaseURL(f.server(t).URL), nil, nil)
+			sum := &services.AttemptSummary{
+				Attempt:      &models.TestAttempt{CorrectCount: 1},
+				Test:         &models.Test{ID: 5, SubjectID: 3, TestNumber: 1, Kind: kind},
+				Total:        2,
+				StatusCounts: map[int]int{models.StatusNone: 1, models.StatusMastered: 1},
+			}
+			cb := &bot.CallbackQuery{ID: "x", Message: &bot.Message{MessageID: 77, Chat: bot.Chat{ID: 42}}}
+			h.renderSummaryInto(context.Background(), cb, "🟢 Правильно", sum, &models.User{ID: 1}, 7, 42, "", services.CompletionOutcome{})
+			if f.calls != 1 || len(f.edited) != 1 || len(f.sent) != 0 {
+				t.Fatalf("result = %d calls (%d edits, %d sends), want exactly 1 edit", f.calls, len(f.edited), len(f.sent))
+			}
+			noPopupKeyboard(t, f.bodies)
+		})
 	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
-// Cluster mode: another worker may have restored the menu, so this
-// process's «already hidden» memory must not skip the hide.
-func TestHideReplyKeyboardSharedUpdates(t *testing.T) {
-	f := &kbFake{}
-	h := New(bot.NewClient("T").WithBaseURL(f.server(t).URL), nil, nil).WithSharedUpdates(true)
-	ctx := context.Background()
-	h.hideReplyKeyboard(ctx, 7)
-	// (meanwhile another worker shows the menu for chat 7)
-	before := f.calls
-	h.hideReplyKeyboard(ctx, 7)
-	if f.calls-before != 2 {
-		t.Fatalf("hide in cluster mode = %d Telegram calls, want 2 (never skipped)", f.calls-before)
+// Without the list (no quiz service) the screen still offers a way back
+// that matches the test kind.
+func TestAfterTestScreenFallback(t *testing.T) {
+	h := New(bot.NewClient("T"), nil, nil)
+	_, kb := h.afterTestScreen(context.Background(), &models.User{ID: 1}, &models.Test{Kind: models.TestKindChain}, "note", nil)
+	if s := markupData(kb); !strings.Contains(s, cbSubjects) || !strings.Contains(s, cbMainMenu) {
+		t.Fatalf("chain fallback: %s", s)
 	}
+	_, kb = h.afterTestScreen(context.Background(), &models.User{ID: 1}, &models.Test{Kind: models.TestKindPersonal}, "note",
+		[][]bot.InlineKeyboardButton{bot.Row(bot.Btn("🏁", cbFinish+"5"))})
+	if s := markupData(kb); !strings.HasPrefix(s, cbFinish+"5|") || !strings.Contains(s, cbWeakMenu) {
+		t.Fatalf("personal fallback: %s", s)
+	}
+}
+
+func markupData(kb *bot.InlineKeyboardMarkup) string {
+	var parts []string
+	for _, row := range kb.InlineKeyboard {
+		for _, b := range row {
+			parts = append(parts, b.CallbackData)
+		}
+	}
+	return strings.Join(parts, "|")
 }

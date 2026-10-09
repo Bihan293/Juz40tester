@@ -182,10 +182,17 @@ func TestOneTelegramCallPerAnswer(t *testing.T) {
 			}
 			continue
 		}
-		// Last answer: the question turns into the result (edit) + the menu
-		// note (send) — never more than the 3 calls of the old flow.
-		if len(lim) > 2 || findCall(lim, "editMessageText", "Тест завершён") == nil || findCall(lim, "sendMessage", "Меню снова доступно") == nil {
+		// Last answer: the question turns into the result ABOVE the
+		// subject's tests grid (ONE edit) — the user is back in the subject
+		// menu, and nothing touches the reply keyboard.
+		res := findCall(lim, "editMessageText", "Тест завершён")
+		if len(lim) != 1 || res == nil {
 			t.Fatalf("final answer = %d limited calls:\n%s", len(lim), dumpCalls(calls))
+		}
+		kb := fmt.Sprint(res.p["reply_markup"])
+		if !strings.Contains(fmt.Sprint(res.p["text"]), "Открыто тестов") ||
+			!strings.Contains(kb, cbOpenTest+itoa(test.ID)) || !strings.Contains(kb, cbSubjects) || !strings.Contains(kb, cbMainMenu) {
+			t.Fatalf("result must show the subject's tests list:\n%s", dumpCalls(calls))
 		}
 	}
 
@@ -205,5 +212,35 @@ func TestOneTelegramCallPerAnswer(t *testing.T) {
 	calls = tap(fmt.Sprintf("%s%d:2:0", cbAnswer, aid))
 	if lim := limited(calls); len(lim) != 1 || lim[0].method != "editMessageText" {
 		t.Fatalf("not-modified must not send a copy:\n%s", dumpCalls(calls))
+	}
+
+	f.setEditErr("")
+
+	// Exit (🚪 → ✅ Да, выйти): back to the subject's tests grid with the
+	// resumable test marked ⏸ — not a mini-menu «К предметам / Главное меню».
+	aid = attemptID()
+	if calls := tap(cbExit + itoa(aid)); findCall(calls, "editMessageText", "Выйти из теста?") == nil {
+		t.Fatalf("exit confirmation:\n%s", dumpCalls(calls))
+	}
+	calls = tap(cbExitYes + itoa(aid))
+	ex := findCall(calls, "editMessageText", "Вы вышли из теста")
+	if ex == nil || len(limited(calls)) != 1 {
+		t.Fatalf("exit:\n%s", dumpCalls(calls))
+	}
+	if kb := fmt.Sprint(ex.p["reply_markup"]); !strings.Contains(fmt.Sprint(ex.p["text"]), "Открыто тестов") ||
+		!strings.Contains(kb, "⏸ ") || !strings.Contains(kb, cbOpenTest+itoa(test.ID)) || !strings.Contains(kb, cbSubjects) {
+		t.Fatalf("exit must show the subject's tests list:\n%s", dumpCalls(calls))
+	}
+
+	// Nothing in the whole flow may pop up a keyboard on the phone.
+	for _, c := range f.since(0) {
+		for _, bad := range []string{"remove_keyboard", "force_reply", "input_field_placeholder"} {
+			if strings.Contains(fmt.Sprint(c.p), bad) {
+				t.Fatalf("%s sent %q: %v", c.method, bad, c.p)
+			}
+		}
+		if rm, ok := c.p["reply_markup"].(map[string]any); ok && rm["keyboard"] != nil {
+			t.Fatalf("%s re-sent the reply keyboard during a test: %v", c.method, c.p)
+		}
 	}
 }
