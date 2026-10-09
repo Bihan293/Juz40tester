@@ -84,7 +84,7 @@ func (h *Handler) startOrResume(ctx context.Context, cb *bot.CallbackQuery, user
 	}
 	if resume != nil {
 		// Continue the saved attempt from the current question.
-		h.showCurrentQuestion(ctx, cb, user, resume.ID)
+		h.showAttempt(ctx, cb, user, resume.ID)
 		return
 	}
 
@@ -103,10 +103,32 @@ func (h *Handler) startOrResume(ctx context.Context, cb *bot.CallbackQuery, user
 		h.failOpenTest(ctx, cb, "Не удалось начать тест")
 		return
 	}
-	// A fresh attempt begins. The bottom reply menu is deliberately left
-	// alone: removing it (ReplyKeyboardRemove) made phones open the text
-	// keyboard right when the test started. Show the first question of the new attempt.
-	h.showCurrentQuestion(ctx, cb, user, attempt.ID)
+	// A fresh attempt begins: test mode on (the main menu is replaced by
+	// «🚪 Выйти из теста» — replaced, never removed: a ReplyKeyboardRemove
+	// made phones open the text keyboard), then its first question.
+	h.showAttempt(ctx, cb, user, attempt.ID)
+}
+
+// showAttempt enters test mode for the attempt (users.active_attempt_id)
+// and shows its current question; when the user just entered the test the
+// main menu is hidden right after the question (one extra message, once per
+// entry — never per answer). Another active test blocks it (guard message).
+func (h *Handler) showAttempt(ctx context.Context, cb *bot.CallbackQuery, user *models.User, attemptID int64) {
+	ok, notice := h.enterTest(ctx, cb.Message.Chat.ID, user, attemptID)
+	if !ok {
+		return
+	}
+	h.showCurrentQuestion(ctx, cb, user, attemptID)
+	h.noticeIfActive(ctx, cb.Message.Chat.ID, user, attemptID, notice)
+}
+
+// noticeIfActive sends the test-mode keyboard when the user has just
+// entered attemptID and is still inside it (a finished / closed attempt
+// already brought the menu back).
+func (h *Handler) noticeIfActive(ctx context.Context, chatID int64, user *models.User, attemptID int64, notice bool) {
+	if notice && user.ActiveAttemptID == attemptID {
+		h.sendTestModeNotice(ctx, chatID)
+	}
 }
 
 // failOpenTest reports an open-test failure. openTest acknowledges the
@@ -140,6 +162,7 @@ func (h *Handler) showCurrentQuestion(ctx context.Context, cb *bot.CallbackQuery
 	if view == nil {
 		// All questions answered -> show the result.
 		h.showResult(ctx, cb, user, attemptID, 0)
+		h.leaveTest(ctx, cb.Message.Chat.ID, user, attemptID)
 		return
 	}
 	if view.Attempt != nil && view.Attempt.Status != models.AttemptInProgress {
@@ -148,6 +171,7 @@ func (h *Handler) showCurrentQuestion(ctx context.Context, cb *bot.CallbackQuery
 		// no longer be answered.
 		text, kb := h.closedAttemptScreen(ctx, user, view.Attempt.TestID)
 		h.editMessage(ctx, cb, text, kb)
+		h.leaveTest(ctx, cb.Message.Chat.ID, user, attemptID)
 		return
 	}
 	admin := h.isAdminTG(user.TelegramID)
@@ -279,6 +303,17 @@ func (h *Handler) handleAnswer(ctx context.Context, cb *bot.CallbackQuery, user 
 		h.answerCallback(ctx, cb, "Некорректный вариант")
 		return
 	}
+	// Test mode: answering a question (e.g. of a paused attempt's older
+	// message) means being inside that test. Free for the active attempt
+	// (the users row read by Upsert already says so — zero queries).
+	notice := false
+	if view.Attempt != nil && view.Attempt.Status == models.AttemptInProgress {
+		var ok bool
+		if ok, notice = h.enterTest(ctx, cb.Message.Chat.ID, user, attemptID); !ok {
+			h.answerCallback(ctx, cb, "Сначала заверши текущий тест или выйди из него")
+			return
+		}
+	}
 
 	res, err := h.quiz.SubmitAnswer(ctx, user.ID, attemptID, position, original)
 	if errors.Is(err, repositories.ErrNotFound) {
@@ -341,9 +376,12 @@ func (h *Handler) handleAnswer(ctx context.Context, cb *bot.CallbackQuery, user 
 		// The last question turns into the result screen (one edit), then
 		// the bottom menu comes back (one send, as before).
 		h.renderSummaryInto(ctx, cb, header, sum, user, attemptID, cb.Message.Chat.ID, extra, outcome)
+		// Test over: test mode off, the main menu comes back.
+		h.leaveTest(ctx, cb.Message.Chat.ID, user, attemptID)
 		return
 	}
 	h.showNextQuestion(ctx, cb, user, attemptID, view.Attempt, header)
+	h.noticeIfActive(ctx, cb.Message.Chat.ID, user, attemptID, notice)
 }
 
 // showNextQuestion edits the answered message into the verdict header plus
@@ -370,11 +408,13 @@ func (h *Handler) showNextQuestion(ctx context.Context, cb *bot.CallbackQuery, u
 		// Nothing left although this answer did not finish the attempt (a
 		// concurrent final answer): show the result in the same message.
 		h.showResultInto(ctx, cb, user, attemptID, header)
+		h.leaveTest(ctx, cb.Message.Chat.ID, user, attemptID)
 		return
 	}
 	if next.Attempt != nil && next.Attempt.Status != models.AttemptInProgress {
 		text, kb := h.closedAttemptScreen(ctx, user, next.Attempt.TestID)
 		h.editMessage(ctx, cb, withHeader(header, text), kb)
+		h.leaveTest(ctx, cb.Message.Chat.ID, user, attemptID)
 		return
 	}
 	admin := h.isAdminTG(user.TelegramID)
@@ -481,7 +521,7 @@ func (h *Handler) restartRun(ctx context.Context, cb *bot.CallbackQuery, user *m
 		h.sendText(ctx, cb.Message.Chat.ID, "Не удалось начать тест 😔")
 		return
 	}
-	h.showCurrentQuestion(ctx, cb, user, newAttempt.ID)
+	h.showAttempt(ctx, cb, user, newAttempt.ID)
 }
 
 // confirmExit replaces the question with a yes/no confirmation instead of
@@ -492,14 +532,7 @@ func (h *Handler) confirmExit(ctx context.Context, cb *bot.CallbackQuery, user *
 		h.sendText(ctx, cb.Message.Chat.ID, "Попытка не найдена")
 		return
 	}
-	idStr := strconv.FormatInt(attemptID, 10)
-	h.editMessage(ctx, cb, "❓ Выйти из теста?\n\nПрогресс сохранится — потом можно будет продолжить с того же вопроса.",
-		&bot.InlineKeyboardMarkup{InlineKeyboard: [][]bot.InlineKeyboardButton{
-			bot.Row(
-				bot.Btn("✅ Да, выйти", cbExitYes+idStr),
-				bot.Btn("↩️ Нет, продолжить", cbExitNo+idStr),
-			),
-		}})
+	h.editMessage(ctx, cb, exitConfirmText, exitConfirmKeyboard(attemptID))
 }
 
 // exitTest performs the actual exit after the user confirmed it.
@@ -522,6 +555,10 @@ func (h *Handler) exitTest(ctx context.Context, cb *bot.CallbackQuery, user *mod
 	}
 	text, kb := h.afterTestScreen(ctx, user, test, note, nil)
 	h.editMessage(ctx, cb, withHeader("", text), kb)
+	// Test mode off: the main menu comes back. Nothing is charged — the
+	// attempt stays in progress (resumable ⏸); only a completed attempt
+	// is charged against the daily quota.
+	h.leaveTest(ctx, cb.Message.Chat.ID, user, attemptID)
 }
 
 // Notes on top of the list after «✅ Да, выйти».
@@ -533,5 +570,5 @@ const (
 // cancelExit returns the user to the current question of the attempt.
 func (h *Handler) cancelExit(ctx context.Context, cb *bot.CallbackQuery, user *models.User, attemptID int64) {
 	h.answerCallback(ctx, cb, "Продолжаем 💪")
-	h.showCurrentQuestion(ctx, cb, user, attemptID)
+	h.showAttempt(ctx, cb, user, attemptID)
 }

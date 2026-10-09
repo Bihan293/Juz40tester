@@ -240,6 +240,16 @@ func TestSubscriptionFlowThroughHandler(t *testing.T) {
 	if findCall(calls, "sendMessage", "закончились") != nil {
 		t.Fatalf("Plus user refused:\n%s", dumpCalls(calls))
 	}
+	// The student leaves the retried run (🚪 → ✅ Да, выйти): test mode is
+	// off, the main menu comes back, nothing is charged.
+	var runID int64
+	if err := pool.QueryRow(ctx, `SELECT a.id FROM test_attempts a JOIN users u ON u.id = a.user_id
+		WHERE u.telegram_id = $1 AND a.status = 'in_progress'`, tgID).Scan(&runID); err != nil {
+		t.Fatalf("retried attempt: %v", err)
+	}
+	if calls := tap(cbExitYes + itoa(runID)); findCall(calls, "sendMessage", menuBackNotice) == nil {
+		t.Fatalf("exit must bring the menu back:\n%s", dumpCalls(calls))
+	}
 	// 9. Admin commands: only for ADMIN_IDS.
 	calls = say(fmt.Sprintf("/grant %d premium 7", tgID), from)
 	if findCall(calls, "sendMessage", "выдан план") != nil {

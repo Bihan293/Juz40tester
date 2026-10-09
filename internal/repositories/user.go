@@ -94,12 +94,12 @@ func (r *UserRepository) upsertOnce(ctx context.Context, u *models.User, today t
 			   OR users.streak_days <= 0
 			   OR users.blocked_at IS NOT NULL
 			RETURNING id, telegram_id, username, first_name, last_name, language_code, created_at, updated_at,
-			          streak_days, COALESCE(last_active_date::text, ''), test_lang
+			          streak_days, COALESCE(last_active_date::text, ''), test_lang, COALESCE(active_attempt_id, 0)
 		)
 		SELECT * FROM up
 		UNION ALL
 		SELECT id, telegram_id, username, first_name, last_name, language_code, created_at, updated_at,
-		       streak_days, COALESCE(last_active_date::text, ''), test_lang
+		       streak_days, COALESCE(last_active_date::text, ''), test_lang, COALESCE(active_attempt_id, 0)
 		FROM users
 		WHERE telegram_id = $1 AND NOT EXISTS (SELECT 1 FROM up)
 		LIMIT 1`,
@@ -109,7 +109,7 @@ func (r *UserRepository) upsertOnce(ctx context.Context, u *models.User, today t
 	var lastActive string
 	err := row.Scan(&out.ID, &out.TelegramID, &out.Username, &out.FirstName,
 		&out.LastName, &out.LanguageCode, &out.CreatedAt, &out.UpdatedAt,
-		&out.StreakDays, &lastActive, &out.TestLang)
+		&out.StreakDays, &lastActive, &out.TestLang, &out.ActiveAttemptID)
 	if err != nil {
 		return nil, err
 	}
