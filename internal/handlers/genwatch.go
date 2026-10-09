@@ -253,7 +253,6 @@ func retryKeyboard(label, retryData string) *bot.InlineKeyboardMarkup {
 // finishGeneration unregisters the key and edits every subscriber's note.
 func (h *Handler) finishGeneration(ctx context.Context, key string, gw *genWatch, text string, kb *bot.InlineKeyboardMarkup) {
 	for _, s := range h.gen.take(key, gw) {
-		h.kbNotes.CompareAndDelete(s.chatID, s.msgID) // never a stale menu-note id
 		h.editNote(ctx, s.chatID, s.msgID, text, kb)
 	}
 }

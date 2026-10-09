@@ -868,6 +868,17 @@ func (s *QuizService) Exit(ctx context.Context, attemptID, userID int64) error {
 	return s.attempts.AssertAttemptForUser(ctx, attemptID, userID)
 }
 
+// ExitTest is Exit for the confirmed «✅ Да, выйти»: it also returns the
+// test of the attempt, so the user can be taken back to that test's list
+// (the subject's tests grid or the weak-topics picker).
+func (s *QuizService) ExitTest(ctx context.Context, attemptID, userID int64) (*models.Test, error) {
+	a, err := s.attempts.GetAttemptForUser(ctx, attemptID, userID)
+	if err != nil {
+		return nil, err
+	}
+	return s.subjects.GetTest(ctx, a.TestID)
+}
+
 // AttemptSummary aggregates data for the result screen.
 type AttemptSummary struct {
 	Attempt      *models.TestAttempt

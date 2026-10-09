@@ -26,22 +26,9 @@ type Handler struct {
 	// callback; any later answer with a text is delivered as a chat message
 	// instead, so error texts are never silently lost.
 	answered sync.Map
-	// kbNotes remembers, per chat, the message that currently carries the
-	// bottom main-menu reply keyboard (chatID -> messageID). Telegram ties a
-	// reply keyboard to the message that sent it, so that note must stay in
-	// the chat while the menu is visible — but only the LATEST one: the
-	// previous note is deleted whenever a new one is sent or the menu is
-	// hidden for the next test, so at most one note exists per chat
-	// (before, every finished test left another «🏠 Главное меню…» line).
-	kbNotes sync.Map
-	// kbHidden remembers chats where THIS process hid the reply keyboard
-	// (chatID -> true) and nothing has shown it since — a repeated hide is
-	// then skipped without any Telegram call (R-2).
-	kbHidden sync.Map
 	// sharedUpdates: the updates of one user may be handled by DIFFERENT
-	// processes (durable update queue, ROLE=worker × N). The per-process
-	// kbHidden shortcut is then wrong — another worker may have shown the
-	// menu again meanwhile — and is not used.
+	// processes (durable update queue, ROLE=worker × N), so no per-process
+	// per-chat UI state may be trusted.
 	sharedUpdates bool
 	// limiter throttles actions per Telegram user (R-9): at most one every
 	// cfg.UserActionInterval. In memory per instance (ratelimit.Limiter) or

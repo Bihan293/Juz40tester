@@ -83,10 +83,7 @@ func (h *Handler) startOrResume(ctx context.Context, cb *bot.CallbackQuery, user
 		return
 	}
 	if resume != nil {
-		// Continue the saved attempt from the current question — the menu
-		// must be hidden for the resumed run too (the user may have left the
-		// test earlier and got the menu back).
-		h.hideReplyKeyboard(ctx, cb.Message.Chat.ID)
+		// Continue the saved attempt from the current question.
 		h.showCurrentQuestion(ctx, cb, user, resume.ID)
 		return
 	}
@@ -106,9 +103,9 @@ func (h *Handler) startOrResume(ctx context.Context, cb *bot.CallbackQuery, user
 		h.failOpenTest(ctx, cb, "Не удалось начать тест")
 		return
 	}
-	// A fresh attempt begins: hide the bottom menu for the whole run.
-	h.hideReplyKeyboard(ctx, cb.Message.Chat.ID)
-	// Show the first question of the new attempt.
+	// A fresh attempt begins. The bottom reply menu is deliberately left
+	// alone: removing it (ReplyKeyboardRemove) made phones open the text
+	// keyboard right when the test started. Show the first question of the new attempt.
 	h.showCurrentQuestion(ctx, cb, user, attempt.ID)
 }
 
@@ -149,7 +146,8 @@ func (h *Handler) showCurrentQuestion(ctx context.Context, cb *bot.CallbackQuery
 		// A stale button («↩️ Нет, продолжить» of an attempt that was
 		// restarted or reaped meanwhile) must not show a question that can
 		// no longer be answered.
-		h.editMessage(ctx, cb, closedAttemptText, closedAttemptKeyboard(view.Attempt.TestID))
+		text, kb := h.closedAttemptScreen(ctx, user, view.Attempt.TestID)
+		h.editMessage(ctx, cb, text, kb)
 		return
 	}
 	admin := h.isAdminTG(user.TelegramID)
@@ -159,6 +157,26 @@ func (h *Handler) showCurrentQuestion(ctx context.Context, cb *bot.CallbackQuery
 // closedAttemptText is shown instead of a question of an attempt that is no
 // longer in progress.
 const closedAttemptText = "⏹ Эта попытка уже закрыта — тест был начат заново или попытка устарела.\n\nОткрой тест, чтобы продолжить."
+
+// closedAttemptScreen is closedAttemptText above the list the test belongs
+// to (the subject's tests grid / the weak-topics picker), so the user can
+// reopen the test from there. Falls back to «▶️ Открыть тест» when the test
+// cannot be loaded.
+func (h *Handler) closedAttemptScreen(ctx context.Context, user *models.User, testID int64) (string, *bot.InlineKeyboardMarkup) {
+	if h.quiz != nil {
+		test, err := h.quiz.GetTest(ctx, testID)
+		if err == nil {
+			if listText, listKb, err := h.testListScreen(ctx, user, test); err == nil {
+				return closedAttemptText + "\n\n" + listText, listKb
+			} else if !errors.Is(err, errNoTestList) {
+				logf("test list of closed attempt: %v", err)
+			}
+		} else {
+			logf("closed attempt test %d: %v", testID, err)
+		}
+	}
+	return closedAttemptText, closedAttemptKeyboard(testID)
+}
 
 func closedAttemptKeyboard(testID int64) *bot.InlineKeyboardMarkup {
 	return &bot.InlineKeyboardMarkup{InlineKeyboard: [][]bot.InlineKeyboardButton{
@@ -355,7 +373,8 @@ func (h *Handler) showNextQuestion(ctx context.Context, cb *bot.CallbackQuery, u
 		return
 	}
 	if next.Attempt != nil && next.Attempt.Status != models.AttemptInProgress {
-		h.editMessage(ctx, cb, withHeader(header, closedAttemptText), closedAttemptKeyboard(next.Attempt.TestID))
+		text, kb := h.closedAttemptScreen(ctx, user, next.Attempt.TestID)
+		h.editMessage(ctx, cb, withHeader(header, text), kb)
 		return
 	}
 	admin := h.isAdminTG(user.TelegramID)
@@ -462,9 +481,6 @@ func (h *Handler) restartRun(ctx context.Context, cb *bot.CallbackQuery, user *m
 		h.sendText(ctx, cb.Message.Chat.ID, "Не удалось начать тест 😔")
 		return
 	}
-	// The menu was restored with the result screen — hide it again for the
-	// new run (retry bypasses openTest, which normally does this).
-	h.hideReplyKeyboard(ctx, cb.Message.Chat.ID)
 	h.showCurrentQuestion(ctx, cb, user, newAttempt.ID)
 }
 
@@ -487,21 +503,29 @@ func (h *Handler) confirmExit(ctx context.Context, cb *bot.CallbackQuery, user *
 }
 
 // exitTest performs the actual exit after the user confirmed it.
+// The user lands back in the list the test was opened from (the subject's
+// tests grid, or the weak-topics picker for a personal test).
 func (h *Handler) exitTest(ctx context.Context, cb *bot.CallbackQuery, user *models.User, attemptID int64) {
-	if err := h.quiz.Exit(ctx, attemptID, user.ID); err != nil {
+	test, err := h.quiz.ExitTest(ctx, attemptID, user.ID)
+	if err != nil {
 		logf("exit attempt %d: %v", attemptID, err)
 		h.answerCallback(ctx, cb, "Не удалось выйти")
 		return
 	}
 	h.answerCallback(ctx, cb, "Прогресс сохранён")
-	h.editMessage(ctx, cb, "🚪 Вы вышли из теста. Попытка сохранена — её можно продолжить с места остановки.",
-		&bot.InlineKeyboardMarkup{InlineKeyboard: [][]bot.InlineKeyboardButton{
-			bot.Row(bot.Btn("📚 К предметам", cbSubjects)),
-			bot.Row(bot.Btn("⬅️ Главное меню", cbMainMenu)),
-		}})
-	// Test is no longer running — give the bottom menu back.
-	h.restoreReplyKeyboard(ctx, cb.Message.Chat.ID)
+	note := exitNoteChain
+	if test.Kind == models.TestKindPersonal {
+		note = exitNotePersonal
+	}
+	text, kb := h.afterTestScreen(ctx, user, test, note, nil)
+	h.editMessage(ctx, cb, withHeader("", text), kb)
 }
+
+// Notes on top of the list after «✅ Да, выйти».
+const (
+	exitNoteChain    = "🚪 Вы вышли из теста. Попытка сохранена — нажми на тест с ⏸, чтобы продолжить с места остановки."
+	exitNotePersonal = "🚪 Вы вышли из теста. Попытка сохранена — выбери предмет ниже, чтобы продолжить с места остановки."
+)
 
 // cancelExit returns the user to the current question of the attempt.
 func (h *Handler) cancelExit(ctx context.Context, cb *bot.CallbackQuery, user *models.User, attemptID int64) {
