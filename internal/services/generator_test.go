@@ -59,13 +59,31 @@ func TestValidateTestDuplicate(t *testing.T) {
 	}
 }
 
+// A degenerate key distribution is REBALANCED locally (options swapped,
+// the right answer text stays right) instead of rejecting the reply.
 func TestValidateTestUnbalancedKeys(t *testing.T) {
 	gt := &generatedTest{Questions: validQuestions()}
+	right := make([]string, len(gt.Questions))
 	for i := range gt.Questions {
-		gt.Questions[i].Correct = 0
+		q := &gt.Questions[i]
+		q.Options[0], q.Options[q.Correct] = q.Options[q.Correct], q.Options[0]
+		q.Correct = 0
+		right[i] = q.Options[0]
 	}
-	if err := validateTest(gt); err == nil {
-		t.Fatal("expected error for degenerate key distribution")
+	if err := validateTest(gt); err != nil {
+		t.Fatalf("unbalanced keys must be rebalanced, got %v", err)
+	}
+	var pos [4]int
+	for i, q := range gt.Questions {
+		pos[q.Correct]++
+		if q.Options[q.Correct] != right[i] {
+			t.Fatalf("q%d: the key no longer points at the right answer", i+1)
+		}
+	}
+	for p, n := range pos {
+		if n > len(gt.Questions)/2 {
+			t.Fatalf("position %d still holds %d keys: %v", p, n, pos)
+		}
 	}
 }
 

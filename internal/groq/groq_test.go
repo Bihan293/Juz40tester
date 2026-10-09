@@ -410,3 +410,34 @@ func TestAPIErrorMessageStaysValidUTF8(t *testing.T) {
 		t.Fatal("short strings must be unchanged")
 	}
 }
+
+func TestRetryableSoon(t *testing.T) {
+	if d, ok := RetryableSoon(&RateLimitError{Reason: "tokens per minute", RetryAfter: 7 * time.Second}); !ok || d != 7*time.Second {
+		t.Fatalf("per-minute quota must be retryable soon: %s %v", d, ok)
+	}
+	for _, r := range []string{"requests per day", "tokens per day", "429 per day: x", "requests per day (server)"} {
+		if _, ok := RetryableSoon(&RateLimitError{Reason: r, RetryAfter: time.Second}); ok {
+			t.Fatalf("%q is a daily quota — never retryable soon", r)
+		}
+	}
+	if _, ok := RetryableSoon(errors.New("boom")); ok {
+		t.Fatal("a plain error is not a quota error")
+	}
+}
+
+// Cached prompt tokens do not count toward Groq's rate limits: the local
+// per-minute window is credited with prompt - cached + completion.
+func TestCachedTokensCreditedToTheWindow(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"ok\":true}"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":3000,"completion_tokens":500,"total_tokens":3500,"prompt_tokens_details":{"cached_tokens":2500}}}`)
+	}))
+	defer srv.Close()
+	c := New("k", srv.URL)
+	if _, err := c.ChatJSON(context.Background(), Request{Model: ModelQwen27B, Messages: []Message{{Role: "user", Content: "hi"}}, MaxTokens: 1000}); err != nil {
+		t.Fatal(err)
+	}
+	if _, tokMin, _, _ := c.limiterFor(ModelQwen27B).snapshot(); tokMin != 1000 {
+		t.Fatalf("window holds %d tokens, want 1000 (3000-2500+500)", tokMin)
+	}
+}

@@ -325,3 +325,63 @@ func TestUsageHookReportsTokens(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// recBudget records the Settle calls of the daily budget.
+type recBudget struct {
+	mu      sync.Mutex
+	settled [][2]float64 // reserved, actual
+}
+
+func (b *recBudget) Reserve(context.Context, float64) error { return nil }
+func (b *recBudget) Settle(_ context.Context, reserved, actual float64) {
+	b.mu.Lock()
+	b.settled = append(b.settled, [2]float64{reserved, actual})
+	b.mu.Unlock()
+}
+
+// A reply lost AFTER the request reached DeepSeek (deadline mid-reply) may
+// have been billed: the worst case stays booked against the daily cap. A
+// request that never connected is released.
+func TestLostReplyKeepsReservation(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+	b := &recBudget{}
+	c := New("k", "pro", "deepseek-flash", srv.URL).WithBudget(b, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if _, err := c.GenerateJSON(ctx, []Message{{Role: "user", Content: "x"}}, 1000, ThinkingEffortLow); err == nil {
+		t.Fatal("want a deadline error")
+	}
+	if len(b.settled) != 1 || b.settled[0][1] != b.settled[0][0] || b.settled[0][0] <= 0 {
+		t.Fatalf("a lost reply must keep the worst case booked: %v", b.settled)
+	}
+
+	b2 := &recBudget{}
+	dead := New("k", "pro", "deepseek-flash", "http://127.0.0.1:1").WithBudget(b2, nil)
+	fastRetries(t)
+	if _, err := dead.GenerateJSON(context.Background(), []Message{{Role: "user", Content: "x"}}, 1000, ThinkingEffortLow); err == nil {
+		t.Fatal("want a connection error")
+	}
+	for _, s := range b2.settled {
+		if s[1] != 0 {
+			t.Fatalf("a request that never connected must be released: %v", b2.settled)
+		}
+	}
+}
+
+// The HTTP safety timeout must never cut a call before the callers' own
+// deadlines (8-minute generation): a reply cut by the client after the
+// server produced it is billed and was then paid for again by the retry.
+func TestHTTPTimeoutAboveCallDeadlines(t *testing.T) {
+	c := New("k", "", "", "")
+	if c.httpClient.Timeout < 9*time.Minute {
+		t.Fatalf("HTTP timeout %s is shorter than the generation call deadline", c.httpClient.Timeout)
+	}
+}

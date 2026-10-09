@@ -78,7 +78,10 @@ func repairPrompt(subjectName string, items []repairItem) string {
 }
 
 // repairSteps is the provider route of a repair call (free Groq first).
-func (g *GeneratorService) repairSteps(messages []deepseek.Message) []aiStep {
+// freeOnly drops the paid DeepSeek step: a batch with only SOFT warnings is
+// accepted as is when the free models can not improve it, so paying for
+// it bought nothing a student would notice.
+func (g *GeneratorService) repairSteps(messages []deepseek.Message, freeOnly ...bool) []aiStep {
 	var steps []aiStep
 	if g.gq != nil {
 		base := groq.Request{
@@ -100,12 +103,16 @@ func (g *GeneratorService) repairSteps(messages []deepseek.Message) []aiStep {
 		qw.TopP = 0.8
 		steps = append(steps, groqStep(g.gq, qw))
 	}
-	if g.ds != nil {
+	if g.ds != nil && !(len(freeOnly) > 0 && freeOnly[0]) {
 		ds := g.ds
 		steps = append(steps, aiStep{
 			name:    "deepseek/" + ds.ReasonerModel() + "(low)",
 			reserve: deepseekRepairReserve,
+			paid:    true,
 			run: func(ctx context.Context) (string, error) {
+				if err := takePaidCall(ctx); err != nil {
+					return "", err
+				}
 				cctx, cancel := context.WithTimeout(ctx, deepseekRepairCallTimeout)
 				defer cancel()
 				return ds.GenerateJSON(cctx, messages, dsRepairMaxTokens, deepseek.ThinkingEffortLow)
@@ -138,8 +145,13 @@ func checkRewrite(orig generatedQuestion, q *generatedQuestion) error {
 	// The topic is part of the weak-topics contract and of the progress
 	// analytics — it is never allowed to drift during a repair.
 	q.Topic = orig.Topic
-	if q.Difficulty < 1 || q.Difficulty > 5 {
+	// The level is part of the test contract too (chain difficulty mean,
+	// batch slot spec): a rewrite that drifted made the repaired test fail
+	// validateFinal — after the money for it was spent.
+	if orig.Difficulty >= 1 && orig.Difficulty <= 5 {
 		q.Difficulty = orig.Difficulty
+	} else if q.Difficulty < 1 || q.Difficulty > 5 {
+		q.Difficulty = 3
 	}
 	if rep := auditQuestion(q.Text, q.Options, q.Correct); rep.HasHard() {
 		return fmt.Errorf("still flagged: %s", rep.Reasons())
@@ -150,7 +162,7 @@ func checkRewrite(orig generatedQuestion, q *generatedQuestion) error {
 // rewriteQuestions asks the model to rewrite the given questions. It returns
 // the accepted rewrites keyed by the item index; items whose rewrite is
 // still bad are simply missing from the map.
-func (g *GeneratorService) rewriteQuestions(ctx context.Context, task, subjectName string, items []repairItem) (map[int]generatedQuestion, error) {
+func (g *GeneratorService) rewriteQuestions(ctx context.Context, task, subjectName string, items []repairItem, freeOnly ...bool) (map[int]generatedQuestion, error) {
 	if len(items) == 0 {
 		return nil, nil
 	}
@@ -186,7 +198,7 @@ func (g *GeneratorService) rewriteQuestions(ctx context.Context, task, subjectNa
 		accepted = ok
 		return nil
 	}
-	if _, _, err := runSteps(ctx, task, g.repairSteps(messages), validate); err != nil {
+	if _, _, err := runSteps(ctx, task, g.repairSteps(messages, freeOnly...), validate); err != nil {
 		return nil, err
 	}
 	return accepted, nil
@@ -224,11 +236,15 @@ func (g *GeneratorService) repairFlagged(ctx context.Context, task, subjectName 
 			}
 			batch := idx[start:end]
 			items := make([]repairItem, len(batch))
+			softOnly := true
 			for k, qi := range batch {
 				items[k] = repairItem{Q: gt.Questions[qi], Reasons: reports[qi].Reasons()}
+				if reports[qi].HasHard() {
+					softOnly = false
+				}
 				log.Printf("quality[%s]: q%d flagged (round %d): %s", task, qi+1, round, reports[qi].Reasons())
 			}
-			fixed, err := g.rewriteQuestions(ctx, fmt.Sprintf("%s repair r%d", task, round), subjectName, items)
+			fixed, err := g.rewriteQuestions(ctx, fmt.Sprintf("%s repair r%d", task, round), subjectName, items, softOnly)
 			if err != nil {
 				if errors.Is(err, deepseek.ErrBudgetExceeded) {
 					budgetHit = true

@@ -102,8 +102,15 @@ type genSpec struct {
 	// personalTopics: the requested weak topics of a personal test.
 	personalTopics []string
 
-	mu        sync.Mutex
-	newTopics map[string]bool // chain topics outside the catalog accepted so far
+	mu sync.Mutex
+	// newTopics: chain topics outside the catalog held by questions of
+	// this test (normalised topic -> number of questions holding it). A
+	// question that is dropped later (its reply was rejected as a whole,
+	// or a parallel batch filled the slot first) releases its hold; before
+	// that fix such phantom holds used up the maxNewChainTopics budget and
+	// every later question on a new topic was refused as «тема не по
+	// спецификации».
+	newTopics map[string]int
 }
 
 func (g *GeneratorService) batchSize() int {
@@ -310,16 +317,49 @@ func (spec *genSpec) acceptTopic(q *generatedQuestion, slot genSlot) bool {
 	defer spec.mu.Unlock()
 	n := models.NormalizeTopic(q.Topic)
 	if spec.newTopics == nil {
-		spec.newTopics = map[string]bool{}
+		spec.newTopics = map[string]int{}
 	}
-	if spec.newTopics[n] {
-		return true
-	}
-	if len(spec.newTopics) >= maxNewChainTopics {
+	if spec.newTopics[n] == 0 && len(spec.newTopics) >= maxNewChainTopics {
 		return false
 	}
-	spec.newTopics[n] = true
+	spec.newTopics[n]++
+	q.newTopic = n
 	return true
+}
+
+// releaseTopic drops the new-topic hold of a question that will not be
+// used after all (see genSpec.newTopics).
+func (spec *genSpec) releaseTopic(q *generatedQuestion) {
+	if q == nil || q.newTopic == "" {
+		return
+	}
+	spec.mu.Lock()
+	defer spec.mu.Unlock()
+	if spec.newTopics[q.newTopic] > 1 {
+		spec.newTopics[q.newTopic]--
+	} else {
+		delete(spec.newTopics, q.newTopic)
+	}
+	q.newTopic = ""
+}
+
+// orderSlots puts the required-topic slots of a group before the free
+// ones: a question on a weak topic must land in that topic's slot, not in
+// a free slot that happens to come first (the weak slot then stayed empty
+// and the chain test failed its weak-topic coverage).
+func (spec *genSpec) orderSlots(group []int) []int {
+	out := make([]int, 0, len(group))
+	for _, si := range group {
+		if spec.slots[si].Topic != "" {
+			out = append(out, si)
+		}
+	}
+	for _, si := range group {
+		if spec.slots[si].Topic == "" {
+			out = append(out, si)
+		}
+	}
+	return out
 }
 
 // acceptTopicRelaxed is acceptTopic of a RESCUE round (only a few slots
@@ -370,6 +410,13 @@ func (g *GeneratorService) matchBatch(ctx context.Context, spec *genSpec, group 
 		return nil, rejectf(rejectFormat, "reply has no questions")
 	}
 	out := make(map[int]*generatedQuestion, len(group))
+	// A rejected reply gives its new-topic holds back.
+	release := func() {
+		for _, q := range out {
+			spec.releaseTopic(q)
+		}
+	}
+	ordered := spec.orderSlots(group)
 	reasons := map[string]int{}
 	var accepted []string
 	hard := 0
@@ -394,7 +441,7 @@ func (g *GeneratorService) matchBatch(ctx context.Context, spec *genSpec, group 
 		// Two passes: an exact-difficulty slot first, then one within the
 		// slack — a greedy first fit wasted exact slots on near matches.
 		for pass := 0; pass <= slack && !placed; pass++ {
-			for _, si := range group {
+			for _, si := range ordered {
 				if out[si] != nil {
 					continue
 				}
@@ -434,10 +481,12 @@ func (g *GeneratorService) matchBatch(ctx context.Context, spec *genSpec, group 
 		}
 	}
 	if hard > maxHardFlaggedPerBatchReply {
+		release()
 		return nil, rejectf(rejectQuality, "quality audit: %d questions reveal the answer or have broken options", hard)
 	}
 	need := (len(group) + 1) / 2
 	if len(out) < need {
+		release()
 		return nil, rejectf(dominantReason(reasons), "only %d of %d questions usable (%s)", len(out), len(group), reasonString(reasons))
 	}
 	return out, nil
@@ -509,9 +558,13 @@ func (g *GeneratorService) batchSteps(messages func() []deepseek.Message, kind s
 		ds := g.ds
 		steps = append(steps, aiStep{
 			name: "deepseek/" + ds.ReasonerModel() + "(" + effort + ")",
+			paid: true,
 			// No step timeout: waiting for a semaphore slot must not eat
 			// the call's time — the timeout starts after the slot.
 			run: func(ctx context.Context) (string, error) {
+				if err := takePaidCall(ctx); err != nil {
+					return "", err
+				}
 				release, err := g.acquireDeepSeek(ctx)
 				if err != nil {
 					return "", err
@@ -621,8 +674,8 @@ func (g *GeneratorService) generateBatched(ctx context.Context, job *models.Gene
 			}
 			q := seedToGenerated(qs[0])
 			slot := spec.slots[si]
-			if !cleanQuestion(&q) || abs(q.Difficulty-slot.Difficulty) > batchDifficultySlack || !spec.acceptTopic(&q, slot) ||
-				repeatsAny(q.Text, spec.prevStems) >= 0 || repeatsAny(q.Text, stems()) >= 0 {
+			if !cleanQuestion(&q) || abs(q.Difficulty-slot.Difficulty) > batchDifficultySlack ||
+				repeatsAny(q.Text, spec.prevStems) >= 0 || repeatsAny(q.Text, stems()) >= 0 || !spec.acceptTopic(&q, slot) {
 				continue // the plan changed (e.g. new weak topics) — regenerate
 			}
 			filled[si] = &q
@@ -691,6 +744,7 @@ func (g *GeneratorService) generateBatched(ctx context.Context, job *models.Gene
 					// Parallel batches can not see each other: re-check
 					// duplicates against everything placed meanwhile.
 					if filled[si] != nil || repeatsAny(q.Text, stems()) >= 0 {
+						spec.releaseTopic(q)
 						continue
 					}
 					filled[si] = q

@@ -27,9 +27,13 @@ const (
 	// genWatchInterval / genWatchJitter: fallback poll period 15–30 s.
 	genWatchInterval = 15 * time.Second
 	genWatchJitter   = 15 * time.Second
-	// genWatchTimeout caps the wait (a real generation takes ~1–3 minutes,
-	// the worker's per-job timeout is 8 minutes).
-	genWatchTimeout = 10 * time.Minute
+	// genWatchTimeout caps the wait. It must outlast ONE full job run (the
+	// worker's per-job timeout is 22 minutes: two free Groq steps, waits for
+	// the free per-minute quota, the paid fallback and the repair). It was
+	// 10 minutes — a slow but successful generation then left the user
+	// with «⏳ Генерация идёт дольше обычного» and no test, although the
+	// test appeared a few minutes later.
+	genWatchTimeout = 25 * time.Minute
 )
 
 type genSubscriber struct{ chatID, msgID int64 }
