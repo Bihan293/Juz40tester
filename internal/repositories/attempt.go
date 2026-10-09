@@ -60,6 +60,10 @@ type AttemptQuota interface {
 	// the per-user lock were taken after row locks, two concurrent
 	// restarts of the same test would deadlock (row lock vs. advisory lock).
 	LockUserTx(ctx context.Context, tx pgx.Tx, userID int64) error
+	// Now is the quota clock. A new attempt's started_at is stamped with
+	// it, so the «started today» count of the start gate and the quota day
+	// the completion is charged to use the SAME clock.
+	Now() time.Time
 }
 
 // WithQuota installs the daily quota (nil = off).
@@ -158,12 +162,19 @@ func (r *AttemptRepository) createAttemptTx(ctx context.Context, userID, testID 
 		}
 	}
 
+	// With a quota the start time comes from the quota clock (see
+	// AttemptQuota.Now); otherwise the database clock, as before.
+	var startedAt *time.Time
+	if r.quota != nil {
+		now := r.quota.Now()
+		startedAt = &now
+	}
 	var a models.TestAttempt
 	if err := tx.QueryRow(ctx, `
-		INSERT INTO test_attempts (user_id, test_id)
-		VALUES ($1, $2)
+		INSERT INTO test_attempts (user_id, test_id, started_at)
+		VALUES ($1, $2, COALESCE($3::timestamptz, now()))
 		RETURNING id, user_id, test_id, status, current_position, correct_count, wrong_count, started_at, completed_at`,
-		userID, testID).
+		userID, testID, startedAt).
 		Scan(&a.ID, &a.UserID, &a.TestID, &a.Status, &a.CurrentPosition,
 			&a.CorrectCount, &a.WrongCount, &a.StartedAt, &a.CompletedAt); err != nil {
 		return nil, err

@@ -132,9 +132,13 @@ func (r *TranslationRepository) QuestionIDsForTest(ctx context.Context, testID i
 // translated one. Copying the cached rows costs zero API calls.
 //
 // Idempotent (ON CONFLICT DO NOTHING) and race-safe: a row is written only
-// when the source question is an exact text match of the clone's question
-// (the option texts then come from the source row whose question matched —
-// exactly the right pairing).
+// when the source question is an exact match of the clone's question — the
+// text AND the four options in the same A-D order AND the correct letter.
+// Matching by the text alone paired the wrong rows when a test has two
+// questions with the same generic stem («Какое утверждение верно?») but
+// different options: the Kazakh options of one question were shown under
+// the other, so the Kazakh-speaking student saw a «correct» answer that
+// was actually wrong.
 func (r *TranslationRepository) CopyTranslationsToTest(ctx context.Context, srcTestID int64, dstQuestionIDs []int64, lang string) (int64, error) {
 	if len(dstQuestionIDs) == 0 {
 		return 0, nil
@@ -146,7 +150,11 @@ func (r *TranslationRepository) CopyTranslationsToTest(ctx context.Context, srcT
 		FROM test_questions stq
 		JOIN questions sq ON sq.id = stq.question_id
 		JOIN question_translations tr ON tr.question_id = sq.id AND tr.lang = $3
-		JOIN questions dq ON dq.question_text = sq.question_text AND dq.id = ANY($2)
+		JOIN questions dq ON dq.id = ANY($2)
+		                 AND dq.question_text = sq.question_text
+		                 AND dq.option_a = sq.option_a AND dq.option_b = sq.option_b
+		                 AND dq.option_c = sq.option_c AND dq.option_d = sq.option_d
+		                 AND dq.correct_answer = sq.correct_answer
 		WHERE stq.test_id = $1
 		ON CONFLICT (question_id, lang) DO NOTHING`, srcTestID, dstQuestionIDs, lang)
 	if err != nil {

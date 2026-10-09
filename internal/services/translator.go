@@ -53,7 +53,7 @@ const (
 // translationSystemPrompt keeps the model strictly in translator mode: the
 // answer key is NEVER sent (it is copied from the master row server-side),
 // so a sloppy reply can never corrupt the correct answers.
-const translationSystemPrompt = `Ты — профессиональный переводчик тестов ЕНТ/УБТ с русского на казахский язык. Переводи точно, официальным академическим стилем казахского языка, без добавлений и сокращений. Формулы, числа, имена собственные и единицы измерения не меняй.
+const translationSystemPrompt = `Ты — профессиональный переводчик тестов ЕНТ/УБТ с русского на казахский язык. Переводи точно, официальным академическим стилем казахского языка, без добавлений и сокращений. Формулы, числа, имена собственные и единицы измерения не меняй. Массив options переводи строго в исходном порядке: i-й элемент перевода — перевод i-го исходного элемента (не сортируй и не переставляй).
 
 Формат — строго JSON, без пояснений и markdown:
 {"translations":[{"id":1,"question":"...","options":["...","...","...","..."],"topic":"..."}]}`
@@ -412,6 +412,9 @@ func buildTranslations(raw string, want int, masterByIdx map[int]*models.Questio
 				return nil, fmt.Errorf("translator: question %d: empty option %d", q.ID, j+1)
 			}
 		}
+		if err := checkOptionAlignment(master, q.Options); err != nil {
+			return nil, fmt.Errorf("translator: question %d: %w", q.ID, err)
+		}
 		out = append(out, models.QuestionTranslation{
 			QuestionID:    master.ID,
 			Lang:          models.TestLangKK,
@@ -425,6 +428,61 @@ func buildTranslations(raw string, want int, masterByIdx map[int]*models.Questio
 		})
 	}
 	return out, nil
+}
+
+// checkOptionAlignment guards the answer key of a translation. The correct
+// letter is copied from the Russian master, so the i-th translated option
+// MUST be the translation of the i-th master option:
+//   - a translated option whose digits are those of ANOTHER master option
+//     (and not of its own) means the model reordered the options (e.g.
+//     sorted numeric answers) — the Kazakh student would be graded against
+//     a different option than the one marked correct;
+//   - two translated options that collapse into the same text while the
+//     master options are different make the question ambiguous.
+//
+// Either way the reply is rejected and the next provider is tried (or the
+// test is shown in Russian) — a wrong translation must never be stored.
+func checkOptionAlignment(master *models.Question, options []string) error {
+	if master == nil || len(options) != 4 {
+		return nil
+	}
+	src := []string{master.OptionA, master.OptionB, master.OptionC, master.OptionD}
+	srcDigits := make([]string, 4)
+	for i := range src {
+		srcDigits[i] = digitSignature(src[i])
+	}
+	for j, opt := range options {
+		got := digitSignature(opt)
+		if got == srcDigits[j] {
+			continue
+		}
+		for k := range srcDigits {
+			if k != j && srcDigits[k] != "" && got == srcDigits[k] {
+				return fmt.Errorf("option %d looks like master option %d (options reordered)", j+1, k+1)
+			}
+		}
+	}
+	seen := make(map[string]int, 4)
+	for j, opt := range options {
+		key := strings.ToLower(strings.Join(strings.Fields(opt), " "))
+		if prev, ok := seen[key]; ok && !strings.EqualFold(strings.TrimSpace(src[prev]), strings.TrimSpace(src[j])) {
+			return fmt.Errorf("options %d and %d translated identically", prev+1, j+1)
+		}
+		seen[key] = j
+	}
+	return nil
+}
+
+// digitSignature is the sequence of ASCII digits of s (numbers, formulas
+// and years stay unchanged in a translation — the prompt requires it).
+func digitSignature(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // parseTranslationJSON extracts the JSON object from a model reply

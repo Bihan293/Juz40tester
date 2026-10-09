@@ -389,7 +389,20 @@ func (s *BillingService) processOrder(ctx context.Context, o *repositories.WeakO
 		return OutcomeWeakPending, nil
 	}
 	if o.ReplaceTestID > 0 {
-		err := s.tests.DeletePersonalTest(ctx, o.UserID, o.ReplaceTestID, o.SubjectID)
+		// The current personal test is deleted only when a new one can be
+		// built at all: with no weak topics left the order is refunded and
+		// the student KEEPS the test they had (it used to be deleted first
+		// and the order refunded right after — test and Stars both gone
+		// from the student's point of view until the refund arrived, the
+		// test for good).
+		keys, err := s.tests.WeakTopicKeys(ctx, o.UserID, o.SubjectID, 1)
+		if err != nil {
+			return retry(false, 30*time.Second, "weak topics: "+err.Error())
+		}
+		if len(keys) == 0 {
+			return refund("no weak topics")
+		}
+		err = s.tests.DeletePersonalTest(ctx, o.UserID, o.ReplaceTestID, o.SubjectID)
 		if err != nil && !errors.Is(err, repositories.ErrNotFound) {
 			return retry(false, 30*time.Second, "delete replaced test: "+err.Error())
 		}

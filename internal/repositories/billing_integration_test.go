@@ -442,3 +442,53 @@ func TestWeakOrderLifecycle(t *testing.T) {
 		t.Fatalf("payment statuses: %s %s", st1, st2)
 	}
 }
+
+// TestQuotaChargedToStartDay: a test started late in the evening and
+// finished after Almaty midnight is charged to the day it was STARTED —
+// the new day keeps its whole limit, and the evening's start is not free.
+// Before the fix the completion was charged to the new day, so starting the
+// limit before midnight and finishing it after it doubled the daily limit.
+func TestQuotaChargedToStartDay(t *testing.T) {
+	f := newBillFixture(t)
+	loc := billing.LoadLocation("Asia/Almaty")
+	evening := time.Date(2031, 3, 10, 23, 50, 0, 0, loc)
+	f.setNow(evening)
+
+	a1, err := f.start(f.chain[0].ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !a1.StartedAt.Equal(evening) {
+		t.Fatalf("started_at must come from the quota clock: %v", a1.StartedAt)
+	}
+	// After midnight: yesterday's open attempt does not block today …
+	f.setNow(evening.Add(20 * time.Minute))
+	if u := f.usage(t); u.Used != 0 || u.CanStart != 1 {
+		t.Fatalf("new day before finishing: %+v", u)
+	}
+	// … and finishing it charges YESTERDAY, not today.
+	if res := f.finish(t, a1); !res.Finished || !res.Charged {
+		t.Fatalf("finish: %+v", res)
+	}
+	if u := f.usage(t); u.Used != 0 || u.Left != 1 || u.CanStart != 1 {
+		t.Fatalf("today must keep its limit: %+v", u)
+	}
+	var day string
+	if err := f.bill.pool.QueryRow(f.ctx, `SELECT day::text FROM test_completions WHERE attempt_id = $1`, a1.ID).Scan(&day); err != nil {
+		t.Fatal(err)
+	}
+	if day != "2031-03-10" {
+		t.Fatalf("charged to %s, want the start day 2031-03-10", day)
+	}
+	// Today's own test is charged to today.
+	a2, err := f.start(f.chain[1].ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res := f.finish(t, a2); !res.Charged {
+		t.Fatalf("today's finish: %+v", res)
+	}
+	if u := f.usage(t); u.Used != 1 || u.Left != 0 {
+		t.Fatalf("after today's test: %+v", u)
+	}
+}
