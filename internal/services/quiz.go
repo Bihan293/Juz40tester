@@ -124,7 +124,7 @@ type SubjectScreen struct {
 	// chain is passed the watermark makes UnlockedMax = 201, which is not a
 	// real test.
 	UnlockedShown int
-	MaxVisible    int // min(MaxVisibleTests, UnlockedMax + lookahead)
+	MaxVisible    int // min(MaxVisibleTests, UnlockedMax + 1): opened tests plus ONE closed
 }
 
 // WeakEntry is the per-user weak-topics test state of one subject.
@@ -203,17 +203,6 @@ func computeUnlocked(chain []models.Test, progress map[int64]*repositories.TestP
 	return unlocked
 }
 
-// maxChainNumber returns the highest TestNumber in the chain (0 if empty).
-func maxChainNumber(chain []models.Test) int {
-	mx := 0
-	for i := range chain {
-		if chain[i].TestNumber > mx {
-			mx = chain[i].TestNumber
-		}
-	}
-	return mx
-}
-
 // GetSubjectScreen builds the tests-grid page: 3-per-row cells, lock marks,
 // pre-generation of the next chain test and the weak-topics entry. The page
 // is clamped to the visible range and remembered per user (so reopening the
@@ -237,16 +226,11 @@ func (s *QuizService) GetSubjectScreen(ctx context.Context, userID, subjectID in
 	if maxVisible > models.MaxVisibleTests {
 		maxVisible = models.MaxVisibleTests
 	}
-	// Never hide already-generated tests. The chain may have holes in its
-	// numbering (e.g. 1,2,3,7,8 after a failed generation), so the bound is
-	// the HIGHEST TestNumber, not len(chain).
-	if mx := maxChainNumber(chain); maxVisible < mx {
-		maxVisible = mx
-	}
-	if maxVisible > models.MaxVisibleTests {
-		maxVisible = models.MaxVisibleTests
-	}
-
+	// The chain is SHARED between users: tests generated because someone
+	// else got far ahead exist in the DB, but must NOT be visible to a user
+	// who has not reached them. The user sees only the tests he has opened
+	// plus exactly ONE closed test ahead (unlockedMax+1) — never more, no
+	// matter how many further tests already exist.
 	totalPages := (maxVisible + models.TestsPerPage - 1) / models.TestsPerPage
 	if totalPages < 1 {
 		totalPages = 1
